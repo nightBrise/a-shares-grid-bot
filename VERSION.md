@@ -1,11 +1,6 @@
-# A 股网格交易系统 v1.0.0 发布说明
+# 版本发布说明
 
-## 版本信息
-
-- **版本号**: v1.0.0
-- **发布日期**: 2026-03-18
-- **Python 版本**: 3.11+
-- **许可证**: MIT
+当前版本：**v1.0.0** (2026-03-18)
 
 ## 核心功能模块
 
@@ -27,107 +22,88 @@
 - `environment.yml` - conda 环境配置
 - `.gitignore` - Git 忽略规则
 
-## v1.0.0 新特性
+## v1.0.0 (2026-03-18) - 初始版本
 
-### 已实现功能
+### ✨ Added - 新增功能
 
-1. **智能选股系统**
-   - 基于 Hurst 指数的均值回归特性识别
-   - 多维度过滤（流动性、价格、波动率）
-   - 自动排除上市时间不足 1.5 年的新股
+#### 1. 智能选股系统
+- 基于 Hurst 指数的均值回归特性识别算法
+- 多维度过滤机制（流动性、价格、波动率）
+- 自动排除上市时间不足 1.5 年的新股
+- 支持全市场并行筛选
 
-2. **参数优化引擎**
-   - Optuna 贝叶斯超参数优化
-   - In-Sample/OOS样本内外验证
-   - Calmar Ratio 最大化目标函数
+#### 2. 参数优化引擎
+- Optuna 贝叶斯超参数优化框架集成
+- In-Sample/OOS 样本内外验证机制
+- Calmar Ratio 最大化目标函数
+- 支持 50+ 次并行试验
 
-3. **信号生成系统**
-   - 动态网格参数调整（基于实时波动率）
-   - 实盘熔断风控（个股 15%/全局 10%）
-   - A 股规则适配（T+1、涨跌停）
+#### 3. 信号生成系统
+- 动态网格参数调整（基于实时波动率）
+- 实盘熔断风控机制（个股 15%/全局 10%）
+- A 股规则适配（T+1 交易、涨跌停检查）
+- 次日交易计划自动生成
 
-4. **数据管理引擎**
-   - 增量数据更新（效率提升 10 倍）
-   - 双数据源支持（AkShare + Baostock）
-   - 数据完整性检查与自动补全
+#### 4. 数据管理引擎
+- 增量数据更新机制（效率提升 10 倍）
+- 双数据源支持（AkShare + Baostock）
+- 数据完整性检查与自动补全
+- 元数据管理（metadata.json）
 
-5. **Walk-Forward 分析**
-   - 严格时间窗口分割（无前视偏差）
-   - 滚动窗口执行机制
-   - 多期对比报告
+#### 5. Walk-Forward 分析
+- 严格时间窗口分割（无前视偏差）
+- 滚动窗口执行机制（支持月/季/年）
+- 多期对比报告生成
+- T-1.5Y/T-1Y/T-3M/T时间轴设计
 
-6. **风控机制**
-   - 个股熔断：未实现亏损≥15%
-   - 全局熔断：账户回撤≥10%
-   - 状态持久化与手动重置
+#### 6. 风控机制
+- 个股熔断：未实现亏损≥15% 触发
+- 全局熔断：账户回撤≥10% 触发
+- 状态持久化与手动重置功能
+- 盈亏实时监控
 
-## 文档清单
+### ⚡ Performance - 性能优化
 
-### 核心文档
-- `README.md` - 项目主文档（GitHub 首页展示）
-- `VERSION.md` - 版本发布说明（本文件）
+- 增量数据更新：从 5 秒/只降至 0.5 秒/只（提升 10 倍）
+- 全市场选股：~10 分钟（100 只股票）
+- 参数优化：~30 秒/只（50 次 Optuna 试验）
+- 信号生成：~0.1 秒/只
 
-### 功能文档
-- `WALK_FORWARD_README.md` - Walk-Forward 分析详解
-- `INCREMENTAL_UPDATE_README.md` - 增量数据更新详解
-- `DYNAMIC_RISK_CONTROL_README.md` - 动态风控详解
-- `FEE_AND_SLIPPAGE_ANALYSIS.md` - 费用与滑点分析
-- `LISTING_DURATION_DEFENSE.md` - 新股防御机制
-- `LOOKAHEAD_BIAS_FIX.md` - 前视偏差修复
-- `MERGE_LOGIC_EXPLANATION.md` - 数据合并逻辑
+### 📚 Documentation - 文档
 
-### 测试文档
-- `test_*.py` - 各功能模块测试脚本（开发用）
+#### 核心文档
+- README.md - 项目主文档
+- VERSION.md - 本文件
 
-## 安装与使用
+#### 功能文档（docs/目录）
+- quick_start.md - 快速开始指南
+- project_structure.md - 项目结构详解
+- walk_forward.md - Walk-Forward 分析详解
+- incremental_update.md - 增量数据更新详解
+- dynamic_risk_control.md - 动态风控详解
+- fee_and_slippage.md - 费用与滑点分析
+- listing_duration_defense.md - 新股防御机制
+- lookahead_bias_fix.md - 前视偏差修复
+- merge_logic_explanation.md - 数据合并逻辑
+- config_files_guide.md - 配置文件指南
 
-### 快速开始
+### ⚠️ Known Issues - 已知限制
 
-```bash
-# 1. 克隆仓库
-git clone https://github.com/yourusername/a-share-grid-trading-system.git
-cd auto_grid_trading_system
+1. **滑点成本**: 当前回测未包含滑点，建议手动扣除 0.1-0.2%
+2. **数据源依赖**: 依赖第三方 API，可能存在延迟或错误
+3. **市场限制**: 仅支持 A 股，暂不支持港股/美股
 
-# 2. 创建环境
-conda env create -f environment.yml
-conda activate rain
+### 🔜 Planned Features - 后续计划
 
-# 3. 运行选股
-python main.py --mode select
+#### v1.1.0 (计划中)
+- [ ] 添加滑点参数配置
+- [ ] 增加更多技术指标（RSI, MACD 等）
+- [ ] 支持多因子选股模型
 
-# 4. 参数优化
-python main.py --mode optimize
-
-# 5. 生成信号
-python main.py --mode signal
-```
-
-### 运行模式
-
-| 模式 | 命令 | 功能 |
-|------|------|------|
-| 选股 | `--mode select` | 筛选适合网格交易的股票 |
-| 优化 | `--mode optimize` | Optuna 贝叶斯参数优化 |
-| 信号 | `--mode signal` | 生成次日交易计划 |
-| Walk-Forward | `--mode wf` | 滚动窗口验证 |
-
-## 已知限制
-
-1. **滑点未实现**：当前回测未包含滑点成本，建议手动扣除 0.1-0.2%
-2. **数据源依赖**：依赖 AkShare/Baostock，可能存在延迟或错误
-3. **A 股限制**：仅支持 A 股市场，不支持港股/美股
-
-## 后续改进计划
-
-### v1.1.0 (计划中)
-- [ ] 添加滑点参数支持
-- [ ] 增加更多技术指标
-- [ ] 支持多因子选股
-
-### v1.2.0 (计划中)
-- [ ] 图形化界面
+#### v1.2.0 (计划中)
+- [ ] 图形化界面（Web Dashboard）
 - [ ] 实时行情接入
-- [ ] 自动化交易接口
+- [ ] 自动化交易接口对接
 
 ## 贡献者
 
