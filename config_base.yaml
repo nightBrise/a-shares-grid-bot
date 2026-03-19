@@ -1,0 +1,147 @@
+# A 股网格交易系统配置文件 v1.0.0
+# 静态配置文件 - 包含所有固定配置参数
+# 动态状态请修改 config_state.json
+
+# === 系统版本 ===
+version: "1.0.0"
+
+# === 运行模式 ===
+# select: 选股模式 - 筛选适合网格交易的标的
+# optimize: 优化模式 - 贝叶斯优化网格参数
+# signal: 信号模式 - 生成次日交易计划
+mode: select
+
+# === 股票池配置 ===
+# 示例股票列表 (可自行修改)
+stocks:
+  - "600519.SH"  # 贵州茅台
+  - "000858.SZ"  # 五粮液
+  - "601318.SH"  # 中国平安
+  - "000333.SZ"  # 美的集团
+  - "600036.SH"  # 招商银行
+
+# === 网格交易基础参数 ===
+grid:
+  # 基础网格间距 (%) - 会被 ATR 动态调整
+  base_spacing: 2.0
+  # 初始仓位比例 (%)
+  initial_position: 50
+  # 每格买入金额 (元)
+  grid_amount: 10000
+  # 最大网格层数
+  max_grids: 10
+  # ATR 周期 (用于动态调整)
+  atr_period: 20
+  # ATR 调整系数 (网格间距 = base_spacing * (ATR / close_price) * coef)
+  atr_coef: 1.5
+
+# === 风控参数 ===
+risk:
+  # 单只股票最大仓位 (%)
+  max_position_per_stock: 20
+  # 总仓位上限 (%)
+  max_total_position: 80
+  # 涨跌停阈值 (%) - 用于判断是否暂停交易
+  limit_threshold: 9.8
+  # 最小流动性 (日均成交额，单位：万元)
+  min_turnover: 5000
+  # 交易时间检查 (True=只在交易时段运行)
+  check_trading_time: true
+
+# === 回测与优化参数 ===
+backtest:
+  # 回测天数 (用于优化)
+  days: 250
+  # 样本外验证比例 (Walk-Forward)
+  oos_ratio: 0.3
+  # Optuna 优化试验次数
+  n_trials: 50
+  # 手续费率 (佣金万 1.5，最低 5 元)
+  commission_rate: 0.00015
+  # 印花税率 (卖出收取万 5)
+  stamp_tax: 0.0005
+  # 过户费率
+  transfer_fee: 0.00002
+
+# === 路径配置 ===
+paths:
+  # 数据存储目录
+  data_dir: "./data"
+  # 输出文件目录
+  output_dir: "./output"
+  # 信号文件名
+  signal_file: "signals.csv"
+  # 日志文件名
+  log_file: "log.txt"
+  # 报告文件名
+  report_file: "report.json"
+
+# === 选股阈值 ===
+selection:
+  # Hurst 指数阈值 (< 0.5 表示均值回归)
+  hurst_threshold: 0.5
+  # 最小价格 (避免低价股)
+  min_price: 5.0
+  # 最大价格 (避免高价股)
+  max_price: 500.0
+  # 年化波动率阈值
+  volatility_threshold: 0.8
+  # 保存前 N 只最佳股票到配置文件 (默认 20 只)
+  save_top_n: 20
+  # 选股时最大处理股票数量 (避免时间过长)
+  max_stocks_to_process: 200
+
+# === 网络优化配置 (反反爬虫策略) ===
+network:
+  # 数据源优先级设置
+  prefer_baostock: false          # 是否优先使用 Baostock (AkShare 被限制时设为 true)
+  use_baostock_fallback: true     # 是否启用 Baostock 作为备用数据源
+  
+  # 请求频率控制（每只股票之间的延迟）
+  min_delay_per_stock: 2.0        # 最小延迟 (秒)
+  max_delay_per_stock: 5.0        # 最大延迟 (秒)
+  
+  # 批次处理设置（模拟人类工作 - 休息节奏）
+  batch_size: 10                  # 每批处理多少只股票
+  long_rest_after_batches: 5      # 每处理几批后长时间休息
+  long_rest_duration: 10.0        # 长时间休息的时长 (秒)
+  
+  # 重试策略
+  max_retries: 5                  # 最大重试次数
+  base_retry_delay: 2.0           # 基础重试延迟 (秒)
+  enable_jitter: true             # 是否启用随机抖动（避免规律性请求）
+  
+  # 连续失败保护
+  consecutive_failure_limit: 5    # 连续失败多少次后主动休息
+  failure_rest_duration: 30.0     # 连续失败后休息时长 (秒)
+  
+  # User-Agent 和 Referer 轮换
+  rotate_user_agent: true         # 是否轮换 User-Agent
+  rotate_referer: true            # 是否轮换 Referer
+  
+  # 额外的人类行为模拟
+  enable_random_extra_delay: true # 是否启用随机额外延迟
+  extra_delay_probability: 0.1    # 触发额外延迟的概率 (10%)
+  extra_delay_min: 5.0            # 额外延迟最小值 (秒)
+  extra_delay_max: 15.0           # 额外延迟最大值 (秒)
+
+# === 数据源配置 ===
+data_sources:
+  # AkShare 配置
+  akshare:
+    enabled: true
+    timeout: 30                   # 请求超时时间 (秒)
+    
+  # Baostock 配置
+  baostock:
+    enabled: true
+    auto_login: true              # 是否自动登录
+
+# === 日志配置 ===
+logging:
+  # 日志级别
+  level: INFO
+  # 日志轮转：保留最近 30 天
+  backup_count: 30
+  # 单个日志文件最大大小 (MB)，0 表示不限制
+  max_bytes: 0

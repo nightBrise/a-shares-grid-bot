@@ -1,0 +1,54 @@
+# Git 忽略文件 - A 股网格交易系统
+
+# 数据目录 (自动下载的行情数据)
+data/
+*.csv
+
+# 输出文件 (信号、日志、报告)
+output/
+*.log
+*.json
+
+# 环境变量和敏感信息
+.env
+*.key
+*.secret
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OS 文件
+.DS_Store
+Thumbs.db
+
+# Optuna 研究存储
+optuna_study_*.db
