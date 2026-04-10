@@ -8,7 +8,12 @@ auto_grid_trading_system/
 ├── 📄 核心代码文件
 │   ├── main.py                  # 主入口：命令行解析、流程调度
 │   ├── strategy.py              # 核心策略：选股、优化、信号生成、回测
-│   ├── data.py                  # 数据模块：增量更新、清洗、指标计算
+│   ├── data.py                  # 数据模块：增量更新、清洗、双数据源
+│   ├── data_http.py             # HTTP Session 管理器：UA轮换、连接复用
+│   ├── indicators.py             # 技术指标：Hurst、OU半衰期、ADX、ATR（Numba加速）
+│   ├── screener.py              # 多因子选股器：横截面打分
+│   ├── grid_engine.py           # 动态网格引擎：波动率区间自适应
+│   ├── risk.py                  # 增强风控：T+1追踪、分层滑点
 │   ├── utils.py                 # 工具模块：费用计算、配置加载、日志
 │   └── risk_control.py          # 风控模块：熔断机制、盈亏监控
 │
@@ -77,7 +82,7 @@ def main() -> int
 ### 2. strategy.py - 核心策略
 
 **职责**:
-- 选股逻辑：Hurst 指数计算、股票池构建
+- 选股逻辑：多因子横截面打分、股票池构建
 - 参数优化：Optuna 贝叶斯优化
 - 信号生成：网格价格计算、动态参数调整
 - 回测引擎：模拟历史交易、计算绩效指标
@@ -94,10 +99,10 @@ def run_walk_forward_analysis(config, ...) -> Dict
 ### 3. data.py - 数据管理
 
 **职责**:
-- 数据获取：AkShare/Baostock双数据源
+- 数据获取：AkShare/Baostock双数据源 + HTTP Session 复用
 - 增量更新：仅拉取新增数据
 - 数据清洗：处理缺失值、格式转换
-- 指标计算：ATR、波动率、Hurst 指数
+- 技术指标：Hurst、OU半衰期、ADX、ATR、波动率
 
 **关键函数**:
 ```python
@@ -141,6 +146,88 @@ class RiskControlManager:
     def should_allow_buy(code) -> bool
     def should_allow_sell(code) -> bool
     def reset_global_breaker() -> bool
+```
+
+### 6. indicators.py - 技术指标计算（Numba JIT 加速）
+
+**职责**:
+- Hurst 指数：R/S 分析判断均值回归特性
+- OU 半衰期：Ornstein-Uhlenbeck 过程半衰期
+- ADX：平均趋向指数（趋势强度）
+- ATR：平均真实波幅
+- 年化波动率：对数收益率标准差 × √252
+
+**关键函数**:
+```python
+def calculate_hurst_60d(df, price_col, window) -> pd.Series
+def calculate_ou_half_life(df, price_col, min_periods) -> pd.Series
+def calculate_adx(df, period) -> pd.DataFrame
+def calculate_volatility_60d(df, price_col) -> pd.Series
+def calculate_all_indicators(df) -> pd.DataFrame
+```
+
+### 7. screener.py - 多因子选股器
+
+**职责**:
+- 多因子横截面打分：OU半衰期、Hurst、ADX、波动率适配
+- 初筛过滤：成交额、价格、上市时间
+- Top N 排序输出
+
+**关键类**:
+```python
+class MultiFactorScreener:
+    def screen_universe(df_stocks, config) -> pd.DataFrame
+    def calculate_factor_scores(df) -> pd.DataFrame
+```
+
+### 8. grid_engine.py - 动态网格引擎
+
+**职责**:
+- 波动率区间判断：低/中/高波动自适应 k 系数
+- 网格间距计算：ΔP = k × ATR(20)
+- 上下轨计算：P_ref ± 2 × σ_60d
+- T+1 最小间距约束
+
+**关键类**:
+```python
+class DynamicGridEngine:
+    def calculate_grid_parameters(df, config) -> GridParameters
+    def determine_volatility_regime(volatility, thresholds) -> str
+    def generate_signals(df, grid_params) -> pd.DataFrame
+```
+
+### 9. risk.py - 增强风控模块
+
+**职责**:
+- T+1 持仓追踪：记录买入日期，计算可用数量
+- 单股/全局熔断：亏损阈值触发
+- 分层滑点模型：0.1% 基础 + 价格分层
+- 阶梯费率计算：佣金、印花税、过户费
+
+**关键类**:
+```python
+class EnhancedRiskControl:
+    def can_buy(code, quantity, price) -> Tuple[bool, str]
+    def can_sell(code, quantity) -> Tuple[bool, str]
+    def record_trade(code, direction, price, quantity, ...)
+    def calculate_fees(trade_amount, direction, code) -> float
+    def calculate_slippage(trade_amount, price, direction) -> float
+```
+
+### 10. data_http.py - HTTP Session 管理器
+
+**职责**:
+- Session 复用：TCP 连接池，避免频繁建立连接
+- UA 轮换：模拟不同浏览器，降低被识别概率
+- 完整请求头：Accept、Accept-Language、DNT 等
+
+**关键类**:
+```python
+class HTTPSessionManager:
+    def get_session() -> requests.Session
+    def refresh_session()
+    def record_success()
+    def record_failure() -> bool
 ```
 
 ## 配置文件说明

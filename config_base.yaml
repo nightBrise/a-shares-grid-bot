@@ -62,6 +62,8 @@ backtest:
   stamp_tax: 0.0005
   # 过户费率
   transfer_fee: 0.00002
+  # 滑点率 (默认 0.1%，即千 1，可根据流动性调整)
+  slippage_rate: 0.001
 
 # === 路径配置 ===
 paths:
@@ -94,36 +96,47 @@ selection:
 # === 网络优化配置 (反反爬虫策略) ===
 network:
   # 数据源优先级设置
-  prefer_baostock: false          # 是否优先使用 Baostock (AkShare 被限制时设为 true)
+  prefer_baostock: true          # 优先使用 Baostock (更稳定，对请求频率限制宽松)
   use_baostock_fallback: true     # 是否启用 Baostock 作为备用数据源
-  
+  aggressive_switch: true         # AkShare 一次失败即切换到 Baostock（快速失败）
+
   # 请求频率控制（每只股票之间的延迟）
-  min_delay_per_stock: 2.0        # 最小延迟 (秒)
-  max_delay_per_stock: 5.0        # 最大延迟 (秒)
-  
+  min_delay_per_stock: 3.0        # 最小延迟 (秒)
+  max_delay_per_stock: 8.0        # 最大延迟 (秒)
+
   # 批次处理设置（模拟人类工作 - 休息节奏）
-  batch_size: 10                  # 每批处理多少只股票
-  long_rest_after_batches: 5      # 每处理几批后长时间休息
-  long_rest_duration: 10.0        # 长时间休息的时长 (秒)
-  
+  batch_size: 5                   # 每批处理多少只股票（减小以更频繁休息）
+  long_rest_after_batches: 3      # 每处理几批后长时间休息
+  long_rest_duration: 30.0        # 长时间休息的时长 (秒)
+
+  # 自适应冷却策略（新增）
+  adaptive_cooldown_base: 30.0     # 基础冷却时间 (秒)
+  adaptive_cooldown_multiplier: 2.0 # 失败时指数增长倍数
+  max_cooldown: 300.0            # 最大冷却时间 (秒)
+  recovery_factor: 0.8            # 成功后延迟减少因子
+
   # 重试策略
-  max_retries: 5                  # 最大重试次数
-  base_retry_delay: 2.0           # 基础重试延迟 (秒)
+  max_retries: 3                  # 最大重试次数（减小以快速失败）
+  base_retry_delay: 3.0           # 基础重试延迟 (秒)
   enable_jitter: true             # 是否启用随机抖动（避免规律性请求）
-  
+
+  # get_all_a_stocks 专用设置（新增）
+  stock_list_delay: 10.0          # 获取股票列表前的基础延迟 (秒)
+  stock_list_per_exchange_rest: 5.0 # 沪深交易所间休息时长 (秒)
+
   # 连续失败保护
-  consecutive_failure_limit: 5    # 连续失败多少次后主动休息
+  consecutive_failure_limit: 3    # 连续失败多少次后主动休息（减小）
   failure_rest_duration: 30.0     # 连续失败后休息时长 (秒)
-  
+
   # User-Agent 和 Referer 轮换
   rotate_user_agent: true         # 是否轮换 User-Agent
   rotate_referer: true            # 是否轮换 Referer
-  
+
   # 额外的人类行为模拟
   enable_random_extra_delay: true # 是否启用随机额外延迟
-  extra_delay_probability: 0.1    # 触发额外延迟的概率 (10%)
+  extra_delay_probability: 0.15   # 触发额外延迟的概率 (15%)
   extra_delay_min: 5.0            # 额外延迟最小值 (秒)
-  extra_delay_max: 15.0           # 额外延迟最大值 (秒)
+  extra_delay_max: 20.0           # 额外延迟最大值 (秒)
 
 # === 数据源配置 ===
 data_sources:
@@ -145,3 +158,73 @@ logging:
   backup_count: 30
   # 单个日志文件最大大小 (MB)，0 表示不限制
   max_bytes: 0
+
+# === 多因子打分配置 (新) ===
+screening:
+  # 因子权重 (绝对值和必须为 1.0)
+  factor_weights:
+    ou_half_life: -0.35    # OU半衰期: 负=偏好低值(快速均值回归)
+    hurst: -0.30           # Hurst指数: 负=偏好低值(均值回归)
+    adx: -0.20             # ADX: 负=偏好低值(趋势弱)
+    volatility_fit: 0.15   # 波动率适配: 正=偏好中等值
+  # 初筛条件
+  initial_filters:
+    min_turnover: 10000    # 万元 (1亿)
+    min_price: 5.0
+    max_price: 500.0
+    max_stocks: 50        # 最多处理50只
+
+# === 动态网格配置 (新) ===
+dynamic_grid:
+  # 波动率区间对应的 k 系数 (间距 = k * ATR)
+  volatility_regime_k:
+    low: 2.5      # 低波动 (<20%年化): k=2.5, 间距宽松
+    medium: 2.0   # 中波动 (20-35%): k=2.0
+    high: 1.5     # 高波动 (>35%): k=1.5, 间距紧密
+  # 波动率阈值
+  volatility_thresholds:
+    low: 0.20     # 年化波动率 < 20% 为低波动
+    high: 0.35    # 年化波动率 > 35% 为高波动
+  # T+1 适配
+  t1_min_spacing_coef: 1.5   # 最小间距 >= 1.5 * 日均振幅
+  # 强制平仓
+  force_close:
+    grids_below: 3          # 价格跌破下轨3格触发
+    close_pct: 0.50         # 平仓50%
+  # 持仓限制
+  position_limit_pct: 0.05  # 单股 <= 5% 总资本
+
+# === 增强风控配置 (新) ===
+risk_control:
+  single_stock_loss_threshold: 0.15  # 单股亏损 >= 15% 熔断
+  max_drawdown_threshold: 0.10       # 全局回撤 >= 10% 熔断
+  max_position_per_stock: 0.05      # 单股持仓上限 5%
+  limit_threshold: 9.8               # 涨跌停阈值 9.8%
+
+# === 滑点模型配置 (新) ===
+slippage:
+  base_rate: 0.001         # 基础滑点 0.1%
+  price_tiers:
+    high: [100, 0.0015]    # 价格>100: 0.15%
+    medium: [20, 0.001]    # 价格20-100: 0.1%
+    low: [0, 0.002]        # 价格<20: 0.2%
+
+# === HTTP 请求配置 (新) ===
+http:
+  # 是否启用 Session 复用
+  session_enabled: true
+  # UA 更换间隔（秒），0 表示不更换
+  ua_change_interval: 30
+  # 连接池连接数
+  pool_connections: 10
+  # 连接池最大连接数
+  pool_maxsize: 20
+
+# === 错误恢复配置 (新) ===
+error_recovery:
+  # 连续失败多少次后刷新 Session
+  session_refresh_after_failures: 3
+  # 失败后是否降级使用缓存
+  fallback_to_cache: true
+  # 缓存过期天数（超过则不使用）
+  cache_expire_days: 7

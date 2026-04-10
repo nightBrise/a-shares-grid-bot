@@ -10,7 +10,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 import pandas as pd
 import numpy as np
 
@@ -190,126 +190,293 @@ def check_data_integrity(df: pd.DataFrame, code: str) -> Tuple[bool, List[str]]:
 
 def is_likely_holiday(date: datetime.date) -> bool:
     """
-    判断日期是否可能是法定节假日（简化版本）
-    
+    判断日期是否可能是法定节假日（保守版本）
+
+    采用保守策略：只排除确认的固定节假日，减少误判
+
     参数:
         date: 要判断的日期
-    
+
     返回:
         是否可能是节假日
     """
-    # 常见中国节假日（固定日期）
+    # 确认的中国法定节假日（仅包含最核心的几天）
     holidays = [
-        # 元旦
+        # 元旦 (1月1日)
         (1, 1),
-        # 劳动节
-        (5, 1), (5, 2), (5, 3),
-        # 国庆节
-        (10, 1), (10, 2), (10, 3), (10, 4), (10, 5), (10, 6), (10, 7),
-        # 中秋节（近似，农历八月十五前后）
-        (9, 15), (9, 16), (9, 17),
-        # 清明节（近似，公历 4 月 4-6 日）
-        (4, 4), (4, 5), (4, 6),
-        # 端午节（近似，农历五月初五前后）
-        (6, 8), (6, 9), (6, 10),
+        # 春节 (除夕到正月初三，简化处理)
+        (1, 28), (1, 29), (1, 30), (1, 31),  # 除夕到初三
+        (2, 1), (2, 2), (2, 3),               # 初一到初三
+        # 清明节 (4月4-5日)
+        (4, 4), (4, 5),
+        # 劳动节 (5月1日)
+        (5, 1),
+        # 端午节 (5月5日)
+        (5, 5),
+        # 中秋节 (10月1日)
+        (10, 1),
+        # 国庆节 (10月1-3日)
+        (10, 1), (10, 2), (10, 3),
     ]
-    
-    # 春节（近似，农历正月初一前后，公历 1 月下旬到 2 月中旬）
-    spring_festival_period = [
-        (1, 21), (1, 22), (1, 23), (1, 24), (1, 25), (1, 26), (1, 27), (1, 28), (1, 29), (1, 30), (1, 31),
-        (2, 1), (2, 2), (2, 3), (2, 4), (2, 5), (2, 6), (2, 7), (2, 8), (2, 9), (2, 10),
-        (2, 11), (2, 12), (2, 13), (2, 14), (2, 15), (2, 16), (2, 17), (2, 18), (2, 19), (2, 20),
-    ]
-    
+
     month_day = (date.month, date.day)
-    
-    return month_day in holidays or month_day in spring_festival_period
+
+    # 保守策略：如果不在确认的节假日列表中，返回 False
+    # 这样可能会有少量真实节假日被漏判，但大大减少误判
+    return month_day in holidays
 
 
-# ==================== HTTP 会话管理 ====================
+# ==================== 自适应限流器 ====================
 
-# 全局 Session 对象，复用连接
-_http_session = None
+class AdaptiveRateLimiter:
+    """
+    自适应请求频率限制器
 
-def get_http_session():
-    """获取或创建 HTTP Session 实例"""
-    global _http_session
-    
-    if _http_session is None:
-        try:
-            import requests
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
-            
-            _http_session = requests.Session()
-            
-            # 配置重试策略
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "OPTIONS"]
-            )
-            
-            adapter = HTTPAdapter(max_retries=retry_strategy)
-            _http_session.mount("http://", adapter)
-            _http_session.mount("https://", adapter)
-            
-            logger.debug("HTTP Session 已创建，启用连接池")
-            
-        except ImportError:
-            logger.warning("requests 库未安装，无法使用 Session 优化")
-            return None
-    
-    return _http_session
+    特性:
+    - 跟踪连续失败/成功次数
+    - 失败时指数退避 (base * multiplier^failures)
+    - 成功后逐步恢复正常（每次成功减少一点延迟）
+    - 线程安全的状态管理
+    """
+
+    def __init__(
+        self,
+        base_delay: float = 5.0,
+        max_delay: float = 300.0,
+        multiplier: float = 2.0,
+        recovery_factor: float = 0.8,
+        min_delay: float = 2.0,
+        failure_ceiling: int = 10
+    ):
+        """
+        初始化自适应限流器
+
+        参数:
+            base_delay: 基础延迟（秒）
+            max_delay: 最大延迟（秒）
+            multiplier: 失败时指数增长倍数
+            recovery_factor: 成功后延迟减少因子
+            min_delay: 最小延迟（秒）
+            failure_ceiling: 最大连续失败计数
+        """
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.multiplier = multiplier
+        self.recovery_factor = recovery_factor
+        self.min_delay = min_delay
+        self.failure_ceiling = failure_ceiling
+
+        # 内部状态
+        self._consecutive_failures = 0
+        self._consecutive_successes = 0
+        self._current_delay = base_delay
+        self._last_request_time = 0
+        self._lock = None  # 延迟初始化
+
+    def _get_lock(self):
+        """延迟初始化锁（避免导入时问题）"""
+        if self._lock is None:
+            import threading
+            self._lock = threading.Lock()
+        return self._lock
+
+    def record_success(self):
+        """记录一次成功请求"""
+        with self._get_lock():
+            self._consecutive_failures = 0
+            self._consecutive_successes += 1
+
+            # 成功后逐步恢复：delay *= recovery_factor（但不低于 base_delay）
+            if self._consecutive_successes >= 2:
+                self._current_delay = max(
+                    self.base_delay,
+                    self._current_delay * self.recovery_factor
+                )
+
+    def record_failure(self):
+        """记录一次失败请求"""
+        with self._get_lock():
+            self._consecutive_failures += 1
+            self._consecutive_successes = 0
+
+            # 失败时指数退避
+            if self._consecutive_failures >= 2:
+                self._current_delay = min(
+                    self.max_delay,
+                    self.base_delay * (self.multiplier ** (self._consecutive_failures - 1))
+                )
+
+    def wait(self) -> float:
+        """执行延迟等待（基于当前状态动态调整）"""
+        import time
+        import random as _random
+
+        with self._get_lock():
+            current_time = time.time()
+            elapsed = current_time - self._last_request_time
+
+            # 添加随机抖动 (±25%)
+            jitter = _random.uniform(-0.25, 0.25) * self._current_delay
+            actual_delay = max(0, self._current_delay + jitter)
+
+            if elapsed < actual_delay:
+                time.sleep(actual_delay - elapsed)
+
+            self._last_request_time = time.time()
+
+        return self._current_delay
+
+    def get_status(self) -> dict:
+        """获取当前状态"""
+        with self._get_lock():
+            return {
+                'current_delay': self._current_delay,
+                'consecutive_failures': self._consecutive_failures,
+                'consecutive_successes': self._consecutive_successes,
+                'mode': 'RECOVERY' if self._consecutive_successes >= 3 else
+                        'BACKOFF' if self._consecutive_failures >= 2 else
+                        'NORMAL'
+            }
 
 
-# ==================== User-Agent 轮换（增强版） ====================
+# ==================== 批次处理器 ====================
 
-# 随机 User-Agent 列表（更多样化，模拟真实用户）
-USER_AGENTS = [
-    # Chrome Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    # Chrome macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    # Chrome Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    # Firefox Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    # Firefox macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    # Firefox Linux
-    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    # Edge Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-]
+class BatchProcessor:
+    """
+    改进的批次处理器
 
-# 常用中文网站 Referer 列表（模拟真实访问来源）
-REFERERS = [
-    "https://www.baidu.com/s?wd=股票行情",
-    "https://www.sogou.com/web?query=股票数据",
-    "https://cn.bing.com/search?q=A 股行情",
-    "https://finance.sina.com.cn/",
-    "https://www.eastmoney.com/",
-    "",  # 有时也使用空 Referer
-]
+    特性:
+    - 减小批次大小，更频繁的休息
+    - 自适应休息时长（根据失败情况增加）
+    """
 
-def get_random_user_agent() -> str:
-    """获取随机 User-Agent"""
-    return random.choice(USER_AGENTS)
+    def __init__(
+        self,
+        batch_size: int = 5,
+        long_rest_after_batches: int = 3,
+        long_rest_duration: float = 30.0,
+        short_rest_duration: float = 5.0,
+        adaptive_long_rest: bool = True
+    ):
+        """
+        初始化批次处理器
 
-def get_random_referer() -> str:
-    """获取随机 Referer"""
-    return random.choice(REFERERS)
+        参数:
+            batch_size: 每批处理的股票数量
+            long_rest_after_batches: 每处理几批后长时间休息
+            long_rest_duration: 长休息时长（秒）
+            short_rest_duration: 短休息时长（秒）
+            adaptive_long_rest: 是否启用自适应长休息
+        """
+        self.batch_size = batch_size
+        self.long_rest_after_batches = long_rest_after_batches
+        self.long_rest_duration = long_rest_duration
+        self.short_rest_duration = short_rest_duration
+        self.adaptive_long_rest = adaptive_long_rest
+
+        self._batch_count = 0
+        self._total_processed = 0
+        self._total_failures = 0
+
+    def pre_request_wait(self, rate_limiter: AdaptiveRateLimiter, extra_delay: float = 0):
+        """请求前等待（结合自适应限流器）"""
+        base_wait = rate_limiter.wait()
+
+        if extra_delay > 0:
+            time.sleep(extra_delay)
+
+        return base_wait + extra_delay
+
+    def post_request_handling(self, success: bool, rate_limiter: AdaptiveRateLimiter):
+        """请求后处理（批次判断、休息）"""
+        self._total_processed += 1
+
+        if success:
+            rate_limiter.record_success()
+            self._batch_count += 1
+        else:
+            rate_limiter.record_failure()
+            self._total_failures += 1
+
+            # 失败后增加长休息概率
+            if self.adaptive_long_rest and self._total_failures >= 3:
+                self._batch_count = self.long_rest_after_batches  # 触发长休息
+
+        # 判断是否需要长休息
+        if self._batch_count >= self.long_rest_after_batches:
+            self._batch_count = 0
+            actual_rest = self.long_rest_duration
+
+            if self.adaptive_long_rest:
+                # 根据失败率调整休息时长
+                failure_rate = self._total_failures / max(self._total_processed, 1)
+                if failure_rate > 0.3:
+                    actual_rest *= 2  # 失败率高时加倍
+                elif failure_rate > 0.5:
+                    actual_rest *= 3
+
+            logger.info(f"批次长休息 {actual_rest:.0f} 秒 (失败率: {failure_rate:.1%})")
+            time.sleep(actual_rest)
+        else:
+            # 短休息
+            time.sleep(self.short_rest_duration)
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        return {
+            'processed': self._total_processed,
+            'failures': self._total_failures,
+            'failure_rate': self._total_failures / max(self._total_processed, 1),
+            'batches': self._batch_count
+        }
 
 
-# ==================== 请求频率控制 ====================
+# ==================== 全局限流器实例（延迟初始化） ====================
+
+_global_rate_limiter = None
+_global_batch_processor = None
+
+
+def get_global_rate_limiter(config: dict = None) -> AdaptiveRateLimiter:
+    """获取或创建全局自适应限流器实例"""
+    global _global_rate_limiter
+
+    if _global_rate_limiter is None or config is not None:
+        if config is None:
+            config = {}
+
+        network_cfg = config.get('network', {})
+        _global_rate_limiter = AdaptiveRateLimiter(
+            base_delay=network_cfg.get('min_delay_per_stock', 5.0),
+            max_delay=network_cfg.get('max_cooldown', 300.0),
+            multiplier=network_cfg.get('adaptive_cooldown_multiplier', 2.0),
+            recovery_factor=network_cfg.get('recovery_factor', 0.8),
+            min_delay=network_cfg.get('min_delay_per_stock', 2.0)
+        )
+
+    return _global_rate_limiter
+
+
+def get_global_batch_processor(config: dict = None) -> BatchProcessor:
+    """获取或创建全局批次处理器实例"""
+    global _global_batch_processor
+
+    if _global_batch_processor is None or config is not None:
+        if config is None:
+            config = {}
+
+        network_cfg = config.get('network', {})
+        _global_batch_processor = BatchProcessor(
+            batch_size=network_cfg.get('batch_size', 5),
+            long_rest_after_batches=network_cfg.get('long_rest_after_batches', 3),
+            long_rest_duration=network_cfg.get('long_rest_duration', 30.0),
+            short_rest_duration=network_cfg.get('min_delay_per_stock', 3.0)
+        )
+
+    return _global_batch_processor
+
+
+# ==================== 请求频率控制（兼容旧接口） ====================
 
 def enforce_rate_limit(min_delay: float = 2.0, max_delay: float = 5.0):
     """
@@ -335,62 +502,76 @@ def enforce_rate_limit(min_delay: float = 2.0, max_delay: float = 5.0):
     _last_request_time = time.time()
 
 
-def add_human_behavior_delay(base_delay: float = 1.5):
-    """
-    添加人类行为延迟（随机性更强，模拟真实用户）
-    
-    参数:
-        base_delay: 基础延迟时间（秒）
-    
-    返回:
-        实际延迟时间
-    """
-    # 加入高斯分布的随机性（更接近人类行为）
-    delay = max(0.5, random.gauss(base_delay, base_delay * 0.3))
-    time.sleep(delay)
-    return delay
-
-
 # ==================== Baostock 数据源（备用） ====================
 
-def _ensure_baostock_login():
-    """确保 Baostock 已登录"""
+def _ensure_baostock_login(force_relogin: bool = False):
+    """
+    确保 Baostock 已登录
+
+    参数:
+        force_relogin: 是否强制重新登录
+    """
     global _bs_logged_in
-    
-    if not _bs_logged_in and BAOSTOCK_AVAILABLE:
-        try:
-            bs.login()
-            _bs_logged_in = True
-            logger.debug("Baostock 登录成功")
-        except Exception as e:
-            logger.warning(f"Baostock 登录失败：{str(e)}")
-            _bs_logged_in = False
+
+    if not BAOSTOCK_AVAILABLE:
+        return
+
+    # 如果已登录且不强制重新登录，则跳过
+    if _bs_logged_in and not force_relogin:
+        return
+
+    # 如果之前登录失败，等待一段时间后再试
+    if hasattr(_ensure_baostock_login, '_last_failed_time'):
+        import time
+        last_failed = _ensure_baostock_login._last_failed_time
+        if time.time() - last_failed < 60:  # 1分钟内不重试
+            logger.debug("Baostock 登录失败冷却中...")
+            return
+
+    try:
+        # 如果之前已登录，先尝试登出
+        if _bs_logged_in:
+            try:
+                bs.logout()
+            except:
+                pass
+
+        bs.login()
+        _bs_logged_in = True
+        logger.info("Baostock 登录成功")
+
+    except Exception as e:
+        logger.warning(f"Baostock 登录失败：{str(e)}")
+        _bs_logged_in = False
+        _ensure_baostock_login._last_failed_time = time.time()
 
 
-def fetch_from_baostock(code: str, start_date: str = None, 
+def fetch_from_baostock(code: str, start_date: str = None,
                         end_date: str = None, adjust: str = "qfq") -> pd.DataFrame:
     """
     从 Baostock 获取股票历史行情（备用数据源）
-    
+
     参数:
         code: 股票代码 (格式：600519.SH)
         start_date: 开始日期 (YYYYMMDD)
         end_date: 结束日期 (YYYYMMDD)
         adjust: 复权类型 ('': 不复权，'qfq': 前复权，'hfq': 后复权)
-    
+
     返回:
         DataFrame 包含：date, open, high, low, close, volume, amount
     """
+    global _bs_logged_in
+
     if not BAOSTOCK_AVAILABLE:
         return pd.DataFrame()
-    
+
     # 确保已登录
     _ensure_baostock_login()
-    
+
     if not _bs_logged_in:
         logger.warning("Baostock 未登录，无法获取数据")
         return pd.DataFrame()
-    
+
     # 转换股票代码格式 (600519.SH -> sh.600519)
     if '.' in code:
         symbol_part = code.split('.')[0]
@@ -399,22 +580,29 @@ def fetch_from_baostock(code: str, start_date: str = None,
     else:
         logger.error(f"股票代码格式错误：{code}")
         return pd.DataFrame()
-    
-    # 默认日期范围
+
+    # 日期格式转换 (AkShare 用 YYYYMMDD, Baostock 用 YYYY-MM-DD)
+    def convert_date_format(date_str):
+        if not date_str:
+            return None
+        # 如果是 YYYYMMDD 格式，转换为 YYYY-MM-DD
+        if len(date_str) == 8 and date_str.isdigit():
+            return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        return date_str
+
+    start_date = convert_date_format(start_date)
+    end_date = convert_date_format(end_date)
+
+    # 默认日期范围 (Baostock 需要 YYYY-MM-DD 格式)
     if not start_date:
-        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
     if not end_date:
-        end_date = datetime.now().strftime("%Y%m%d")
-    
+        end_date = datetime.now().strftime("%Y-%m-%d")
+
     try:
-        # 根据复权类型选择字段
-        if adjust == 'qfq':
-            fields = "date,time,open,high,low,close,volume,amount,turn,pctChg"
-        elif adjust == 'hfq':
-            fields = "date,time,open,high,low,close,volume,amount,turn,pctChg"
-        else:
-            fields = "date,time,open,high,low,close,volume,amount,turn,pctChg"
-        
+        # 日线数据字段（不包括 time，分红送股日会有 time 字段但日线不需要）
+        fields = "date,open,high,low,close,volume,amount,turn,pctChg"
+
         # 查询日线数据
         rs = bs.query_history_k_data_plus(
             bs_code,
@@ -424,21 +612,29 @@ def fetch_from_baostock(code: str, start_date: str = None,
             frequency="d",  # 日线
             adjustflag="3" if adjust == 'qfq' else ("2" if adjust == 'hfq' else "1")
         )
-        
-        # 检查查询结果
-        if rs.error_code != '0':
-            logger.error(f"Baostock 查询失败：{rs.error_msg}")
+
+        # 检查查询结果是否有效
+        if rs is None:
+            logger.warning(f"Baostock 查询返回 None：{code}")
+            # 重新尝试登录
+            _bs_logged_in = False
+            _ensure_baostock_login()
             return pd.DataFrame()
-        
+
+        if not hasattr(rs, 'error_code') or rs.error_code != '0':
+            error_msg = getattr(rs, 'error_msg', 'Unknown error') if rs else 'None'
+            logger.warning(f"Baostock 查询失败：{error_msg}")
+            return pd.DataFrame()
+
         # 转换为 DataFrame
         data_list = []
-        while (rs.error_code == '0') and rs.next():
+        while rs and rs.next():
             data_list.append(rs.get_row_data())
-        
+
         if not data_list:
             logger.warning(f"Baostock 未获取到数据：{code}")
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(data_list, columns=rs.fields)
         
         # 重命名列名为英文
@@ -476,7 +672,7 @@ def fetch_from_baostock(code: str, start_date: str = None,
         
     except Exception as e:
         logger.error(f"✗ {code} Baostock 获取失败：{str(e)}")
-        return pd.DataFrame()
+        raise  # 传播异常，让调用方能识别错误类型
 
 
 # ==================== 增量数据更新引擎 ====================
@@ -592,8 +788,9 @@ def backfill_missing_data(code: str, missing_dates: List[str],
     # 获取每个区间的数据
     all_backfill_data = []
     for start_dt, end_dt in date_ranges:
-        start_str = datetime.strptime(start_dt, '%Y-%m-%d').strftime('%Y%m%d')
-        end_str = datetime.strptime(end_dt, '%Y-%m-%d').strftime('%Y%m%d')
+        # Baostock 需要 YYYY-MM-DD 格式（带破折号）
+        start_str = datetime.strptime(start_dt, '%Y-%m-%d').strftime('%Y-%m-%d')
+        end_str = datetime.strptime(end_dt, '%Y-%m-%d').strftime('%Y-%m-%d')
         
         logger.debug(f"补全区间：{start_str} 至 {end_str}")
         
@@ -789,37 +986,40 @@ def incremental_update(code: str, data_dir: str = "./data",
 
 # ==================== 数据获取（增强版） ====================
 
-def fetch_stock_history(code: str, start_date: str = None, 
+def fetch_stock_history(code: str, start_date: str = None,
                         end_date: str = None, adjust: str = "qfq",
-                        max_retries: int = 5, 
+                        max_retries: int = 3,
                         base_delay: float = 2.0,
                         timeout: int = 30,
-                        use_baostock_fallback: bool = True) -> pd.DataFrame:
+                        use_baostock_fallback: bool = True,
+                        prefer_baostock: bool = True,
+                        aggressive_switch: bool = True) -> pd.DataFrame:
     """
-    获取股票历史行情 (日线) - 增强反反爬虫版
-    
+    获取股票历史行情 (日线) - 自适应反反爬虫版
+
     特性:
-    - 人类行为模拟（随机延迟、User-Agent 轮换、Referer 轮换）
-    - 智能重试机制（指数退避 + 抖动）
-    - 请求频率控制
-    - AkShare/Baostock 双数据源自动切换
-    - 连续失败保护
-    
+    - 自适应限流器（指数退避 + 成功后恢复）
+    - 快速失败切换（aggressive_switch）
+    - 优先 Baostock（更稳定）
+    - AkShare/Baostock 双数据源
+
     参数:
         code: 股票代码 (格式：600519.SH)
         start_date: 开始日期 (YYYYMMDD)，默认 20200101
         end_date: 结束日期 (YYYYMMDD)，默认今天
         adjust: 复权类型 ('': 不复权，'qfq': 前复权，'hfq': 后复权)
-        max_retries: 最大重试次数 (默认 5 次)
+        max_retries: 最大重试次数 (默认 3 次，快速失败)
         base_delay: 基础延迟范围 (默认 2.0 秒)
         timeout: 请求超时时间 (秒，默认 30 秒)
         use_baostock_fallback: 是否启用 Baostock 备用数据源
-    
+        prefer_baostock: 是否优先使用 Baostock（默认 True）
+        aggressive_switch: 是否启用快速切换模式（默认 True，遇到错误立即切换）
+
     返回:
         DataFrame 包含：date, open, high, low, close, volume, amount
     """
     global _consecutive_failures
-    
+
     # 分离代码和交易所
     if '.' in code:
         symbol = code.split('.')[0]
@@ -827,146 +1027,136 @@ def fetch_stock_history(code: str, start_date: str = None,
     else:
         logger.error(f"股票代码格式错误：{code}")
         return pd.DataFrame()
-    
+
     # 默认日期范围
     if not start_date:
         start_date = "20200101"
     if not end_date:
         end_date = datetime.now().strftime("%Y%m%d")
-    
-    # 重试逻辑 - 增强版（模拟人类行为）
+
+    # 获取全局限流器
+    rate_limiter = get_global_rate_limiter()
+
+    # 定义数据源获取函数
+    def fetch_from_akshare_impl():
+        """从 AkShare 获取数据"""
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust
+        )
+
+        if df is not None and not df.empty and len(df) > 0:
+            column_mapping = {
+                '日期': 'date', '开盘': 'open', '最高': 'high',
+                '最低': 'low', '收盘': 'close', '成交量': 'volume',
+                '成交额': 'amount', '振幅': 'amplitude',
+                '涨跌幅': 'pct_change', '涨跌额': 'change',
+                '换手率': 'turnover_rate'
+            }
+            df = df.rename(columns=column_mapping)
+            df['date'] = pd.to_datetime(df['date'])
+            required_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            available_cols = [col for col in required_cols if col in df.columns]
+            return df[available_cols]
+        return pd.DataFrame()
+
+    # 确定数据源顺序
+    if prefer_baostock:
+        source_order = ['baostock', 'akshare']
+    else:
+        source_order = ['akshare', 'baostock']
+
+    # 重试逻辑
     for attempt in range(max_retries):
         try:
-            # === 请求前延迟（模拟人类操作） ===
-            if attempt > 0:
-                # 指数退避 + 随机抖动
-                random_base = random.uniform(2.0, 4.0)  # 更长的基础延迟
-                delay = random_base * (2 ** (attempt - 1))
-                # 添加随机抖动（±20%）
-                jitter = random.uniform(-0.2, 0.2) * delay
-                delay += jitter
-                # 限制最大延迟不超过 60 秒
-                delay = min(delay, 60.0)
-                
-                logger.warning(
-                    f"{code} 第 {attempt} 次重试，等待 {delay:.1f}秒 "
-                    f"(基础={random_base:.1f}s, 倍率=2^{attempt-1}, 抖动={jitter:.1f}s)"
-                )
-                time.sleep(delay)
-            
-            # === 设置请求头（环境变量） ===
-            os.environ['USER_AGENT'] = get_random_user_agent()
-            os.environ['HTTP_REFERER'] = get_random_referer()
-            
-            # === 尝试 AkShare（主数据源） ===
-            if AKSHARE_AVAILABLE:
-                logger.debug(f"{code} 使用 AkShare 获取数据 (User-Agent: {get_random_user_agent()[:50]}...)")
-                
-                df = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust
-                )
-                
-                # 验证数据有效性
-                if df is not None and not df.empty and len(df) > 0:
-                    # 重命名列名为英文
-                    column_mapping = {
-                        '日期': 'date',
-                        '开盘': 'open',
-                        '最高': 'high',
-                        '最低': 'low',
-                        '收盘': 'close',
-                        '成交量': 'volume',
-                        '成交额': 'amount',
-                        '振幅': 'amplitude',
-                        '涨跌幅': 'pct_change',
-                        '涨跌额': 'change',
-                        '换手率': 'turnover_rate'
-                    }
-                    
-                    df = df.rename(columns=column_mapping)
-                    
-                    # 转换日期格式
-                    df['date'] = pd.to_datetime(df['date'])
-                    
-                    # 选择需要的列
-                    required_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
-                    available_cols = [col for col in required_cols if col in df.columns]
-                    df = df[available_cols]
-                    
-                    logger.info(f"✓ {code} AkShare 成功获取 {len(df)} 条记录 (尝试 {attempt+1}/{max_retries})")
-                    _consecutive_failures = 0  # 重置失败计数
-                    return df
-            
-            # === AkShare 失败，尝试 Baostock（备用数据源） ===
-            if use_baostock_fallback and BAOSTOCK_AVAILABLE:
-                logger.info(f"{code} AkShare 不可用，切换到 Baostock...")
-                df_bs = fetch_from_baostock(code, start_date, end_date, adjust)
-                
-                if df_bs is not None and not df_bs.empty and len(df_bs) > 0:
-                    logger.info(f"✓ {code} Baostock 成功获取 {len(df_bs)} 条记录")
-                    _consecutive_failures = 0  # 重置失败计数
-                    return df_bs
-            
-            # 两个数据源都失败
-            raise Exception("AkShare 和 Baostock 均未返回有效数据")
-            
+            # 每次重试都重新确定数据源顺序（基于 prefer_baostock，非修改后的 source_order）
+            # 这样确保反爬虫切换后，下次重试仍按原始偏好选择数据源
+            if prefer_baostock:
+                current_source_order = ['baostock', 'akshare']
+            else:
+                current_source_order = ['akshare', 'baostock']
+
+            # 请求前等待（使用自适应限流器）
+            rate_limiter.wait()
+
+            # 尝试各个数据源
+            for source in current_source_order:
+                if source == 'baostock' and BAOSTOCK_AVAILABLE and use_baostock_fallback:
+                    logger.info(f"{code} 尝试从 Baostock 获取...")
+                    df_bs = fetch_from_baostock(code, start_date, end_date, adjust)
+                    if df_bs is not None and not df_bs.empty and len(df_bs) > 0:
+                        logger.info(f"✓ {code} Baostock 成功获取 {len(df_bs)} 条记录")
+                        rate_limiter.record_success()
+                        return df_bs
+
+                    # Baostock 失败，快速切换
+                    if aggressive_switch:
+                        logger.warning(f"{code} Baostock 失败，启用快速切换...")
+                        continue
+
+                elif source == 'akshare' and AKSHARE_AVAILABLE:
+                    logger.debug(f"{code} 尝试从 AkShare 获取...")
+                    df = fetch_from_akshare_impl()
+                    if df is not None and not df.empty and len(df) > 0:
+                        logger.info(f"✓ {code} AkShare 成功获取 {len(df)} 条记录")
+                        rate_limiter.record_success()
+                        return df
+
+            # 所有源都失败，抛出异常
+            raise Exception("所有数据源均未返回有效数据")
+
         except Exception as e:
             error_msg = str(e)
             error_type = type(e).__name__
-            _consecutive_failures += 1
-            
-            # 判断是否为反爬虫相关错误
+            rate_limiter.record_failure()
+
+            # 判断错误类型
             anti_bot_keywords = [
                 '403', '429', 'Too Many Requests', 'Forbidden',
                 '访问频繁', 'IP 被限制', '请求过于频繁',
                 'Robot detection', 'Anti-bot'
             ]
-            
             is_anti_bot_error = any(kw in error_msg for kw in anti_bot_keywords)
-            
-            # 判断是否为网络相关错误
+
             network_keywords = [
-                'Connection', 'timeout', 'Timeout', 'Remote end', 
+                'Connection', 'timeout', 'Timeout', 'Remote end',
                 'network', 'read timed out', 'Max retries',
-                'ConnectionError', 'ConnectionResetError'
+                'ConnectionError', 'ConnectionResetError',
+                # 新增：远程连接断开相关
+                'RemoteDisconnected', 'Connection aborted',
+                'ConnectionRefusedError', 'SSLError',
+                'Could not fetch', 'ECONNRESET', 'EOF',
             ]
-            
             is_network_error = any(kw in error_msg for kw in network_keywords)
-            
+
+            status = rate_limiter.get_status()
+            logger.warning(
+                f"{code} 获取失败 (尝试 {attempt+1}/{max_retries}): {error_type}: {error_msg[:80]}... "
+                f"[限流器: {status['mode']}, delay={status['current_delay']:.1f}s]"
+            )
+
             if is_anti_bot_error:
-                logger.warning(
-                    f"{code} 可能触发反爬虫机制 ({error_type}): {error_msg[:100]}..."
-                )
-                # 遇到反爬虫错误，增加额外延迟
-                if attempt < max_retries - 1:
-                    extra_delay = random.uniform(5.0, 10.0)
-                    logger.warning(f"{code} 触发反爬保护，额外等待 {extra_delay:.1f}秒...")
+                # 反爬虫错误，快速切换到 Baostock
+                if aggressive_switch and prefer_baostock:
+                    logger.warning(f"{code} 反爬虫错误，快速切换数据源...")
+                    source_order = ['baostock']  # 只用 Baostock
+                elif attempt < max_retries - 1:
+                    extra_delay = random.uniform(10.0, 20.0)
+                    logger.warning(f"{code} 额外冷却 {extra_delay:.1f}秒...")
                     time.sleep(extra_delay)
             elif is_network_error and attempt < max_retries - 1:
-                logger.warning(f"{code} 网络错误 ({error_type}): {error_msg[:100]}...")
                 continue
-            elif is_network_error and attempt >= max_retries - 1:
-                logger.error(
-                    f"✗ {code} 网络错误，重试{max_retries}次后放弃 "
-                    f"(总耗时约{sum([base_delay * (2**i) for i in range(max_retries)])}秒)"
-                )
+            elif attempt >= max_retries - 1:
+                logger.error(f"✗ {code} 重试{max_retries}次后放弃")
             else:
-                logger.error(f"✗ {code} 获取失败 ({error_type}): {error_msg}")
-                
-                # 如果是数据源问题，尝试切换数据源
-                if "ak" in error_msg.lower() and use_baostock_fallback:
-                    logger.info(f"{code} 尝试使用 Baostock 作为备用数据源...")
-                    df_bs = fetch_from_baostock(code, start_date, end_date, adjust)
-                    if df_bs is not None and not df_bs.empty and len(df_bs) > 0:
-                        return df_bs
                 break
-    
+
     # 所有重试都失败
-    logger.error(f"✗ {code} 最终无法获取数据 (连续失败{_consecutive_failures}次)")
+    status = rate_limiter.get_status()
+    logger.error(f"✗ {code} 最终无法获取数据 [限流器: {status['mode']}, delay={status['current_delay']:.1f}s]")
     return pd.DataFrame()
 
 
@@ -975,14 +1165,14 @@ def fetch_stock_history(code: str, start_date: str = None,
 def get_cache_path(code: str, data_dir: str = "./data") -> str:
     """获取缓存文件路径"""
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, f"{code.replace('.', '_')}.csv")
+    return os.path.join(data_dir, f"{code.replace('.', '_')}.parquet")
 
 
 def load_from_cache(cache_path: str) -> Optional[pd.DataFrame]:
     """从本地缓存加载数据"""
     if os.path.exists(cache_path):
         try:
-            df = pd.read_csv(cache_path, parse_dates=['date'])
+            df = pd.read_parquet(cache_path)
             logger.debug(f"从缓存加载：{cache_path}")
             return df
         except Exception as e:
@@ -994,7 +1184,7 @@ def load_from_cache(cache_path: str) -> Optional[pd.DataFrame]:
 def save_to_cache(df: pd.DataFrame, cache_path: str) -> bool:
     """保存数据到本地缓存"""
     try:
-        df.to_csv(cache_path, index=False)
+        df.to_parquet(cache_path, index=False, engine='pyarrow')
         logger.debug(f"数据已缓存：{cache_path}")
         return True
     except Exception as e:
@@ -1002,36 +1192,87 @@ def save_to_cache(df: pd.DataFrame, cache_path: str) -> bool:
         return False
 
 
-def get_stock_data(code: str, data_dir: str = "./data", 
+def migrate_csv_to_parquet(data_dir: str = "./data") -> Dict[str, Any]:
+    """
+    将现有 CSV 缓存文件迁移到 Parquet 格式
+
+    迁移成功后自动删除原始 CSV 文件
+
+    参数:
+        data_dir: 数据目录
+
+    返回:
+        包含迁移结果的字典：{'success': [], 'failed': []}
+    """
+    csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+    results: Dict[str, List] = {'success': [], 'failed': []}
+
+    if not csv_files:
+        logger.info("没有找到需要迁移的 CSV 文件")
+        return results
+
+    logger.info(f"开始迁移 {len(csv_files)} 个 CSV 文件到 Parquet 格式...")
+
+    for csv_file in csv_files:
+        csv_path = os.path.join(data_dir, csv_file)
+        parquet_file = csv_file.replace('.csv', '.parquet')
+        parquet_path = os.path.join(data_dir, parquet_file)
+
+        # 如果 Parquet 已存在，直接删除 CSV
+        if os.path.exists(parquet_path):
+            os.remove(csv_path)
+            logger.info(f"Parquet 已存在，删除 CSV：{csv_file}")
+            continue
+
+        try:
+            df = pd.read_csv(csv_path, parse_dates=['date'])
+            df.to_parquet(parquet_path, index=False, engine='pyarrow')
+            os.remove(csv_path)  # 转换成功后删除原始 CSV
+            results['success'].append(csv_file)
+            logger.info(f"迁移成功：{csv_file} -> {parquet_file} ({len(df)} 条记录)")
+        except Exception as e:
+            results['failed'].append((csv_file, str(e)))
+            logger.error(f"迁移失败：{csv_file} - {str(e)}")
+
+    logger.info(f"\n{'='*60}")
+    logger.info(f"CSV -> Parquet 迁移完成:")
+    logger.info(f"  成功: {len(results['success'])}")
+    logger.info(f"  失败: {len(results['failed'])}")
+    logger.info(f"{'='*60}")
+
+    return results
+
+
+def get_stock_data(code: str, data_dir: str = "./data",
                    use_cache: bool = True, fallback_to_cache: bool = True,
-                   prefer_baostock: bool = False, 
+                   prefer_baostock: bool = True,
                    enable_incremental: bool = True,
                    force_full: bool = False,
                    **kwargs) -> pd.DataFrame:
     """
     获取股票数据 (优先读取缓存，支持双数据源自动切换，增量更新引擎)
-    
+
     参数:
         code: 股票代码
         data_dir: 数据目录
         use_cache: 是否使用缓存
         fallback_to_cache: 网络失败时是否降级使用过期缓存
-        prefer_baostock: 是否优先使用 Baostock（用于 AkShare 被限制时）
+        prefer_baostock: 是否优先使用 Baostock（默认 True，更稳定）
         enable_incremental: 是否启用增量更新（默认启用）
         force_full: 是否强制全量更新（忽略增量逻辑）
         **kwargs: 传递给 fetch_stock_history 的参数
-    
+
     返回:
         DataFrame 包含历史行情
     """
     cache_path = get_cache_path(code, data_dir)
-    
-    # === 增量更新模式（新特性） ===
+
+    # === 增量更新模式 ===
     if enable_incremental and not force_full:
         logger.info(f"{code} 使用增量更新引擎...")
         return incremental_update(code, data_dir=data_dir, adjust='qfq', force_full=False)
-    
-    # === 传统全量模式（向后兼容） ===
+
+    # === 传统全量模式 ===
     # 尝试从缓存加载
     if use_cache:
         cached_df = load_from_cache(cache_path)
@@ -1039,36 +1280,33 @@ def get_stock_data(code: str, data_dir: str = "./data",
             # 检查缓存是否为最新 (简单检查最后一条记录的日期)
             last_date = cached_df['date'].max()
             days_diff = (datetime.now() - last_date).days
-            
+
             # 如果缓存是 7 天内的，直接使用
             if days_diff <= 7:
                 logger.info(f"✓ {code} 使用缓存数据 (最后更新：{last_date.strftime('%Y-%m-%d')})")
                 return cached_df
             else:
                 logger.info(f"{code} 缓存已过时 ({days_diff}天前), 尝试获取最新数据...")
-    
-    # 重新获取数据
-    if prefer_baostock and BAOSTOCK_AVAILABLE:
-        logger.info(f"正在从 Baostock 获取 {code} 的最新数据...")
-        df = fetch_from_baostock(code, **kwargs)
-        
-        # 如果 Baostock 失败，回退到 AkShare
-        if df.empty:
-            logger.info(f"{code} Baostock 获取失败，切换到 AkShare...")
-            df = fetch_stock_history(code, use_baostock_fallback=False, **kwargs)
-    else:
-        logger.info(f"正在获取 {code} 的最新数据...")
-        df = fetch_stock_history(code, use_baostock_fallback=True, **kwargs)
-    
+
+    # 重新获取数据 - 使用统一的 fetch_stock_history（包含自适应限流和快速切换）
+    logger.info(f"正在获取 {code} 的最新数据 (prefer_baostock={prefer_baostock})...")
+    df = fetch_stock_history(
+        code,
+        prefer_baostock=prefer_baostock,
+        aggressive_switch=True,
+        use_baostock_fallback=True,
+        **kwargs
+    )
+
     # 保存到缓存
     if len(df) > 0:
         save_to_cache(df, cache_path)
-        
+
         # 更新元数据（全量模式）
         last_date = df['date'].max().strftime('%Y-%m-%d')
-        update_stock_metadata(code, last_date, len(df), data_dir, 
+        update_stock_metadata(code, last_date, len(df), data_dir,
                              update_mode='full_legacy')
-        
+
         return df
     else:
         # 网络获取失败，如果有缓存则降级使用
@@ -1081,7 +1319,7 @@ def get_stock_data(code: str, data_dir: str = "./data",
                     f"(最后更新：{last_date.strftime('%Y-%m-%d')})"
                 )
                 return cached_df
-        
+
         logger.error(f"✗ {code} 无法获取任何数据 (缓存和网络均失败)")
         return pd.DataFrame()
 
@@ -1330,122 +1568,134 @@ def is_valid_a_stock_code(code: str) -> bool:
     return False
 
 
-def get_all_a_stocks(force_refresh: bool = False) -> pd.DataFrame:
+def get_all_a_stocks(force_refresh: bool = False, prefer_baostock: bool = True) -> pd.DataFrame:
     """
-    获取所有 A 股股票列表 (沪深两市) - 增强版
-    严格过滤，仅返回中国大陆 A 股市场股票
-    
+    获取所有 A 股股票列表 (沪深两市) - 安全版
+
+    改进:
+    1. 优先使用 Baostock（更稳定，对请求频率限制宽松）
+    2. 沪深分别获取，交易所间休息
+    3. AkShare 失败后不再继续（快速失败）
+
     参数:
         force_refresh: 是否强制刷新缓存
-    
+        prefer_baostock: 是否优先使用 Baostock（默认 True）
+
     返回:
         DataFrame 包含：code, name, exchange, list_date 等
     """
-    logger.info("正在获取全市场 A 股列表（严格过滤非 A 股）...")
-    
+    logger.info("正在获取全市场 A 股列表（安全模式）...")
+
+    # 预延迟（模拟打开浏览器、输入网址的时间）
+    logger.info("预延迟 10 秒...")
+    time.sleep(random.uniform(8.0, 12.0))
+
     results = []
-    ak_success = False
-    
-    # === 尝试从 AkShare 获取 ===
-    if AKSHARE_AVAILABLE:
+    success = False
+
+    # === 优先使用 Baostock（更稳定） ===
+    if prefer_baostock and BAOSTOCK_AVAILABLE:
+        logger.info("从 Baostock 获取 A 股列表（优先）...")
+
         try:
-            # 添加延迟模拟人类行为
-            enforce_rate_limit(min_delay=3.0, max_delay=6.0)
-            
-            # 设置随机 User-Agent 和 Referer
-            os.environ['USER_AGENT'] = get_random_user_agent()
-            os.environ['HTTP_REFERER'] = get_random_referer()
-            
-            # 获取沪深 A 股列表
+            _ensure_baostock_login()
+
+            if _bs_logged_in:
+                # 分两次获取（沪市、深市）
+                for exchange_code, exchange_name in [('sh', 'SH'), ('sz', 'SZ')]:
+                    logger.info(f"获取 {exchange_name} 市股票...")
+
+                    rs = bs.query_all_stock(exchange_code)
+
+                    # 检查 rs 是否有效
+                    if rs is None or not hasattr(rs, 'error_code'):
+                        logger.warning(f"Baostock {exchange_name} 市查询返回无效结果")
+                        continue
+
+                    if rs.error_code == '0':
+                        data_list = []
+                        while rs.next():
+                            data_list.append(rs.get_row_data())
+
+                        if data_list:
+                            df = pd.DataFrame(data_list, columns=rs.fields)
+                            if 'code' in df.columns:
+                                for _, row in df.iterrows():
+                                    code = str(row['code']).zfill(6)
+                                    full_code = f"{code}.{exchange_name}"
+
+                                    if is_valid_a_stock_code(full_code):
+                                        results.append({
+                                            'code': full_code,
+                                            'name': row.get('code_name', ''),
+                                            'exchange': exchange_name
+                                        })
+
+                    # 交易所间休息
+                    rest_time = random.uniform(3.0, 5.0)
+                    logger.info(f"{exchange_name} 市完成，休息 {rest_time:.1f} 秒...")
+                    time.sleep(rest_time)
+
+                if results:
+                    logger.info(f"Baostock 成功获取 {len(results)} 只 A 股")
+                    success = True
+
+        except Exception as e:
+            logger.error(f"Baostock 获取失败：{str(e)}")
+            # Baostock 失败后不再尝试 AkShare（快速失败）
+            logger.warning("Baostock 失败，不再尝试 AkShare（快速失败策略）")
+            success = False
+
+    # === 只有在 Baostock 失败时才尝试 AkShare ===
+    if not success and AKSHARE_AVAILABLE:
+        logger.info("尝试从 AkShare 获取 A 股列表（备用）...")
+
+        try:
+            # 添加延迟
+            enforce_rate_limit(min_delay=5.0, max_delay=10.0)
+
+            # 获取沪市 A 股列表
             logger.info("获取沪市 A 股列表...")
             df_sh = ak.stock_info_sh_name_code()
-            
+
             # 处理沪市股票
             if 'code' in df_sh.columns:
                 for _, row in df_sh.iterrows():
                     code = str(row['code']).zfill(6)
                     full_code = f"{code}.SH"
-                    
-                    # 严格验证是否为 A 股
+
                     if is_valid_a_stock_code(full_code):
                         name = row.get('name', '')
                         results.append({'code': full_code, 'name': name, 'exchange': 'SH'})
-            
-            logger.info(f"获取深市 A 股列表...")
+
+            # 沪深间休息
+            rest_time = random.uniform(5.0, 8.0)
+            logger.info(f"沪市完成，休息 {rest_time:.1f} 秒...")
+            time.sleep(rest_time)
+
+            # 获取深市 A 股列表
+            logger.info("获取深市 A 股列表...")
             df_sz = ak.stock_info_a_code_name()
-            
+
             # 处理深市股票
             if 'code' in df_sz.columns:
                 for _, row in df_sz.iterrows():
                     code = str(row['code']).zfill(6)
                     full_code = f"{code}.SZ"
-                    
-                    # 严格验证是否为 A 股
+
                     if is_valid_a_stock_code(full_code):
                         name = row.get('name', '')
                         results.append({'code': full_code, 'name': name, 'exchange': 'SZ'})
-            
-            ak_success = len(results) > 0
-            
+
+            if results:
+                logger.info(f"AkShare 成功获取 {len(results)} 只 A 股")
+                success = True
+
         except Exception as e:
-            logger.error(f"AkShare 获取 A 股列表失败：{str(e)}")
-            ak_success = False
-    
-    # === 如果 AkShare 失败，尝试 Baostock ===
-    if not ak_success and BAOSTOCK_AVAILABLE:
-        logger.info("AkShare 获取失败，尝试从 Baostock 获取 A 股列表...")
-        
-        try:
-            _ensure_baostock_login()
-            
-            if _bs_logged_in:
-                # 查询上交所股票
-                rs_sh = bs.query_all_stock('sh')
-                if rs_sh.error_code == '0':
-                    data_list = []
-                    while rs_sh.next():
-                        data_list.append(rs_sh.get_row_data())
-                    
-                    if data_list:
-                        df_sh = pd.DataFrame(data_list, columns=rs_sh.fields)
-                        if 'code' in df_sh.columns:
-                            for _, row in df_sh.iterrows():
-                                code = str(row['code']).zfill(6)
-                                if code.startswith('6'):  # 沪市
-                                    full_code = f"{code}.SH"
-                                    if is_valid_a_stock_code(full_code):
-                                        results.append({
-                                            'code': full_code,
-                                            'name': row.get('code_name', ''),
-                                            'exchange': 'SH'
-                                        })
-                
-                # 查询深交所股票
-                rs_sz = bs.query_all_stock('sz')
-                if rs_sz.error_code == '0':
-                    data_list = []
-                    while rs_sz.next():
-                        data_list.append(rs_sz.get_row_data())
-                    
-                    if data_list:
-                        df_sz = pd.DataFrame(data_list, columns=rs_sz.fields)
-                        if 'code' in df_sz.columns:
-                            for _, row in df_sz.iterrows():
-                                code = str(row['code']).zfill(6)
-                                if code.startswith('0') or code.startswith('3'):  # 深市
-                                    full_code = f"{code}.SZ"
-                                    if is_valid_a_stock_code(full_code):
-                                        results.append({
-                                            'code': full_code,
-                                            'name': row.get('code_name', ''),
-                                            'exchange': 'SZ'
-                                        })
-                
-                ak_success = len(results) > 0
-                
-        except Exception as e:
-            logger.error(f"Baostock 获取 A 股列表失败：{str(e)}")
-    
+            logger.error(f"AkShare 最终也失败：{str(e)}")
+            # AkShare 失败后直接返回空，不再继续
+            success = False
+
     # === 结果处理 ===
     if not results:
         logger.warning("未从任何数据源获取到有效的 A 股代码")
@@ -1460,22 +1710,22 @@ def get_all_a_stocks(force_refresh: bool = False) -> pd.DataFrame:
             'name': [''] * len(fallback_stocks),
             'exchange': [code.split('.')[1] for code in fallback_stocks]
         })
-    
+
     df_all = pd.DataFrame(results)
-    
+
     # 二次过滤：确保所有代码都符合 A 股规范
     initial_count = len(df_all)
     df_all = df_all[df_all['code'].apply(is_valid_a_stock_code)]
     filtered_count = initial_count - len(df_all)
-    
+
     if filtered_count > 0:
         logger.info(f"二次过滤移除 {filtered_count} 只非 A 股股票")
-    
+
     # 按交易所和代码排序
     df_all = df_all.sort_values(['exchange', 'code']).reset_index(drop=True)
-    
+
     logger.info(f"✓ 成功获取 {len(df_all)} 只 A 股股票 (沪市{len(df_all[df_all['exchange']=='SH'])}只，深市{len(df_all[df_all['exchange']=='SZ'])}只)")
-    
+
     return df_all
 
 
@@ -1504,105 +1754,155 @@ def filter_stocks_by_criteria(df_stocks: pd.DataFrame,
 
 # ==================== 选股数据准备（增强版） ====================
 
+def get_update_strategy(code: str, data_dir: str, hurst_threshold: float = 0.5) -> Tuple[str, Dict]:
+    """
+    根据股票的缓存数据和历史 Hurst 值决定更新策略
+
+    参数:
+        code: 股票代码
+        data_dir: 数据目录
+        hurst_threshold: Hurst 阈值
+
+    返回:
+        (strategy, kwargs) - 策略名称和传递给 get_stock_data 的参数
+        strategy 可选:
+        - 'full': 全量获取（无缓存或 Hurst 不合格）
+        - 'incremental': 增量更新（Hurst 合格）
+        - 'cache_only': 仅使用缓存（Hurst 不合格但有缓存）
+    """
+    cache_path = get_cache_path(code, data_dir)
+    metadata = get_stock_metadata(code, data_dir)
+
+    if metadata is None:
+        # 无元数据，需要全量获取
+        return 'full', {'force_full': True, 'enable_incremental': False}
+
+    hurst = metadata.get('hurst')
+    if hurst is None:
+        # 有缓存但无 Hurst 值，需要重新计算（全量获取）
+        return 'full', {'force_full': True, 'enable_incremental': False}
+
+    if hurst < hurst_threshold:
+        # Hurst 合格，继续增量更新
+        return 'incremental', {'force_full': False, 'enable_incremental': True}
+    else:
+        # Hurst 不合格，仅使用缓存不更新
+        return 'cache_only', {'force_full': False, 'enable_incremental': False}
+
+
 def prepare_selection_data(stocks: List[str], config: dict) -> pd.DataFrame:
     """
-    为选股准备数据 (批量获取股票数据并计算指标) - 增强反反爬虫版
-    
+    为选股准备数据 (批量获取股票数据并计算指标) - 智能增量更新版
+
     策略:
-    - 随机延迟（模拟人类操作间隔）
-    - 每批处理后长时间休息
+    - 自适应限流器（指数退避 + 成功后恢复）
+    - 批次处理器（更频繁的休息）
     - 连续失败保护
-    - 双数据源自动切换
-    
+    - 优先使用 Baostock
+    - 智能增量更新:
+        - Hurst < 0.5 的股票：增量更新（保持合格股票数据新鲜）
+        - Hurst >= 0.5 的股票：仅使用缓存（跳过更新，减少请求）
+        - 无数据的股票：全量获取
+
     参数:
         stocks: 股票代码列表
         config: 配置字典
-    
+
     返回:
         包含各股票指标的 DataFrame
     """
     import time
-    
+
     results = []
     data_dir = config['paths']['data_dir']
     selection_cfg = config.get('selection', {})
-    
-    # 从配置读取网络优化参数
     network_cfg = config.get('network', {})
-    min_delay_per_stock = network_cfg.get('min_delay_per_stock', 2.0)
-    max_delay_per_stock = network_cfg.get('max_delay_per_stock', 5.0)
-    batch_size = network_cfg.get('batch_size', 10)
-    long_rest_after_batches = network_cfg.get('long_rest_after_batches', 5)
-    long_rest_duration = network_cfg.get('long_rest_duration', 10.0)
-    
+    hurst_threshold = selection_cfg.get('hurst_threshold', 0.5)
+
+    # 初始化自适应限流器和批次处理器
+    rate_limiter = get_global_rate_limiter(config)
+    batch_processor = get_global_batch_processor(config)
+
     # 统计成功和失败数量
     success_count = 0
     fail_count = 0
-    consecutive_failures = 0
-    
+    skip_update_count = 0  # 因 Hurst 不合格而跳过更新的数量
+
     logger.info(f"\n开始处理 {len(stocks)} 只股票的数据...")
-    logger.info(f"延迟设置：{min_delay_per_stock}-{max_delay_per_stock}秒/股票，每{batch_size}只休息{long_rest_duration}秒")
-    
+    status = rate_limiter.get_status()
+    logger.info(f"自适应限流器状态：{status['mode']}, 当前延迟={status['current_delay']:.1f}秒")
+    logger.info(f"智能更新策略：Hurst < {hurst_threshold} 的股票增量更新，>= {hurst_threshold} 的股票跳过更新")
+
     for i, code in enumerate(stocks):
         try:
-            # === 批次处理 + 长休息 ===
-            if i > 0 and i % (batch_size * long_rest_after_batches) == 0:
-                logger.info(f"\n已处理 {i} 只股票，进行长时间休息 ({long_rest_duration}秒)...")
-                time.sleep(long_rest_duration)
-            
-            # === 随机延迟（每只股票之间） ===
-            if i > 0:
-                delay = random.uniform(min_delay_per_stock, max_delay_per_stock)
-                # 偶尔（10% 概率）添加额外延迟，模拟人类休息
-                if random.random() < 0.1:
-                    extra_delay = random.uniform(5.0, 15.0)
-                    logger.info(f"股票 {code} 前添加额外延迟 {extra_delay:.1f}秒...")
-                    delay += extra_delay
-                
-                logger.debug(f"等待 {delay:.1f}秒后处理 {code}...")
-                time.sleep(delay)
-            
-            logger.info(f"[{i+1}/{len(stocks)}] 处理股票：{code}")
-            
-            # === 获取历史数据 ===
-            df = get_stock_data(code, data_dir=data_dir)
-            
-            if df.empty or len(df) < 60:
-                logger.warning(f"{code} 数据不足 (<60 条)，跳过")
-                fail_count += 1
-                consecutive_failures += 1
-                
-                # 连续失败过多时，主动休息
-                if consecutive_failures >= 5:
-                    logger.warning(f"连续失败{consecutive_failures}次，主动休息 30 秒...")
-                    time.sleep(30.0)
-                    consecutive_failures = 0
-                continue
-            
-            # 重置连续失败计数
-            consecutive_failures = 0
-            
+            # === 决定更新策略 ===
+            strategy, update_kwargs = get_update_strategy(code, data_dir, hurst_threshold)
+
+            if strategy == 'cache_only':
+                logger.info(f"[{i+1}/{len(stocks)}] {code} (Hurst 不合格，使用缓存)")
+                # 仅从缓存加载
+                cache_path = get_cache_path(code, data_dir)
+                df = load_from_cache(cache_path)
+                if df is None or len(df) < 60:
+                    # 缓存无效，降级为全量获取
+                    logger.warning(f"{code} 缓存无效，改为全量获取")
+                    df = get_stock_data(code, data_dir=data_dir,
+                                        prefer_baostock=network_cfg.get('prefer_baostock', True),
+                                        force_full=True, enable_incremental=False)
+                    if df.empty or len(df) < 60:
+                        fail_count += 1
+                        continue
+                else:
+                    skip_update_count += 1
+            else:
+                # === 请求前等待（使用自适应限流器） ===
+                extra_delay = 0
+                # 偶尔（15% 概率）添加额外延迟，模拟人类休息
+                if random.random() < network_cfg.get('extra_delay_probability', 0.15):
+                    extra_delay = random.uniform(
+                        network_cfg.get('extra_delay_min', 5.0),
+                        network_cfg.get('extra_delay_max', 20.0)
+                    )
+
+                batch_processor.pre_request_wait(rate_limiter, extra_delay)
+
+                if extra_delay > 0:
+                    logger.info(f"添加额外人类行为延迟 {extra_delay:.1f}秒")
+
+                logger.info(f"[{i+1}/{len(stocks)}] {code} (策略: {strategy})")
+
+                # === 获取历史数据 ===
+                df = get_stock_data(code, data_dir=data_dir,
+                                    prefer_baostock=network_cfg.get('prefer_baostock', True),
+                                    **update_kwargs)
+
+                if df.empty or len(df) < 60:
+                    logger.warning(f"{code} 数据不足 (<60 条)，跳过")
+                    fail_count += 1
+                    batch_processor.post_request_handling(False, rate_limiter)
+                    continue
+
             # === 清洗数据 ===
             df = clean_data(df)
-            
+
             # === 计算最新指标 ===
             latest = df.iloc[-1]
-            
+
             # 计算 ATR
             df['atr'] = calculate_atr(df, selection_cfg.get('atr_period', 20))
             latest_atr = df['atr'].iloc[-1]
-            
+
             # 计算波动率
             df['volatility'] = calculate_volatility(df, 20)
             latest_vol = df['volatility'].iloc[-1]
-            
+
             # 计算 Hurst 指数 (使用最近 250 天的收盘价)
             price_series = df['close'].tail(250)
             hurst = calculate_hurst_exponent(price_series)
-            
+
             # 计算日均成交额 (用于流动性过滤)
             avg_turnover = df['amount'].tail(20).mean() / 10000  # 转换为万元
-            
+
             # === 收集结果 ===
             results.append({
                 'code': code,
@@ -1613,27 +1913,43 @@ def prepare_selection_data(stocks: List[str], config: dict) -> pd.DataFrame:
                 'avg_turnover': avg_turnover,
                 'valid': True
             })
-            
+
             success_count += 1
-            
+
+            # === 保存 Hurst 到元数据 ===
+            last_date = df['date'].max().strftime('%Y-%m-%d') if 'date' in df.columns else metadata.get('last_update_date', '')
+            update_stock_metadata(code, last_date, len(df), data_dir, hurst=hurst)
+
+            # 请求后处理（批次判断、休息）
+            if strategy != 'cache_only':
+                batch_processor.post_request_handling(True, rate_limiter)
+
             # 进度报告
-            if (i + 1) % 20 == 0:
-                logger.info(f"进度：{i+1}/{len(stocks)}, 成功:{success_count}, 失败:{fail_count}")
-        
+            if (i + 1) % 10 == 0:
+                status = rate_limiter.get_status()
+                batch_stats = batch_processor.get_stats()
+                logger.info(f"进度：{i+1}/{len(stocks)}, 成功:{success_count}, 失败:{fail_count}, 跳过更新:{skip_update_count}, 限流器:{status['mode']}")
+
         except Exception as e:
             logger.error(f"处理 {code} 时发生异常：{str(e)}")
             fail_count += 1
-            consecutive_failures += 1
-    
+            if strategy != 'cache_only':
+                batch_processor.post_request_handling(False, rate_limiter)
+
     # === 输出统计信息 ===
     logger.info(f"\n{'='*60}")
     logger.info(f"选股数据处理完成:")
     logger.info(f"  总计：{len(stocks)} 只")
     logger.info(f"  成功：{success_count} 只")
     logger.info(f"  失败：{fail_count} 只")
+    logger.info(f"  跳过更新：{skip_update_count} 只 (Hurst >= {hurst_threshold})")
     logger.info(f"  成功率：{success_count/max(len(stocks),1)*100:.1f}%")
+    final_status = rate_limiter.get_status()
+    final_batch = batch_processor.get_stats()
+    logger.info(f"  最终限流器状态：{final_status['mode']}, 延迟={final_status['current_delay']:.1f}秒")
+    logger.info(f"  批次统计：处理={final_batch['processed']}, 失败={final_batch['failures']}, 失败率={final_batch['failure_rate']:.1%}")
     logger.info(f"{'='*60}")
-    
+
     return pd.DataFrame(results)
 
 

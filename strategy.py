@@ -22,6 +22,31 @@ from utils import (
     check_limit_status, check_t1_rule, format_number, safe_divide
 )
 
+# 新模块：多因子选股 (可选)
+try:
+    from indicators import calculate_all_indicators, get_latest_indicators
+    from screener import MultiFactorScreener, screen_universe
+    NEW_SCREENER_AVAILABLE = True
+except ImportError:
+    NEW_SCREENER_AVAILABLE = False
+    logger.warning("新多因子选股模块不可用，请检查 indicators.py 和 screener.py 是否存在")
+
+# 新模块：动态网格引擎 (可选)
+try:
+    from grid_engine import DynamicGridEngine
+    GRID_ENGINE_AVAILABLE = True
+except ImportError:
+    GRID_ENGINE_AVAILABLE = False
+    logger.warning("动态网格引擎不可用，请检查 grid_engine.py 是否存在")
+
+# 新模块：增强风控 (可选)
+try:
+    from risk import EnhancedRiskControl
+    ENHANCED_RISK_AVAILABLE = True
+except ImportError:
+    ENHANCED_RISK_AVAILABLE = False
+    logger.warning("增强风控模块不可用，请检查 risk.py 是否存在")
+
 
 logger = logging.getLogger("grid_trading")
 
@@ -34,20 +59,27 @@ import sys
 def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
     """
     选股模式：筛选适合网格交易的标的
-    
+
     选股标准:
     1. Hurst 指数 < 0.5 (均值回归特性)
     2. 流动性充足 (日均成交额 > 阈值)
     3. 价格适中 (避免高价股和低价股)
     4. 波动率适中 (避免过度波动)
-    
+
     参数:
         config: 配置字典
         auto_update_config: 是否自动更新配置文件
-    
+
     返回:
         符合条件的股票列表 DataFrame
     """
+    # 检查是否使用新的多因子选股器
+    if '--new-screener' in sys.argv and NEW_SCREENER_AVAILABLE:
+        logger.info("=" * 60)
+        logger.info("使用多因子横截面打分选股器 (--new-screener)")
+        logger.info("=" * 60)
+        return run_multi_factor_selection(config, auto_update_config)
+
     logger.info("=" * 60)
     logger.info("开始执行选股策略...")
     logger.info("=" * 60)
@@ -177,8 +209,163 @@ def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame
         # === 自动更新配置文件 ===
         if auto_update_config and len(df_selection) > 0:
             update_config_with_selected_stocks(df_selection, config)
-    
+
     return df_selection
+
+
+def run_multi_factor_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
+    """
+    多因子横截面打分选股模式 (新)
+
+    使用多因子模型替代绝对 Hurst < 0.5 阈值筛选。
+
+    因子:
+    - OU 半衰期 (35%): 快速均值回归优先
+    - Hurst 指数 (30%): 趋势性指标
+    - ADX (20%): 趋势强度
+    - 波动率适配 (15%): 中等波动最好
+
+    参数:
+        config: 配置字典
+        auto_update_config: 是否自动更新配置文件
+
+    返回:
+        符合条件的多因子得分 Top N 股票列表 DataFrame
+    """
+    if not NEW_SCREENER_AVAILABLE:
+        logger.error("多因子选股模块不可用，切换到传统选股")
+        return run_selection(config, auto_update_config)
+
+    logger.info("=" * 60)
+    logger.info("开始执行多因子横截面打分选股...")
+    logger.info("=" * 60)
+
+    paths_cfg = config.get('paths', {})
+    selection_cfg = config.get('selection', {})
+
+    # 获取全市场股票列表
+    from data import get_all_a_stocks, get_stock_data
+
+    df_all_stocks = get_all_a_stocks()
+
+    if df_all_stocks.empty:
+        logger.error("无法获取全市场股票列表")
+        return pd.DataFrame()
+
+    # 初步过滤 (仅保留代码格式正确的)
+    initial_count = len(df_all_stocks)
+    df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
+    logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票")
+
+    # 限制处理数量
+    max_stocks_to_process = selection_cfg.get('max_stocks_to_process', 200)
+    stock_list = df_all_stocks['code'].head(max_stocks_to_process).tolist()
+    logger.info(f"将处理最近的 {len(stock_list)} 只股票")
+
+    # 计算每只股票的因子指标
+    stocks_factors = []
+    success_count = 0
+    fail_count = 0
+
+    for i, code in enumerate(stock_list):
+        try:
+            # 获取数据
+            df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
+            if df.empty:
+                fail_count += 1
+                continue
+
+            # 清洗数据
+            df = clean_data(df)
+
+            # 计算所有指标
+            if len(df) < 60:
+                fail_count += 1
+                continue
+
+            df_with_indicators = calculate_all_indicators(df)
+            latest = get_latest_indicators(df_with_indicators)
+
+            if not latest or all(v is None for v in latest.values()):
+                fail_count += 1
+                continue
+
+            # 获取价格和成交额
+            latest_price = df['close'].iloc[-1]
+            avg_turnover = df['amount'].tail(20).mean() / 10000  # 万元
+
+            # ST 检查 (简化: 通过名称判断)
+            # 实际应通过财务数据判断
+            is_st = False
+
+            stocks_factors.append({
+                'code': code,
+                'price': latest_price,
+                'avg_turnover': avg_turnover,
+                'is_st': is_st,
+                **latest
+            })
+            success_count += 1
+
+            if (i + 1) % 50 == 0:
+                logger.info(f"已处理 {i+1}/{len(stock_list)} 只股票")
+
+        except Exception as e:
+            logger.debug(f"处理 {code} 时发生异常：{str(e)}")
+            fail_count += 1
+
+    logger.info(f"指标计算完成: 成功 {success_count}, 失败 {fail_count}")
+
+    if not stocks_factors:
+        logger.error("没有获取到任何股票数据")
+        return pd.DataFrame()
+
+    # 使用多因子打分器筛选
+    screening_config = config.get('screening', {})
+    screener = MultiFactorScreener(screening_config)
+
+    top_n = selection_cfg.get('save_top_n', 20)
+    df_result = screener.screen(stocks_factors, top_n=top_n)
+
+    if df_result.empty:
+        logger.warning("多因子筛选后无股票，调整阈值重试...")
+        # 放宽条件重试
+        screening_config['initial_filters']['min_turnover'] = 5000  # 降至 5000 万
+        screener = MultiFactorScreener(screening_config)
+        df_result = screener.screen(stocks_factors, top_n=top_n)
+
+    if df_result.empty:
+        logger.error("多因子筛选无结果")
+        return pd.DataFrame()
+
+    # 添加更多信息列
+    df_result['reason'] = df_result.apply(
+        lambda row: f"总分:{row['total_score']:.4f} "
+                    f"(H:{row.get('hurst_score', 0):.2f} "
+                    f"OU:{row.get('ou_score', 0):.2f} "
+                    f"ADX:{row.get('adx_score', 0):.2f} "
+                    f"Vol:{row.get('vol_score', 0):.2f})",
+        axis=1
+    )
+
+    logger.info("\n" + "=" * 60)
+    logger.info("多因子选股结果 (Top 10):")
+    logger.info("=" * 60)
+
+    for _, row in df_result.head(10).iterrows():
+        logger.info(f"#{int(row['rank']):2d} {row['code']:<12s} | {row['reason']}")
+
+    # 保存选股结果
+    output_dir = paths_cfg['output_dir']
+    result_file = os.path.join(output_dir, "stock_selection_multifactor.csv")
+    df_result.to_csv(result_file, index=False, encoding='utf-8-sig')
+    logger.info(f"\n多因子选股结果已保存到：{result_file}")
+
+    # 自动更新配置文件
+    if auto_update_config and len(df_result) > 0:
+        update_config_with_selected_stocks(df_result, config)
+
+    return df_result
 
 
 def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict):
@@ -295,13 +482,14 @@ def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict)
 def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
                            grid_amount: float, initial_position: float,
                            max_grids: int, commission_rate: float,
-                           stamp_tax: float) -> Dict:
+                           stamp_tax: float, slippage_rate: float = 0.001) -> Dict:
     """
-    网格交易回测引擎
+    网格交易回测引擎（增强版 - 包含滑点）
     
     原理:
     - 将资金分成多份，在价格下跌时买入，上涨时卖出
     - 记录每次交易，计算最终收益
+    - 考虑滑点成本（买入价上浮，卖出价下浮）
     
     参数:
         df: 历史行情数据 (包含 close 列)
@@ -311,6 +499,7 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
         max_grids: 最大网格层数
         commission_rate: 佣金费率
         stamp_tax: 印花税率
+        slippage_rate: 滑点比率（默认 0.1%，即千 1）
     
     返回:
         回测结果字典 (包含收益率、最大回撤、卡尔玛比率等)
@@ -324,15 +513,21 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
     cash = 1000000.0  # 假设初始资金 100 万
     position = 0  # 持仓股数
     avg_cost = 0  # 平均成本
+    total_slippage_cost = 0.0  # 累计滑点成本
     
     # 初始建仓
     first_price = prices[0]
     initial_investment = cash * (initial_position / 100)
     position = int(initial_investment / first_price / 100) * 100  # 100 的整数倍
-    cash -= position * first_price + calculate_transaction_fee(
-        position * first_price, 'buy', commission_rate, stamp_tax
+    
+    # 应用滑点：买入成交价 = 理论价 × (1 + 滑点率)
+    actual_buy_price = first_price * (1 + slippage_rate)
+    cost = position * actual_buy_price
+    fee = calculate_transaction_fee(
+        cost, 'buy', commission_rate, stamp_tax
     )
-    avg_cost = first_price
+    cash -= cost + fee
+    avg_cost = actual_buy_price  # 使用实际成交价作为成本
     
     # 网格中心价
     center_price = first_price
@@ -376,24 +571,31 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
                 buy_qty = validate_buy_quantity(int(grid_amount / buy_price))
                 
                 if buy_qty > 0 and cash >= buy_qty * buy_price * 1.01:
-                    cost = buy_qty * buy_price
+                    # 应用滑点：买入成交价 = 理论价 × (1 + 滑点率)
+                    actual_buy_price = buy_price * (1 + slippage_rate)
+                    cost = buy_qty * actual_buy_price
                     fee = calculate_transaction_fee(
                         cost, 'buy', commission_rate, stamp_tax
                     )
                     
                     if cash >= cost + fee:
                         # 更新持仓
-                        total_cost = position * avg_cost + buy_qty * buy_price
+                        total_cost = position * avg_cost + buy_qty * actual_buy_price
                         position += buy_qty
                         avg_cost = total_cost / position if position > 0 else 0
                         cash -= cost + fee
                         
+                        # 记录滑点成本
+                        slippage_cost = buy_qty * (actual_buy_price - buy_price)
+                        total_slippage_cost += slippage_cost
+                        
                         trades.append({
                             'day': i,
                             'type': 'buy',
-                            'price': buy_price,
+                            'price': actual_buy_price,
                             'qty': buy_qty,
-                            'cost': cost + fee
+                            'cost': cost + fee,
+                            'slippage': slippage_cost
                         })
                         break
         
@@ -406,7 +608,9 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
                 ))
                 
                 if sell_qty > 0:
-                    revenue = sell_qty * sell_price
+                    # 应用滑点：卖出成交价 = 理论价 × (1 - 滑点率)
+                    actual_sell_price = sell_price * (1 - slippage_rate)
+                    revenue = sell_qty * actual_sell_price
                     fee = calculate_transaction_fee(
                         revenue, 'sell', commission_rate, stamp_tax
                     )
@@ -415,12 +619,17 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
                     position -= sell_qty
                     cash += revenue - fee
                     
+                    # 记录滑点成本
+                    slippage_cost = sell_qty * (sell_price - actual_sell_price)
+                    total_slippage_cost += slippage_cost
+                    
                     trades.append({
                         'day': i,
                         'type': 'sell',
-                        'price': sell_price,
+                        'price': actual_sell_price,
                         'qty': sell_qty,
-                        'revenue': revenue - fee
+                        'revenue': revenue - fee,
+                        'slippage': slippage_cost
                     })
                     break
         
@@ -467,6 +676,14 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
     # 交易次数
     n_trades = len(trades)
     
+    # 滑点统计
+    total_trade_amount = sum(
+        abs(t.get('cost', 0) - t.get('fee', 0)) if t['type'] == 'buy' 
+        else t.get('revenue', 0) + t.get('fee', 0)
+        for t in trades
+    )
+    slippage_ratio = safe_divide(total_slippage_cost, total_trade_amount, 0) if total_trade_amount > 0 else 0
+    
     return {
         'total_return': total_return,
         'annual_return': annual_return,
@@ -475,7 +692,9 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
         'sharpe_ratio': sharpe_ratio,
         'n_trades': n_trades,
         'final_value': final_value,
-        'trades': trades
+        'trades': trades,
+        'total_slippage_cost': total_slippage_cost,
+        'slippage_ratio': slippage_ratio
     }
 
 
@@ -554,7 +773,8 @@ def run_optimization(config: dict) -> Dict:
                 initial_position=initial_position,
                 max_grids=max_grids,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005)
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
             )
             
             # 返回卡尔玛比率 (最大化)
@@ -591,7 +811,8 @@ def run_optimization(config: dict) -> Dict:
             initial_position=best_params['initial_position'],
             max_grids=best_params['max_grids'],
             commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005)
+            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+            slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
         )
         
         logger.info(f"样本外验证 - 卡尔玛比率：{result_oos['calmar_ratio']:.4f}")
@@ -1660,7 +1881,8 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
                 initial_position=initial_position,
                 max_grids=max_grids,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005)
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
             )
             
             # 返回 Calmar Ratio（最大化）
@@ -1699,7 +1921,8 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
             initial_position=best_params['initial_position'],
             max_grids=best_params['max_grids'],
             commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005)
+            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+            slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
         )
         
         logger.info(f"\n{code} Out-of-Sample 绩效指标:")

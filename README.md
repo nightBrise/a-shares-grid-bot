@@ -3,7 +3,7 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 ---
 
@@ -11,11 +11,11 @@
 
 | 特性 | 说明 |
 |------|------|
-| 📊 **智能选股** | Hurst 指数筛选均值回归标的，多维度过滤 |
+| 📊 **智能选股** | 多因子横截面打分（OU半衰期、Hurst、ADX、波动率） |
 | 🎯 **参数优化** | Optuna 贝叶斯优化寻找最佳网格参数 |
 | 📈 **信号生成** | 自动生成次日买卖计划，动态调整参数 |
-| 🛡️ **严格风控** | 个股 15%/全局 10% 双重熔断机制 |
-| ⚡ **高效更新** | 增量数据更新，效率提升 10 倍 |
+| 🛡️ **严格风控** | T+1 追踪、单股/全局熔断、涨跌停跳过 |
+| ⚡ **高效更新** | 增量数据更新 + HTTP Session 复用，效率提升 10 倍 |
 
 ---
 
@@ -68,16 +68,21 @@ python main.py --mode signal
 ```
 auto_grid_trading_system/
 ├── main.py                  # 主入口
-├── strategy.py              # 核心策略 (~1920 行)
-├── data.py                  # 数据管理 (~1700 行)
+├── strategy.py              # 核心策略 (~2200 行)
+├── data.py                  # 数据管理 (~2000 行)
+├── data_http.py             # HTTP Session 管理器 (新增)
 ├── utils.py                 # 工具函数 (~450 行)
 ├── risk_control.py          # 风控模块 (~450 行)
+├── risk.py                  # 增强风控模块 (新增)
+├── indicators.py            # 技术指标计算 (新增)
+├── screener.py              # 多因子选股器 (新增)
+├── grid_engine.py           # 动态网格引擎 (新增)
 │
 ├── config_base.yaml         # 基础配置
-├── config_enhanced.yaml     # 增强配置（含完整风控）
 │
 ├── README.md                # 本文件
-├── VERSION.md               # 版本发布说明
+├── CLAUDE.md               # Claude Code 指导文件
+├── VERSION.md              # 版本发布说明
 │
 └── docs/                    # 详细文档目录
     ├── quick_start.md       # 快速开始指南
@@ -95,13 +100,23 @@ auto_grid_trading_system/
 
 ### 1. 智能选股系统
 
-**选股标准**:
-- Hurst 指数 < 0.5 (均值回归特性)
-- 日均成交额 ≥ 5000 万元
+**多因子横截面打分**（替代 Hurst<0.5 绝对阈值）:
+
+| 因子 | 权重 | 说明 |
+|------|------|------|
+| OU 半衰期 | -35% | 快速均值回归优先 |
+| Hurst 指数 | -30% | 均值回归特性 |
+| ADX | -20% | 趋势强度，越低越适合网格 |
+| 波动率适配 | +15% | 中等波动最佳 |
+
+**初筛条件**:
+- 成交额 ≥ 1 亿元
 - 股价 5-500 元
 - 上市时间 ≥ 1.5 年
 
 **输出**: `output/stock_selection.csv`
+
+> 💡 **为什么不用 Hurst<0.5？** A 股 Hurst > 0.5 为常态（趋势市场），绝对阈值导致无可选股票。多因子打分通过横截面相对排序选择最适合的标的。
 
 ### 2. 参数优化引擎
 
@@ -115,12 +130,17 @@ auto_grid_trading_system/
 
 **输出**: `output/report.json`
 
-### 3. 信号生成系统
+### 3. 动态网格引擎
 
-**特性**:
-- 动态参数调整（根据实时波动率）
-- 实盘熔断检查
-- A 股规则适配（T+1、涨跌停）
+**网格间距自适应**:
+
+| 波动率区间 | 年化波动率 | 网格系数 k |
+|------------|------------|------------|
+| 低波动 | < 20% | k = 2.5（宽松） |
+| 中波动 | 20% ~ 35% | k = 2.0 |
+| 高波动 | > 35% | k = 1.5（紧密） |
+
+**公式**: `ΔP = k × ATR(20)`
 
 **输出**: `output/signals.csv`
 
@@ -174,9 +194,10 @@ auto_grid_trading_system/
 ## 🛠️ 技术栈
 
 - **Python**: 3.11+
-- **核心库**: pandas, numpy, optuna, akshare, baostock
+- **核心库**: pandas, numpy, scipy, optuna, akshare, baostock, numba
 - **数据源**: AkShare (主), Baostock (备)
 - **配置**: YAML + JSON
+- **加速**: Numba JIT 编译（技术指标计算）
 
 **依赖安装**:
 ```bash
@@ -227,6 +248,21 @@ conda env create -f environment.yml
 
 ## 📝 版本历史
 
+### v1.1.0 (2026-04-10) - 多因子打分升级
+
+**新增功能**:
+- ✅ 多因子横截面打分选股器（替代 Hurst<0.5 绝对阈值）
+  - OU 半衰期、Hurst 指数、ADX、波动率适配
+  - Numba JIT 加速的向量化指标计算
+- ✅ 动态网格引擎（波动率区间自适应 k=1.5/2.0/2.5）
+- ✅ 增强风控模块（T+1 追踪、分层滑点、阶梯费率）
+- ✅ HTTP Session 管理器（UA 轮换、连接复用）
+
+**修复**:
+- ✅ data.py 错误处理修复（异常传播、错误分类）
+- ✅ source_order 重置问题
+- ✅ RemoteDisconnected 等网络错误识别
+
 ### v1.0.0 (2026-03-18)
 
 **新增功能**:
@@ -247,13 +283,15 @@ conda env create -f environment.yml
 
 - 🐛 **报告 Bug**: https://github.com/yourusername/a-share-grid-trading-system/issues
 - 💡 **功能建议**: 同上
-- 📧 **联系**: your.email@example.com
+- 📧 **联系**: zhnyworking@163.com
 
 ---
 
 ## 📄 许可证
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+本作品采用 [知识共享署名 - 非商业性使用 - 相同方式共享 4.0 国际许可协议](http://creativecommons.org/licenses/by-nc-sa/4.0/) 进行许可。
+
+详见 [LICENSE](LICENSE) 文件。
 
 ---
 

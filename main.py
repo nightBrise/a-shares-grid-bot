@@ -76,7 +76,13 @@ def parse_arguments():
         action='store_true',
         help='强制重新选股 (忽略配置文件中已有的股票列表)'
     )
-    
+
+    parser.add_argument(
+        '--new-screener',
+        action='store_true',
+        help='使用新多因子横截面打分选股器 (替代 Hurst<0.5 绝对阈值)'
+    )
+
     parser.add_argument(
         '--rolling',
         type=str,
