@@ -3,7 +3,7 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v1.1.0-blue.svg)](VERSION.md)
+[![Version](https://img.shields.io/badge/version-v1.2.0-green.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 ---
