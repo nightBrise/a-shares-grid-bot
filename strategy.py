@@ -25,7 +25,12 @@ from utils import (
 # 新模块：多因子选股 (可选)
 try:
     from indicators import calculate_all_indicators, get_latest_indicators
-    from screener import MultiFactorScreener, screen_universe
+    from screener import (
+        MultiFactorScreener,
+        AdvancedMultiFactorScreener,
+        screen_universe,
+        screen_universe_advanced,
+    )
     NEW_SCREENER_AVAILABLE = True
 except ImportError:
     NEW_SCREENER_AVAILABLE = False
@@ -58,172 +63,50 @@ import sys
 
 def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
     """
-    选股模式：筛选适合网格交易的标的
+    选股模式：使用多因子横截面打分筛选适合网格交易的标的
 
-    选股标准:
-    1. Hurst 指数 < 0.5 (均值回归特性)
-    2. 流动性充足 (日均成交额 > 阈值)
-    3. 价格适中 (避免高价股和低价股)
-    4. 波动率适中 (避免过度波动)
+    多因子模型通过横截面相对排序选择"最适合"网格交易的股票，
+    解决了 A 股 Hurst > 0.5 (趋势市场) 导致绝对阈值无法筛选的问题。
+
+    因子:
+    - OU 半衰期 (35%): 快速均值回归优先
+    - Hurst 指数 (30%): 均值回归特性
+    - ADX (20%): 趋势强度，越低越适合网格
+    - 波动率适配 (15%): 中等波动最佳
 
     参数:
         config: 配置字典
         auto_update_config: 是否自动更新配置文件
 
     返回:
-        符合条件的股票列表 DataFrame
+        多因子得分 Top N 股票列表 DataFrame
     """
-    # 检查是否使用新的多因子选股器
-    if '--new-screener' in sys.argv and NEW_SCREENER_AVAILABLE:
+    # 默认使用多因子横截面打分选股器
+    if NEW_SCREENER_AVAILABLE:
         logger.info("=" * 60)
-        logger.info("使用多因子横截面打分选股器 (--new-screener)")
+        logger.info("使用多因子横截面打分选股器")
         logger.info("=" * 60)
         return run_multi_factor_selection(config, auto_update_config)
 
-    logger.info("=" * 60)
-    logger.info("开始执行选股策略...")
-    logger.info("=" * 60)
-    
-    # 检查是否需要重新选股
-    stocks = config.get('stocks', [])
-    selection_cfg = config.get('selection', {})
-    risk_cfg = config.get('risk', {})
-    paths_cfg = config.get('paths', {})
-    selection_status = config.get('selection_status', {})
-    
-    # 检查选股完成标记
-    is_completed = selection_status.get('completed', False)
-    last_date = selection_status.get('last_selection_date', '')
-    status_version = selection_status.get('version', '')
-    
-    if is_completed and stocks:
-        logger.info(f"✓ 检测到选股完成标记 (最后选股：{last_date})")
-        logger.info(f"  配置文件中已有 {len(stocks)} 只股票，跳过选股流程")
-        logger.info(f"  如需重新选股，请使用 --force-select 参数")
-        
-        # 验证现有股票是否有效
-        from data import prepare_selection_data
-        df_selection = prepare_selection_data(stocks, config)
-        
-        if df_selection.empty:
-            logger.warning("现有股票数据无效，需要重新选股")
-            force_select = True
-        else:
-            # 直接返回现有股票
-            df_selection = df_selection.sort_values('hurst', ascending=True)
-            df_selection['rank'] = range(1, len(df_selection) + 1)
-            logger.info(f"\n使用已选股票池，共 {len(df_selection)} 只股票")
-            return df_selection
-    else:
-        logger.info("未检测到选股完成标记或股票池为空")
-        force_select = True
-    
-    # 强制选股逻辑
-    if '--force-select' in sys.argv or (is_completed and not stocks):
-        force_select = True
-    
-    if force_select:
-        if '--force-select' in sys.argv:
-            logger.info("检测到 --force-select 参数，强制执行选股...")
-        else:
-            logger.info("开始从全市场筛选适合网格交易的标的...")
-        
-        # 获取全市场股票列表
-        from data import get_all_a_stocks, prepare_selection_data
-        
-        df_all_stocks = get_all_a_stocks()
-        
-        if df_all_stocks.empty:
-            logger.error("无法获取全市场股票列表")
-            return pd.DataFrame()
-        
-        # 初步过滤 (仅保留代码格式正确的)
-        initial_count = len(df_all_stocks)
-        df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
-        logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票 (共过滤 {initial_count - len(df_all_stocks)} 只)")
-        
-        # 限制处理数量 (避免时间过长，可选前 100-200 只流动性最好的)
-        max_stocks_to_process = selection_cfg.get('max_stocks_to_process', 200)
-        stock_list = df_all_stocks['code'].head(max_stocks_to_process).tolist()
-        logger.info(f"将处理最近的 {len(stock_list)} 只股票 (可配置 max_stocks_to_process 调整)")
-        
-        # 获取选股数据并计算指标
-        df_selection = prepare_selection_data(stock_list, config)
-        
-        if df_selection.empty:
-            logger.error("没有获取到任何股票数据")
-            return pd.DataFrame()
-        
-        # === 应用选股条件过滤 ===
-        
-        # 1. Hurst 指数过滤 (均值回归)
-        hurst_threshold = selection_cfg.get('hurst_threshold', 0.5)
-        df_selection = df_selection[df_selection['hurst'] < hurst_threshold]
-        logger.info(f"Hurst < {hurst_threshold}: 剩余 {len(df_selection)} 只股票")
-        
-        # 2. 流动性过滤
-        min_turnover = risk_cfg.get('min_turnover', 5000)  # 万元
-        df_selection = df_selection[df_selection['avg_turnover'] >= min_turnover]
-        logger.info(f"日均成交额 >= {min_turnover}万：剩余 {len(df_selection)} 只股票")
-        
-        # 3. 价格过滤
-        min_price = selection_cfg.get('min_price', 5.0)
-        max_price = selection_cfg.get('max_price', 500.0)
-        df_selection = df_selection[
-            (df_selection['price'] >= min_price) & 
-            (df_selection['price'] <= max_price)
-        ]
-        logger.info(f"价格在 [{min_price}, {max_price}] 区间：剩余 {len(df_selection)} 只股票")
-        
-        # 4. 波动率过滤 (避免过度波动)
-        vol_threshold = selection_cfg.get('volatility_threshold', 0.8)
-        df_selection = df_selection[df_selection['volatility'] < vol_threshold]
-        logger.info(f"波动率 < {vol_threshold}: 剩余 {len(df_selection)} 只股票")
-        
-        # === 排序并返回最佳标的 ===
-        # 按 Hurst 指数升序排列 (越小越适合网格)
-        df_selection = df_selection.sort_values('hurst', ascending=True)
-        
-        # 添加排名和推荐理由
-        df_selection['rank'] = range(1, len(df_selection) + 1)
-        df_selection['reason'] = df_selection.apply(
-            lambda row: f"Hurst={row['hurst']:.3f}, "
-                        f"ATR={row['atr']:.2f}, "
-                        f"成交额={row['avg_turnover']:.0f}万",
-            axis=1
-        )
-        
-        logger.info("\n" + "=" * 60)
-        logger.info("选股结果:")
-        logger.info("=" * 60)
-        
-        for _, row in df_selection.iterrows():
-            logger.info(f"{row['rank']}. {row['code']} | 价格:{row['price']:.2f} | {row['reason']}")
-        
-        # 保存选股结果到 CSV
-        output_dir = paths_cfg['output_dir']
-        result_file = os.path.join(output_dir, "stock_selection.csv")
-        df_selection.to_csv(result_file, index=False, encoding='utf-8-sig')
-        logger.info(f"\n选股结果已保存到：{result_file}")
-        
-        # === 自动更新配置文件 ===
-        if auto_update_config and len(df_selection) > 0:
-            update_config_with_selected_stocks(df_selection, config)
-
-    return df_selection
+    logger.error("多因子选股模块不可用，请检查 indicators.py 和 screener.py")
+    return pd.DataFrame()
 
 
 def run_multi_factor_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
     """
-    多因子横截面打分选股模式 (新)
+    多因子横截面打分选股模式 (高级版)
 
-    使用多因子模型替代绝对 Hurst < 0.5 阈值筛选。
+    使用四因子正交化模型：
+    - F1: Reversion_Speed (OU半衰期) - 均值回归速度
+    - F2: Trend_Strength (ADX) - 趋势持续性
+    - F3: Vol_Quality (波动率倒U型) - 波动质量
+    - F4: Path_Memory (Variance Ratio) - 残差分形结构
 
-    因子:
-    - OU 半衰期 (35%): 快速均值回归优先
-    - Hurst 指数 (30%): 趋势性指标
-    - ADX (20%): 趋势强度
-    - 波动率适配 (15%): 中等波动最好
+    特性：
+    - 横截面多元正交化（F4 对 F1、F2 回归取残差）
+    - 双轨权重（ETF vs 股票）
+    - 动态阈值（adaptive_quantile 模式）
+    - 现金缓冲机制
 
     参数:
         config: 配置字典
@@ -233,15 +116,16 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
         符合条件的多因子得分 Top N 股票列表 DataFrame
     """
     if not NEW_SCREENER_AVAILABLE:
-        logger.error("多因子选股模块不可用，切换到传统选股")
-        return run_selection(config, auto_update_config)
+        logger.error("多因子选股模块不可用，请检查 indicators.py 和 screener.py")
+        return pd.DataFrame()
 
     logger.info("=" * 60)
-    logger.info("开始执行多因子横截面打分选股...")
+    logger.info("开始执行高级多因子横截面打分选股 (v2)...")
     logger.info("=" * 60)
 
     paths_cfg = config.get('paths', {})
     selection_cfg = config.get('selection', {})
+    adv_cfg = config.get('advanced_screening', {})
 
     # 获取全市场股票列表
     from data import get_all_a_stocks, get_stock_data
@@ -267,6 +151,10 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     success_count = 0
     fail_count = 0
 
+    # 获取 Path Memory 参数
+    pm_cfg = adv_cfg.get('path_memory', {})
+    vr_min_periods = pm_cfg.get('min_periods', 120)
+
     for i, code in enumerate(stock_list):
         try:
             # 获取数据
@@ -278,15 +166,22 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             # 清洗数据
             df = clean_data(df)
 
-            # 计算所有指标
-            if len(df) < 60:
+            # 检查数据长度（Path Memory 需要至少 120 天）
+            min_periods_required = max(60, vr_min_periods)
+            if len(df) < min_periods_required:
                 fail_count += 1
                 continue
 
+            # 计算所有指标
             df_with_indicators = calculate_all_indicators(df)
             latest = get_latest_indicators(df_with_indicators)
 
             if not latest or all(v is None for v in latest.values()):
+                fail_count += 1
+                continue
+
+            # 检查 Path Memory 因子
+            if latest.get('path_memory') is None:
                 fail_count += 1
                 continue
 
@@ -295,7 +190,6 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             avg_turnover = df['amount'].tail(20).mean() / 10000  # 万元
 
             # ST 检查 (简化: 通过名称判断)
-            # 实际应通过财务数据判断
             is_st = False
 
             stocks_factors.append({
@@ -320,46 +214,53 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
         logger.error("没有获取到任何股票数据")
         return pd.DataFrame()
 
-    # 使用多因子打分器筛选
-    screening_config = config.get('screening', {})
-    screener = MultiFactorScreener(screening_config)
+    # 使用高级多因子打分器筛选
+    screener = AdvancedMultiFactorScreener(config)
 
     top_n = selection_cfg.get('save_top_n', 20)
-    df_result = screener.screen(stocks_factors, top_n=top_n)
+    df_result = screener.screen(stocks_factors, asset_type="stock", top_n=top_n)
 
     if df_result.empty:
-        logger.warning("多因子筛选后无股票，调整阈值重试...")
+        logger.warning("高级多因子筛选后无股票，尝试放宽阈值...")
         # 放宽条件重试
-        screening_config['initial_filters']['min_turnover'] = 5000  # 降至 5000 万
-        screener = MultiFactorScreener(screening_config)
-        df_result = screener.screen(stocks_factors, top_n=top_n)
+        alt_config = config.copy()
+        alt_adv = alt_config.get('advanced_screening', {}).copy()
+        alt_adv['quality_threshold'] = 0.55  # 降低阈值
+        alt_config['advanced_screening'] = alt_adv
+        screener = AdvancedMultiFactorScreener(alt_config)
+        df_result = screener.screen(stocks_factors, asset_type="stock", top_n=top_n)
 
     if df_result.empty:
-        logger.error("多因子筛选无结果")
+        logger.error("高级多因子筛选无结果")
         return pd.DataFrame()
 
     # 添加更多信息列
     df_result['reason'] = df_result.apply(
         lambda row: f"总分:{row['total_score']:.4f} "
-                    f"(H:{row.get('hurst_score', 0):.2f} "
-                    f"OU:{row.get('ou_score', 0):.2f} "
-                    f"ADX:{row.get('adx_score', 0):.2f} "
-                    f"Vol:{row.get('vol_score', 0):.2f})",
+                    f"(F1:{row.get('F1_norm', 0):.2f} "
+                    f"F2:{row.get('F2_norm', 0):.2f} "
+                    f"F3:{row.get('F3_norm', 0):.2f} "
+                    f"F4:{row.get('F4_ortho', 0):.2f})",
         axis=1
     )
 
     logger.info("\n" + "=" * 60)
-    logger.info("多因子选股结果 (Top 10):")
+    logger.info("高级多因子选股结果 (Top 10):")
     logger.info("=" * 60)
 
     for _, row in df_result.head(10).iterrows():
-        logger.info(f"#{int(row['rank']):2d} {row['code']:<12s} | {row['reason']}")
+        params = row.get('grid_params', {})
+        threshold_mark = "✓" if row.get('passes_threshold', True) else "⚠"
+        logger.info(
+            f"{threshold_mark} #{int(row['rank']):2d} {row['code']:<12s} | "
+            f"{row['reason']} | 网格:{params.get('spacing_coef', 'N/A')}×ATR"
+        )
 
     # 保存选股结果
     output_dir = paths_cfg['output_dir']
-    result_file = os.path.join(output_dir, "stock_selection_multifactor.csv")
+    result_file = os.path.join(output_dir, "stock_selection_advanced.csv")
     df_result.to_csv(result_file, index=False, encoding='utf-8-sig')
-    logger.info(f"\n多因子选股结果已保存到：{result_file}")
+    logger.info(f"\n高级多因子选股结果已保存到：{result_file}")
 
     # 自动更新配置文件
     if auto_update_config and len(df_result) > 0:
@@ -2126,6 +2027,95 @@ def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
     except Exception as e:
         logger.exception(f"策略执行失败：{str(e)}")
         raise
+
+
+class SignalStabilizer:
+    """
+    信号稳定性过滤器（无状态设计，调用方维护实例）。
+
+    职责：
+    - 维护 signal_history (maxlen=3)：每只股票最近3日得分
+    - 维护 cooldown_tracker：剔除观察期追踪
+    - 输出 trade_signals：T日生成 → T+1日9:30执行
+
+    使用方式：
+        stabilizer = SignalStabilizer()
+        # T日:
+        threshold = screener._get_threshold(scores)
+        result = stabilizer.update(daily_signals_df, current_date, threshold)
+        # T+1日9:30执行 result[result["action"]=="buy"]
+    """
+
+    def __init__(self, config: Optional[dict] = None):
+        """
+        初始化信号稳定性过滤器。
+
+        Parameters:
+            config: 配置字典（可选）
+        """
+        self.signal_stability_days = 3  # 连续3日达标
+        self.cooldown_margin = 0.05     # 阈值下方5%以内触发冷却
+        self.cooldown_days = 2           # 冷却期2日
+        self.signal_history = {}          # {code: deque(maxlen=3) of scores}
+        self.cooldown_tracker = {}       # {code: remaining_cooldown_days}
+
+    def update(self, daily_signals: pd.DataFrame, current_date: str,
+               daily_threshold: float) -> pd.DataFrame:
+        """
+        输入当日截面打分，输出可交易信号。
+
+        Parameters:
+            daily_signals: screener.screen() 输出的 DataFrame，含 code, total_score
+            current_date: 当前日期字符串 "YYYY-MM-DD"
+            daily_threshold: 当日动态阈值（来自 screener._get_threshold）
+
+        Returns:
+            pd.DataFrame: 含可交易信号的 DataFrame (columns: code, score, action, reason)
+        """
+        from collections import deque
+
+        trade_signals = []
+        for _, row in daily_signals.iterrows():
+            code, score = row["code"], row["total_score"]
+
+            # 1. 更新历史
+            hist = self.signal_history.setdefault(code, deque(maxlen=3))
+            hist.append(score)
+
+            # 2. 冷却期递减
+            if code in self.cooldown_tracker:
+                self.cooldown_tracker[code] -= 1
+                if self.cooldown_tracker[code] <= 0:
+                    del self.cooldown_tracker[code]
+                trade_signals.append({"code": code, "score": score, "action": "cooldown", "reason": "waiting"})
+                continue
+
+            # 3. 稳定性检查：连续3日均 >= daily_threshold
+            if len(hist) < 3:
+                trade_signals.append({"code": code, "score": score, "action": "watch", "reason": f"history={len(hist)}/3"})
+                continue
+
+            if min(hist) >= daily_threshold:
+                trade_signals.append({"code": code, "score": score, "action": "buy", "reason": "stable_3d"})
+                self.cooldown_tracker[code] = self.cooldown_days  # 触发后进入冷却
+            else:
+                trade_signals.append({"code": code, "score": score, "action": "skip", "reason": "below_threshold"})
+
+        return pd.DataFrame(trade_signals)
+
+    def prune_suspended(self, active_codes: List[str]):
+        """
+        停牌标的自动从历史缓存剔除。
+
+        Parameters:
+            active_codes: 当前在交易的有效代码列表
+        """
+        for code in list(self.signal_history.keys()):
+            if code not in active_codes:
+                del self.signal_history[code]
+        for code in list(self.cooldown_tracker.keys()):
+            if code not in active_codes:
+                del self.cooldown_tracker[code]
 
 
 if __name__ == "__main__":

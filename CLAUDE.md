@@ -14,14 +14,19 @@ conda env create -f environment.yml
 conda activate rain
 
 # 运行模式
-python main.py --mode select        # 选股模式（约10分钟）
-python main.py --mode select --new-screener  # 使用新多因子打分选股
+python main.py --mode select        # 选股模式（约10分钟，多因子横截面打分）
 python main.py --mode optimize      # 参数优化（约5分钟）
 python main.py --mode signal        # 信号生成（约1分钟）
 python main.py --mode wf           # Walk-Forward分析（约30分钟）
 
 # 运行单个测试
 python -m pytest tests/test_stock_selection.py
+
+# 运行全部测试
+python -m pytest tests/
+
+# 代码质量检查（需先安装 ruff, mypy, bandit）
+/code-scan
 
 # 强制重新选股（忽略缓存的股票列表）
 python main.py --force-select
@@ -33,16 +38,16 @@ python main.py --force-select
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `main.py` | ~280 | 入口点，CLI解析，模式调度 |
-| `strategy.py` | ~2200 | 选股、回测引擎、优化、信号生成、Walk-Forward分析 |
-| `data.py` | ~2100 | 数据获取（AkShare/Baostock双数据源）、数据清洗、增量更新、自适应限流 |
-| `data_http.py` | ~350 | HTTP Session 管理器（UA轮换、连接复用） |
-| `indicators.py` | ~540 | 向量化技术指标计算（Numba JIT 加速） |
-| `screener.py` | ~450 | 多因子横截面打分选股器 |
-| `grid_engine.py` | ~450 | 动态网格引擎（波动率区间自适应） |
-| `risk.py` | ~650 | 增强风控模块（T+1追踪、分层滑点、费用计算） |
-| `utils.py` | ~450 | 配置加载、交易费用计算、验证工具 |
-| `risk_control.py` | ~450 | 熔断风控（个股15%/全局10%） |
+| `main.py` | 266 | 入口点，CLI解析，模式调度 |
+| `strategy.py` | 2044 | 选股、回测引擎、优化、信号生成、Walk-Forward分析 |
+| `data.py` | 1980 | 数据获取（AkShare/Baostock双数据源）、数据清洗、增量更新、自适应限流 |
+| `data_http.py` | 336 | HTTP Session 管理器（UA轮换、连接复用） |
+| `indicators.py` | 636 | 向量化技术指标计算（Numba JIT 加速） |
+| `screener.py` | 949 | 高级多因子横截面打分选股器（含正交化） |
+| `grid_engine.py` | 553 | 动态网格引擎（波动率区间自适应） |
+| `risk.py` | 644 | 增强风控模块（T+1追踪、分层滑点、费用计算） |
+| `utils.py` | 362 | 配置加载、交易费用计算、验证工具 |
+| `risk_control.py` | 564 | 熔断风控（个股15%/全局10%） |
 
 ### 新增模块说明
 
@@ -52,10 +57,13 @@ python main.py --force-select
 - `calculate_adx()` - ADX 趋向指标
 - `calculate_volatility_60d()` - 年化波动率
 - `calculate_atr()` - ATR 平均真实波幅
+- `calculate_variance_ratio()` / `calculate_path_memory()` - 方差比检验（Path_Memory 因子）
 
-**screener.py** - 多因子横截面打分选股器:
-- OU 半衰期 (-35%)、Hurst (-30%)、ADX (-20%)、波动率适配 (+15%)
-- 初筛：成交额≥1亿、股价5-500元
+**screener.py** - 高级多因子横截面打分选股器（v2）:
+- 四因子正交化模型：F1(Reversion_Speed)、F2(Trend_Strength)、F3(Vol_Quality)、F4(Path_Memory)
+- 双轨权重（ETF vs 股票）
+- 动态阈值（adaptive_quantile 模式）
+- 现金缓冲机制
 
 **grid_engine.py** - 动态网格引擎:
 - 波动率区间自适应 k 系数（低=2.5、中=2.0、高=1.5）
@@ -73,7 +81,7 @@ python main.py --force-select
 
 ### 运行模式
 
-1. **select** - 多因子横截面打分筛选股票（OU半衰期、Hurst、ADX、波动率）
+1. **select** - 高级多因子横截面打分筛选股票（四因子正交化 + 双轨权重）
 2. **optimize** - 使用 Optuna 贝叶斯优化最大化 Calmar Ratio
 3. **signal** - 基于 ATR 和波动率动态调整网格间距，生成次日买卖计划
 4. **wf** - Walk-Forward 滚动窗口分析
@@ -117,14 +125,18 @@ AkShare/Baostock → data.py → indicators.py/screener.py → grid_engine.py �
 - 初始仓位：30% ~ 70%
 - 最大网格层数：5 ~ 15 层
 
-### 选股标准（多因子打分）
-- OU 半衰期 < 15 天（快速均值回归）
-- Hurst 指数（越低越好）
-- ADX < 25（趋势弱）
-- 波动率 20% ~ 35%（中等波动）
-- 成交额 ≥ 1 亿元
-- 股价范围：5 ~ 500 元
-- 上市时间 ≥ 1.5 年（Walk-Forward模式）
+### 选股标准（高级多因子打分 v2）
+**四因子正交化模型**:
+- F1: Reversion_Speed (OU半衰期) - 均值回归速度，越短越好
+- F2: Trend_Strength (ADX) - 趋势持续性，越低越好
+- F3: Vol_Quality (波动率) - 倒U型函数，0.25 最优
+- F4: Path_Memory (Variance Ratio) - 分形结构，正交化处理
+
+**双轨权重**:
+- ETF: F1=0.35, F2=0.15, F3=0.30, F4=0.20
+- 股票: F1=0.25, F2=0.35, F3=0.20, F4=0.20
+
+**质量阈值**: Score ≥ 0.65（动态阈值模式：max(0.65, quantile(0.75))）
 
 ### 风控熔断机制
 - T+1 追踪：今日买入不可卖，可用数量 = 总持仓 - 今日买入

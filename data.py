@@ -1374,39 +1374,9 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 # ==================== 技术指标计算 ====================
 
 def calculate_atr(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """
-    计算 ATR (Average True Range, 平均真实波幅)
-    
-    公式:
-    TR = max(high - low, |high - prev_close|, |low - prev_close|)
-    ATR = MA(TR, period)
-    
-    参数:
-        df: 包含 high, low, close 列的 DataFrame
-        period: ATR 周期
-    
-    返回:
-        ATR 序列
-    """
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    
-    # 计算前一日的收盘价
-    prev_close = close.shift(1)
-    
-    # 计算三种 TR
-    tr1 = high - low
-    tr2 = abs(high - prev_close)
-    tr3 = abs(low - prev_close)
-    
-    # 取最大值作为 TR
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    # 计算 ATR (简单移动平均)
-    atr = tr.rolling(window=period).mean()
-    
-    return atr
+    """计算 ATR (委托给 indicators.py 实现)"""
+    from indicators import calculate_atr as _calc_atr
+    return _calc_atr(df, period)
 
 
 def calculate_volatility(df: pd.DataFrame, period: int = 20) -> pd.Series:

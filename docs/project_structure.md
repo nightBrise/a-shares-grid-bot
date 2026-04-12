@@ -156,6 +156,7 @@ class RiskControlManager:
 - ADX：平均趋向指数（趋势强度）
 - ATR：平均真实波幅
 - 年化波动率：对数收益率标准差 × √252
+- Variance Ratio：路径记忆因子（q=5 对齐网格周期）
 
 **关键函数**:
 ```python
@@ -163,20 +164,25 @@ def calculate_hurst_60d(df, price_col, window) -> pd.Series
 def calculate_ou_half_life(df, price_col, min_periods) -> pd.Series
 def calculate_adx(df, period) -> pd.DataFrame
 def calculate_volatility_60d(df, price_col) -> pd.Series
+def calculate_variance_ratio(log_returns, q) -> pd.Series
 def calculate_all_indicators(df) -> pd.DataFrame
 ```
 
-### 7. screener.py - 多因子选股器
+### 7. screener.py - 高级多因子选股器
 
 **职责**:
-- 多因子横截面打分：OU半衰期、Hurst、ADX、波动率适配
-- 初筛过滤：成交额、价格、上市时间
-- Top N 排序输出
+- 四因子正交化横截面打分：F1(OU半衰期)、F2(ADX)、F3(波动质量)、F4(VR正交化)
+- 双轨权重：ETF vs 股票差异化权重
+- 动态阈值：adaptive_quantile 模式，软上限 0.82
+- 行业分散约束：单一行业最多3只（ETF隔离处理）
+- SignalStabilizer：连续3日达标 + 2日冷却期
 
 **关键类**:
 ```python
-class MultiFactorScreener:
-    def screen_universe(df_stocks, config) -> pd.DataFrame
+class AdvancedMultiFactorScreener:
+    def screen(stocks_data, asset_type, top_n) -> pd.DataFrame
+    def _apply_concentration_limits(df, max_per_industry) -> pd.DataFrame
+    def _get_threshold(scores) -> float
     def calculate_factor_scores(df) -> pd.DataFrame
 ```
 

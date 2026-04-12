@@ -1,8 +1,9 @@
-# 📊 A 股网格交易系统 v1.0.0
+# 📊 A 股网格交易系统
 
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/version-v1.1.0-blue.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 ---
@@ -67,16 +68,16 @@ python main.py --mode signal
 
 ```
 auto_grid_trading_system/
-├── main.py                  # 主入口
-├── strategy.py              # 核心策略 (~2200 行)
-├── data.py                  # 数据管理 (~2000 行)
-├── data_http.py             # HTTP Session 管理器 (新增)
-├── utils.py                 # 工具函数 (~450 行)
-├── risk_control.py          # 风控模块 (~450 行)
-├── risk.py                  # 增强风控模块 (新增)
-├── indicators.py            # 技术指标计算 (新增)
-├── screener.py              # 多因子选股器 (新增)
-├── grid_engine.py           # 动态网格引擎 (新增)
+├── main.py                  # 主入口 (~270 行)
+├── strategy.py              # 核心策略 + SignalStabilizer (~2130 行)
+├── data.py                  # 数据管理 (~1980 行)
+├── data_http.py             # HTTP Session 管理器 (~330 行)
+├── utils.py                 # 工具函数 (~360 行)
+├── risk_control.py          # 熔断风控 (~560 行)
+├── risk.py                  # 增强风控 (~640 行)
+├── indicators.py            # 技术指标 Numba JIT (~630 行)
+├── screener.py              # 高级多因子选股器 (~820 行)
+├── grid_engine.py           # 动态网格引擎 (~550 行)
 │
 ├── config_base.yaml         # 基础配置
 │
@@ -89,7 +90,7 @@ auto_grid_trading_system/
     ├── project_structure.md # 项目结构详解
     ├── walk_forward.md      # Walk-Forward 分析
     ├── incremental_update.md# 增量数据更新
-    └── ... (其他 7 个文档)
+    └── ... (其他 6 个文档)
 ```
 
 **完整结构说明**: [📖 项目结构详解](docs/project_structure.md)
@@ -100,14 +101,20 @@ auto_grid_trading_system/
 
 ### 1. 智能选股系统
 
-**多因子横截面打分**（替代 Hurst<0.5 绝对阈值）:
+**高级多因子横截面打分 v2**（替代 Hurst<0.5 绝对阈值）:
 
-| 因子 | 权重 | 说明 |
-|------|------|------|
-| OU 半衰期 | -35% | 快速均值回归优先 |
-| Hurst 指数 | -30% | 均值回归特性 |
-| ADX | -20% | 趋势强度，越低越适合网格 |
-| 波动率适配 | +15% | 中等波动最佳 |
+**四因子正交化模型**:
+| 因子 | 含义 | 股票权重 | ETF权重 | 逻辑 |
+|------|------|---------|---------|------|
+| F1: Reversion_Speed | OU半衰期 | 25% | 35% | 越短越好（快速均值回归） |
+| F2: Trend_Strength | ADX | 35% | 15% | 越低越好（趋势弱） |
+| F3: Vol_Quality | 波动率 | 20% | 30% | 倒U型，0.25最优 |
+| F4: Path_Memory | Variance Ratio | 20% | 20% | 正交化处理 |
+
+**信号稳定性过滤**:
+- 连续3日总分 ≥ 动态阈值 → 生成可交易信号
+- 触发后进入2日冷却期
+- T日生成 → T+1日9:30执行
 
 **初筛条件**:
 - 成交额 ≥ 1 亿元
@@ -248,11 +255,24 @@ conda env create -f environment.yml
 
 ## 📝 版本历史
 
+### v1.2.0 (2026-04-12) - 选股系统生产级改进
+
+**新增功能**:
+- ✅ SignalStabilizer 信号稳定性过滤器（策略层实现，无状态设计）
+  - 连续3日达标 + 冷却期机制，降低换手率
+- ✅ 动态阈值软上限（0.65~0.82），牛市候选池保障
+- ✅ 行业分散约束（单一行业最多3只，ETF/股票隔离）
+- ✅ VR q 参数固化（q=5 对齐网格触发频率3-10日）
+
+**架构改进**:
+- ✅ 四因子正交化模型（F1-F4，减少共线性）
+- ✅ 双轨权重（ETF vs 股票差异化权重）
+
 ### v1.1.0 (2026-04-10) - 多因子打分升级
 
 **新增功能**:
 - ✅ 多因子横截面打分选股器（替代 Hurst<0.5 绝对阈值）
-  - OU 半衰期、Hurst 指数、ADX、波动率适配
+  - F1(OUC半衰期)、F2(ADX)、F3(波动质量)、F4(Path_Memory)
   - Numba JIT 加速的向量化指标计算
 - ✅ 动态网格引擎（波动率区间自适应 k=1.5/2.0/2.5）
 - ✅ 增强风控模块（T+1 追踪、分层滑点、阶梯费率）
@@ -297,4 +317,4 @@ conda env create -f environment.yml
 
 **🎉 开始你的量化交易之旅！**
 
-*Last Updated: 2026-03-18*
+*Last Updated: 2026-04-12*

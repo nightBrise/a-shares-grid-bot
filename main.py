@@ -78,12 +78,6 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        '--new-screener',
-        action='store_true',
-        help='使用新多因子横截面打分选股器 (替代 Hurst<0.5 绝对阈值)'
-    )
-
-    parser.add_argument(
         '--rolling',
         type=str,
         metavar='PERIOD',

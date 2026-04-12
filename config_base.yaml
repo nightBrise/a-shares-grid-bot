@@ -228,3 +228,57 @@ error_recovery:
   fallback_to_cache: true
   # 缓存过期天数（超过则不使用）
   cache_expire_days: 7
+
+# === 高级多因子选股配置 ===
+advanced_screening:
+  # 双轨权重 (ETF vs 股票)
+  weights:
+    etf:
+      reversion_speed: 0.35      # F1: OU半衰期
+      trend_strength: 0.15       # F2: ADX
+      vol_quality: 0.30          # F3: 波动质量
+      path_memory: 0.20          # F4: Variance Ratio
+    stock:
+      reversion_speed: 0.25      # F1: OU半衰期
+      trend_strength: 0.35       # F2: ADX
+      vol_quality: 0.20          # F3: 波动质量
+      path_memory: 0.20          # F4: Variance Ratio
+
+  # 质量阈值
+  quality_threshold: 0.65
+  threshold_mode: "adaptive_quantile"  # fixed | adaptive_quantile
+  adaptive_quantile: 0.75              # 仅当 mode=adaptive_quantile 生效
+  threshold_soft_cap: 0.82              # 阈值软上限，保证牛市候选池
+
+  # 现金缓冲比例（当 Score < threshold 时）
+  cash_buffer_ratio: 0.50
+
+  # 行业分散约束（仅对股票生效）
+  concentration_limits:
+    max_per_industry: 3         # 单一申万一级行业最多N只
+
+  # Path_Memory (Variance Ratio) 参数
+  path_memory:
+    variance_ratio_q: 5        # q=5 对齐网格触发频率(3-10日)
+    min_periods: 120           # 最小样本数（~半年）
+
+  # 波动质量参数 (倒U型函数)
+  vol_quality:
+    optimal_vol: 0.25          # 最优波动率
+    tolerance: 0.15            # 容差范围
+
+  # 网格参数映射（基于评分）
+  grid_params:
+    high_score:                # >= 0.80
+      spacing_coef: 1.8
+      position_pct: 0.025
+    medium_score:              # 0.65 ~ 0.80
+      spacing_coef: 2.2
+      position_pct: 0.018
+    low_score:                 # < 0.65
+      spacing_coef: null
+      position_pct: 0
+
+# === 资产类型判断 ===
+asset_classification:
+  etf_regex: "^(51|56|58|15|16)\\d{4}\\.(SH|SZ)$"

@@ -481,6 +481,7 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         - minus_di: -DI 指标
         - volatility_60d: 年化波动率 (60日)
         - atr_20: 平均真实范围 (20日)
+        - path_memory: 方差比因子 (Variance Ratio)
     """
     result = df.copy()
 
@@ -513,6 +514,10 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if all(c in result.columns for c in ["high", "low", "close"]) and len(result) >= 20:
         result["atr_20"] = calculate_atr(result, period=20)
 
+    # Path Memory (Variance Ratio)
+    if "close" in result.columns and len(result) >= 120:
+        result["path_memory"] = calculate_variance_ratio(result, q=20, min_periods=120)
+
     return result
 
 
@@ -532,9 +537,100 @@ def get_latest_indicators(df: pd.DataFrame) -> dict:
     latest = df.iloc[-1]
 
     indicators = {}
-    for col in ["hurst_60d", "ou_half_life", "adx", "plus_di", "minus_di", "volatility_60d", "atr_20"]:
+    for col in ["hurst_60d", "ou_half_life", "adx", "plus_di", "minus_di", "volatility_60d", "atr_20", "path_memory"]:
         if col in latest:
             val = latest[col]
             indicators[col] = float(val) if pd.notna(val) else None
 
     return indicators
+
+
+# ==================== Path Memory (Variance Ratio) ====================
+
+
+def calculate_variance_ratio(
+    df: pd.DataFrame,
+    price_col: str = "close",
+    q: int = 20,
+    min_periods: int = 120,
+) -> pd.Series:
+    """
+    计算方差比 (Variance Ratio) 作为 Path_Memory 因子。
+
+    Variance Ratio 检验序列是趋势持续还是反持续：
+    - VR > 1: 趋势记忆 (长期持有有利，网格易破网)
+    - VR < 1: 反持续记忆 (均值回归，网格有效)
+    - VR ≈ 1: 随机游走
+
+    Formula:
+        VR(q) = Var(μ_q) * q / Var(μ_1)
+    其中 μ_q 是 q 期滚动均值
+
+    A股应用：
+    - VR < 1 表示反持续性，均值回归特性强，适合网格交易
+    - 转换为得分：VR 越远离 1（越小）得分越高
+
+    Parameters:
+        df: 包含价格数据的 DataFrame
+        price_col: 价格列名 (默认 'close')
+        q: 滚动窗口期数 (默认 20，约1个月)
+        min_periods: 最小样本数 (默认 120，约半年)
+
+    Returns:
+        VR 得分 Series (0~1)，VR=1 时得 0.5，VR 越远离 1 得分越高
+    """
+    log_returns = np.log(df[price_col] / df[price_col].shift(1)).dropna()
+    n = len(log_returns)
+
+    if n < min_periods:
+        return pd.Series(np.nan, index=df.index, name="path_memory")
+
+    # 计算 Var(μ_1) - 单期收益率方差
+    var_1 = log_returns.var()
+
+    if var_1 < 1e-10:
+        return pd.Series(0.5, index=df.index[-n:], name="path_memory")
+
+    # 计算 Var(μ_q) * q
+    rolling_mean = log_returns.rolling(window=q).mean()
+    var_q = rolling_mean.var() * q
+
+    # 方差比
+    vr = var_q / var_1
+
+    # 限制 VR 在合理范围
+    vr = max(0.1, min(10.0, vr))
+
+    # 转换为 0~1 得分：VR=1 时得 0.5，VR 越小（反持续）得分越高
+    # 使用 1 - |VR - 1| / (VR + 1) 映射
+    # 当 VR=1 → 0.5，当 VR→0 → 1，当 VR→∞ → 0
+    score = 1 - abs(vr - 1) / (vr + 1)
+
+    # 扩展到完整索引
+    result = pd.Series(np.nan, index=df.index, name="path_memory")
+    result.iloc[-n:] = score
+
+    return result
+
+
+def calculate_path_memory(
+    df: pd.DataFrame,
+    price_col: str = "close",
+    q: int = 20,
+    min_periods: int = 120,
+) -> pd.Series:
+    """
+    计算 Path_Memory 因子（Variance Ratio 的逆向得分）。
+
+    此函数是 calculate_variance_ratio 的别名，保持命名一致性。
+
+    Parameters:
+        df: 包含价格数据的 DataFrame
+        price_col: 价格列名 (默认 'close')
+        q: 滚动窗口期数 (默认 20)
+        min_periods: 最小样本数 (默认 120)
+
+    Returns:
+        Path_Memory 得分 Series (0~1)
+    """
+    return calculate_variance_ratio(df, price_col, q, min_periods)
