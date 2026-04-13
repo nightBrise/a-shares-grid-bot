@@ -228,19 +228,15 @@ df_final = df_deduped.sort_values('date').reset_index(drop=True)
 
 3. **完整性检查检测遗漏**:
    ```python
-   is_complete, missing = check_data_integrity(df_updated, code)
-   
-   def check_data_integrity(df, code):
-       """检查相邻日期间隔，识别缺失的交易日"""
-       dates = pd.to_datetime(df.sort_values('date')['date'])
-       gaps = dates.diff()[dates.diff() > pd.Timedelta(days=3)]
-       
-       if len(gaps) > 0:
-           # 发现间隔，生成缺失日期列表
-           missing = generate_missing_dates(gaps)
-           return False, missing
-       
-       return True, []
+   from data import verify_date_alignment
+
+   is_aligned, warnings = verify_date_alignment(code, df_updated)
+
+   # verify_date_alignment 检查:
+   # 1. 数据日期是否都是交易日
+   # 2. 是否有遗漏的交易日（基于真实 A 股日历）
+   #
+   # 返回: (是否对齐, 警告列表)
    ```
 
 4. **自动补全机制**:

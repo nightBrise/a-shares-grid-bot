@@ -4,7 +4,7 @@ A 股网格交易系统 v1.0.0 - 主程序入口
 功能：统一调度选股、优化、信号生成三大模块
 
 使用方式:
-    python main.py              # 使用 config_base.yaml 中的 mode
+    python main.py              # 使用 config.yaml 中的 mode
     python main.py --mode select   # 强制指定模式
     python main.py --version       # 显示版本号
 """
@@ -16,7 +16,7 @@ import argparse
 from datetime import datetime
 
 # 定义版本号
-__version__ = "1.0.0"
+__version__ = "0.2.0"
 
 # 导入项目模块
 from utils import load_config, load_state, save_state, setup_logging, send_notification, get_version
@@ -53,8 +53,8 @@ def parse_arguments():
     parser.add_argument(
         '--config', '-c',
         type=str,
-        default='config_base.yaml',
-        help='配置文件路径 (默认：config_base.yaml)'
+        default='config.yaml',
+        help='配置文件路径 (默认：config.yaml)'
     )
     
     parser.add_argument(
@@ -110,7 +110,7 @@ def main():
         config = load_config(args.config)
     except FileNotFoundError:
         print(f"错误：配置文件不存在 - {args.config}")
-        print("请确保 config_base.yaml 文件存在")
+        print("请确保 config.yaml 文件存在")
         sys.exit(1)
     except Exception as e:
         print(f"错误：加载配置文件失败 - {str(e)}")

@@ -523,24 +523,43 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_latest_indicators(df: pd.DataFrame) -> dict:
     """
-    获取最新一只股票的指标值（最后一行）。
+    获取最新一只股票的指标值（最后一个有效值）。
+
+    注意：对于有时间延迟的指标（如 ADX），最后一个观测值可能为 NaN，
+    因为计算需要 future 数据。本函数回溯找到最后一个有效值。
 
     Parameters:
         df: 包含所有指标列的 DataFrame
 
     Returns:
-        包含最新指标值的字典
+        包含最新有效指标值的字典
     """
     if df.empty:
         return {}
 
-    latest = df.iloc[-1]
-
     indicators = {}
     for col in ["hurst_60d", "ou_half_life", "adx", "plus_di", "minus_di", "volatility_60d", "atr_20", "path_memory"]:
-        if col in latest:
-            val = latest[col]
-            indicators[col] = float(val) if pd.notna(val) else None
+        if col not in df.columns:
+            continue
+
+        # 回溯找到最后一个非 NaN 值
+        series = df[col]
+        valid_mask = series.notna()
+
+        if valid_mask.any():
+            # 找到最后一个有效值的索引
+            last_valid_idx = valid_mask.idxmax()  # 找到最后一个 True 的位置
+            # 但这不对 - idxmax 返回第一个最大值的索引
+            # 需要用 last_valid_idx = series[valid_mask].index[-1]
+
+            # 正确做法：找到最后一个有效值的索引
+            valid_indices = series[valid_mask].index
+            if len(valid_indices) > 0:
+                last_valid_idx = valid_indices[-1]
+                val = series.loc[last_valid_idx]
+                indicators[col] = float(val) if pd.notna(val) else None
+        else:
+            indicators[col] = None
 
     return indicators
 

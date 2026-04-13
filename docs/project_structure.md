@@ -18,8 +18,7 @@ auto_grid_trading_system/
 │   └── risk_control.py          # 风控模块：熔断机制、盈亏监控
 │
 ├── ⚙️ 配置文件
-│   ├── config_base.yaml         # 基础配置（包含所有参数说明）
-│   ├── config_enhanced.yaml     # 增强配置（含完整风控参数）
+│   ├── config.yaml              # 主配置文件（包含所有参数说明）
 │   ├── config_state.json        # 动态状态（自动维护，无需手动编辑）
 │   └── .env.example             # 环境变量模板
 │
@@ -238,7 +237,7 @@ class HTTPSessionManager:
 
 ## 配置文件说明
 
-### config_base.yaml
+### config.yaml
 
 **用途**: 静态配置文件，包含所有固定参数
 

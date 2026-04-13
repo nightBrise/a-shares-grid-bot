@@ -134,7 +134,7 @@ from datetime import datetime
 from strategy import run_walk_forward_analysis, WalkForwardWindow
 
 # 方式 1: 直接调用完整流程
-config = load_config('config_base.yaml')
+config = load_config('config.yaml')
 result = run_walk_forward_analysis(
     config,
     current_date=datetime(2024, 12, 31),
@@ -261,7 +261,7 @@ Optuna 参数优化使用以下搜索空间：
 新增的 Walk-Forward 功能与原有配置结构完全兼容。可通过配置文件控制以下参数：
 
 ```yaml
-# config_base.yaml
+# config.yaml
 
 backtest:
   n_trials: 50              # Optuna 试验次数
@@ -282,32 +282,32 @@ risk:
 
 ## 非交易日对齐
 
-系统使用 `pd.DateOffset` 确保正确处理非交易日：
+系统使用 `pd.DateOffset` 计算时间窗口边界，然后通过 `align_to_trading_day()` 对齐到真实 A 股交易日：
 
 ```python
-# 正确处理方式
-from pandas import DateOffset
+from data import align_to_trading_day, get_trade_calendar
 
-# T - 3 个月
-oos_start = current_date - DateOffset(months=3)
+# WalkForwardWindow 内部实现
+self.current_date = align_to_trading_day(raw_date, direction='backward')
 
-# T - 1 年
-ins_start = current_date - DateOffset(years=1)
+# T - 3 个月，对齐到真实交易日
+oos_start_raw = self.current_date - pd.DateOffset(months=3)
+self.oos_start = align_to_trading_day(oos_start_raw, direction='backward')
 ```
 
-如需进一步对齐到交易日，可在后续版本中添加：
+**交易日历来源**（优先级）:
+1. AKShare (`tool_trade_date_hist_sina`) - 优先
+2. Baostock (`query_trade_dates`) - 交叉校验
+3. TuShare (`trade_cal`) - 仲裁
+4. Fallback（仅排除周末）- 兜底
 
+**关键函数**:
 ```python
-# 可选：对齐到最近的交易日
-def align_to_trading_day(date, direction='backward'):
-    """将日期对齐到交易日"""
-    # 检查是否为周末或节假日
-    while date.weekday() >= 5 or is_holiday(date):
-        if direction == 'backward':
-            date -= timedelta(days=1)
-        else:
-            date += timedelta(days=1)
-    return date
+get_trade_calendar()          # 获取 A 股完整日历（多数据源校验）
+is_trading_day(date)          # 判断是否为交易日
+align_to_trading_day(date, direction)  # 对齐到最近交易日
+get_previous_trading_day(date, n)       # 获取前 n 个交易日
+get_next_trading_day(date, n)           # 获取后 n 个交易日
 ```
 
 ## 代码注释规范

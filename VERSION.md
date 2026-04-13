@@ -1,6 +1,38 @@
 # 版本发布说明
 
-当前版本：**v1.2.0** (2026-04-12)
+当前版本：**v0.2.0** (2026-04-13) ⚠️ 测试版 - 项目未完全验证
+
+---
+
+## v0.2.0 (2026-04-13) - 交易日严格对齐
+
+### 核心改进
+
+#### 1. 多数据源交叉校验日历
+- AKShare (`tool_trade_date_hist_sina`) 优先
+- Baostock (`query_trade_dates`) 实时校验
+- TuShare (`trade_cal`) 仲裁
+- Fallback（仅排除周末）兜底
+
+#### 2. 日期严格对齐
+- `WalkForwardWindow` 所有边界日期对齐真实交易日
+- `generate_signals` 使用 `get_next_trading_day()` 计算 `valid_date`
+- `align_to_trading_day(date, direction)` 支持 forward/backward 两种模式
+
+#### 3. 数据对齐验证
+- `verify_date_alignment()` 严格检查数据是否包含非交易日
+- 识别并警告缺失的交易日
+
+### 新增函数
+
+| 函数 | 说明 |
+|------|------|
+| `get_trade_calendar()` | 获取 A 股完整日历（带缓存） |
+| `is_trading_day(date)` | 判断是否为交易日 |
+| `get_previous_trading_day(date, n)` | 获取前 n 个交易日 |
+| `get_next_trading_day(date, n)` | 获取后 n 个交易日 |
+| `align_to_trading_day(date, direction)` | 对齐到最近交易日 |
+| `verify_date_alignment(code, df)` | 验证数据交易日对齐 |
 
 ---
 

@@ -586,10 +586,26 @@ class AdvancedMultiFactorScreener:
         if len(series) < 2:
             return pd.Series(0.5, index=series.index)
 
+        # 保存原始索引
+        original_index = series.index
+
+        # 处理 NaN：先填充为中位数（保持排名结构）
+        nan_mask = series.isna()
+        if nan_mask.any():
+            # 用非 NaN 值的中位数填充 NaN
+            median_val = series[~nan_mask].median()
+            series = series.fillna(median_val)
+
         pct_rank = series.rank(pct=True)
         if inverse:
-            return 1 - pct_rank
-        return pct_rank
+            result = 1 - pct_rank
+        else:
+            result = pct_rank
+
+        # 恢复原始 NaN 位置为 NaN（不做填充，让它们保持 NaN）
+        result[nan_mask] = np.nan
+
+        return result
 
     def _orthogonalize_cross_section(self, df: pd.DataFrame) -> pd.Series:
         """

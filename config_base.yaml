@@ -1,9 +1,9 @@
-# A 股网格交易系统配置文件 v1.0.0
+# A 股网格交易系统配置文件 v0.2.0
 # 静态配置文件 - 包含所有固定配置参数
 # 动态状态请修改 config_state.json
 
 # === 系统版本 ===
-version: "1.0.0"
+version: "0.2.0"
 
 # === 运行模式 ===
 # select: 选股模式 - 筛选适合网格交易的标的
@@ -14,22 +14,21 @@ mode: select
 # === 股票池配置 ===
 # 示例股票列表 (可自行修改)
 stocks:
-  - "600519.SH"  # 贵州茅台
-  - "000858.SZ"  # 五粮液
-  - "601318.SH"  # 中国平安
-  - "000333.SZ"  # 美的集团
-  - "600036.SH"  # 招商银行
-
+  - "000333.SZ"
+  - "000066.SZ"
+  - "000651.SZ"
+  - "000338.SZ"
+  - "000425.SZ"
 # === 网格交易基础参数 ===
 grid:
   # 基础网格间距 (%) - 会被 ATR 动态调整
   base_spacing: 2.0
   # 初始仓位比例 (%)
   initial_position: 50
-  # 每格买入金额 (元)
-  grid_amount: 10000
-  # 最大网格层数
-  max_grids: 10
+  # 每格买入金额 (元) - 小资金建议 3000-5000
+  grid_amount: 3000
+  # 最大网格层数 - 小资金建议 5 层
+  max_grids: 5
   # ATR 周期 (用于动态调整)
   atr_period: 20
   # ATR 调整系数 (网格间距 = base_spacing * (ATR / close_price) * coef)
@@ -88,10 +87,10 @@ selection:
   max_price: 500.0
   # 年化波动率阈值
   volatility_threshold: 0.8
-  # 保存前 N 只最佳股票到配置文件 (默认 20 只)
-  save_top_n: 20
-  # 选股时最大处理股票数量 (避免时间过长)
-  max_stocks_to_process: 200
+  # 保存前 N 只最佳股票到配置文件 - 小资金建议 3-5 只
+  save_top_n: 5
+  # 选股时最大处理股票数量 (避免时间过长) - 小资金建议 50 只
+  max_stocks_to_process: 50
 
 # === 网络优化配置 (反反爬虫策略) ===
 network:
@@ -198,7 +197,7 @@ dynamic_grid:
 risk_control:
   single_stock_loss_threshold: 0.15  # 单股亏损 >= 15% 熔断
   max_drawdown_threshold: 0.10       # 全局回撤 >= 10% 熔断
-  max_position_per_stock: 0.05      # 单股持仓上限 5%
+  max_position_per_stock: 0.30      # 单股持仓上限 30%（小资金适配）
   limit_threshold: 9.8               # 涨跌停阈值 9.8%
 
 # === 滑点模型配置 (新) ===
@@ -234,15 +233,15 @@ advanced_screening:
   # 双轨权重 (ETF vs 股票)
   weights:
     etf:
-      reversion_speed: 0.35      # F1: OU半衰期
-      trend_strength: 0.15       # F2: ADX
-      vol_quality: 0.30          # F3: 波动质量
-      path_memory: 0.20          # F4: Variance Ratio
+      F1: 0.35      # F1: OU半衰期 (均值回归速度，越短越好)
+      F2: 0.15       # F2: ADX (趋势强度，越低越好)
+      F3: 0.30          # F3: 波动质量 (倒U型，0.25最优)
+      F4: 0.20          # F4: Path_Memory (方差比，越小越好)
     stock:
-      reversion_speed: 0.25      # F1: OU半衰期
-      trend_strength: 0.35       # F2: ADX
-      vol_quality: 0.20          # F3: 波动质量
-      path_memory: 0.20          # F4: Variance Ratio
+      F1: 0.25      # F1: OU半衰期
+      F2: 0.35       # F2: ADX
+      F3: 0.20          # F3: 波动质量
+      F4: 0.20          # F4: Path_Memory
 
   # 质量阈值
   quality_threshold: 0.65
@@ -279,6 +278,51 @@ advanced_screening:
       spacing_coef: null
       position_pct: 0
 
+# === 交易日历配置 (新增) ===
+trading_calendar:
+  cache_days: 7              # 日历缓存天数
+  verify_on_load: true       # 是否在加载数据时校验交易日对齐
+  cross_validate: true       # 是否启用多数据源交叉校验
+  warn_on_mismatch: true     # 日历不一致时是否记录警告
+
 # === 资产类型判断 ===
 asset_classification:
   etf_regex: "^(51|56|58|15|16)\\d{4}\\.(SH|SZ)$"
+
+# === 小资金配置（<10万）===
+small_capital:
+  enabled: true
+  capital: 50000                    # 资金量（元）
+  grid_amount: 3000                 # 每格金额
+  max_grids: 5                      # 最大层数
+  max_position_per_stock: 0.30      # 单股最大仓位 30%
+  save_top_n: 3                     # 只选 3 只备选
+  parallel_workers: 3                # 并行线程数
+
+# === 预过滤配置（新增）===
+pre_filter:
+  enabled: true                      # 是否启用预过滤
+  min_turnover: 50000               # 成交额门槛（万元），5亿以上
+  max_price: 100.0                  # 最大价格（匹配 grid_amount/100）
+  use_batch_info: true              # 使用批量行情接口（更快）
+  parallel_workers: 3               # 预过滤并行线程数
+
+# === 选股状态标记 (自动生成，勿手动修改) ===
+
+# === 选股状态标记 (自动生成，勿手动修改) ===
+
+# === 选股状态标记 (自动生成，勿手动修改) ===
+
+# === 选股状态标记 (自动生成，勿手动修改) ===
+
+# === 选股状态标记 (自动生成，勿手动修改) ===
+selection_status:
+  completed: true
+  last_selection_date: "2026-04-13"
+  selection_count: 5
+  version: "v4.0"
+
+
+
+
+

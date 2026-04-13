@@ -14,7 +14,7 @@ import yaml
 
 # ==================== 配置加载 ====================
 
-def load_config(config_path: str = "config_base.yaml") -> dict:
+def load_config(config_path: str = "config.yaml") -> dict:
     """加载 YAML 静态配置文件"""
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)

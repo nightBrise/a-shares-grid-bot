@@ -45,8 +45,8 @@ INFO - Incremental update: 3 days data fetched for 600519.SH
 
 **缺失日期检测规则:**
 - 检查相邻日期间隔是否大于 1 天
-- 过滤周末（周六、周日）
-- 过滤常见法定节假日（春节、国庆等）
+- 基于真实 A 股日历判断是否为交易日
+- 使用 `verify_date_alignment()` 进行严格对齐检查
 
 ### 4. 异常处理 (Error Handling)
 ```
@@ -195,8 +195,9 @@ auto_grid_trading_system/
    - 如遇数据异常，使用 `force_full=True` 强制全量更新
 
 3. **节假日处理**
-   - 当前使用简化节假日判断（固定日期）
-   - 如需精确判断，可扩展 `is_likely_holiday()` 函数
+   - 使用真实 A 股日历（AKShare/Baostock/TuShare 多数据源）
+   - 自动识别周末、春节、国庆等法定节假日
+   - 缓存 7 天，减少网络请求
 
 4. **停牌股票**
    - 长期停牌股票可能触发降级机制

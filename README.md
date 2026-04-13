@@ -3,7 +3,7 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v1.2.0-green.svg)](VERSION.md)
+[![Version](https://img.shields.io/badge/version-v0.2.0-yellow.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 ---
@@ -33,9 +33,6 @@ conda activate rain
 ### 2. 配置
 
 ```bash
-# 复制配置文件
-cp config_base.yaml config.yaml
-
 # 编辑股票池列表
 vim config.yaml
 ```
@@ -79,7 +76,7 @@ auto_grid_trading_system/
 ├── screener.py              # 高级多因子选股器 (~820 行)
 ├── grid_engine.py           # 动态网格引擎 (~550 行)
 │
-├── config_base.yaml         # 基础配置
+├── config.yaml              # 主配置文件
 │
 ├── README.md                # 本文件
 ├── CLAUDE.md               # Claude Code 指导文件
@@ -254,6 +251,20 @@ conda env create -f environment.yml
 ---
 
 ## 📝 版本历史
+
+### v0.2.0 (2026-04-13) - 交易日严格对齐
+
+**核心改进**:
+- ✅ 多数据源交叉校验 A 股日历 (AKShare + Baostock + TuShare)
+- ✅ `WalkForwardWindow` 日期严格对齐真实交易日
+- ✅ 信号 `valid_date` 使用 `get_next_trading_day()` 计算
+- ✅ `verify_date_alignment()` 严格验证数据交易日对齐
+
+**新增函数**:
+- `get_trade_calendar()` - 多数据源交叉校验
+- `is_trading_day()` / `get_previous_trading_day()` / `get_next_trading_day()`
+- `align_to_trading_day()` - 日期对齐到最近交易日
+- `verify_date_alignment()` - 数据对齐验证
 
 ### v1.2.0 (2026-04-12) - 选股系统生产级改进
 

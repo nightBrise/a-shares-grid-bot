@@ -16,7 +16,13 @@ try:
 except ImportError:
     raise ImportError("请安装 optuna: pip install optuna>=3.0.0")
 
-from data import get_stock_data, clean_data, calculate_atr, calculate_hurst_exponent
+from data import (
+    get_stock_data, clean_data, calculate_atr, calculate_hurst_exponent,
+    align_to_trading_day, get_next_trading_day, get_trade_calendar,
+    pre_filter_stocks_fast, get_thread_rate_limiter
+)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from utils import (
     load_config, calculate_transaction_fee, validate_buy_quantity,
     check_limit_status, check_t1_rule, format_number, safe_divide
@@ -92,6 +98,34 @@ def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame
     return pd.DataFrame()
 
 
+# ==================== 并行化选股辅助函数 ====================
+
+
+def _fetch_single_stock_data(args: Tuple) -> Tuple[str, pd.DataFrame, str]:
+    """
+    线程 worker：获取单只股票历史数据
+
+    参数:
+        args: (code, data_dir, force_full, config) 元组
+
+    返回:
+        (code, df, status) 元组
+    """
+    code, data_dir, force_full, cfg = args
+    try:
+        # 使用线程独立的限流器
+        rate_limiter = get_thread_rate_limiter(cfg)
+        rate_limiter.wait()
+
+        # 网络不稳定时优先使用缓存，避免重试等待
+        df = get_stock_data(code, data_dir=data_dir, force_full=force_full,
+                           enable_incremental=False, use_cache=True, fallback_to_cache=True)
+        return (code, df, "success")
+    except Exception as e:
+        logger.debug(f"{code} 获取失败: {e}")
+        return (code, pd.DataFrame(), f"error: {e}")
+
+
 def run_multi_factor_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
     """
     多因子横截面打分选股模式 (高级版)
@@ -128,7 +162,7 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     adv_cfg = config.get('advanced_screening', {})
 
     # 获取全市场股票列表
-    from data import get_all_a_stocks, get_stock_data
+    from data import get_all_a_stocks, get_stock_data, get_stocks_basic_info_batch
 
     df_all_stocks = get_all_a_stocks()
 
@@ -141,10 +175,37 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
     logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票")
 
-    # 限制处理数量
-    max_stocks_to_process = selection_cfg.get('max_stocks_to_process', 200)
-    stock_list = df_all_stocks['code'].head(max_stocks_to_process).tolist()
-    logger.info(f"将处理最近的 {len(stock_list)} 只股票")
+    # === 获取批量行情并按成交额排序 ===
+    pre_filter_cfg = config.get('pre_filter', {})
+    top_n_by_turnover = pre_filter_cfg.get('top_n_by_turnover', 200)
+
+    df_spot = get_stocks_basic_info_batch()
+
+    if not df_spot.empty:
+        # 合并全市场列表和行情数据
+        df_merged = df_all_stocks.merge(df_spot[['code', 'price', 'turnover', 'is_st']], on='code', how='left')
+
+        # 按成交额降序排序，取 top N
+        df_merged = df_merged.sort_values('turnover', ascending=False)
+        top_n_list = df_merged['code'].head(top_n_by_turnover).tolist()
+        logger.info(f"按成交额排序后取 Top {top_n_by_turnover} 只候选")
+
+        # 预过滤：按用户配置的成交额/价格/ST 条件过滤
+        if pre_filter_cfg.get('enabled', True):
+            logger.info("执行预过滤阶段...")
+            stock_list = pre_filter_stocks_fast(top_n_list, config)
+        else:
+            stock_list = top_n_list
+    else:
+        # Fallback：无法获取行情时，按代码顺序
+        stock_list = df_all_stocks['code'].head(top_n_by_turnover).tolist()
+        logger.warning(f"无法获取批量行情，使用代码顺序候选 {len(stock_list)} 只")
+
+    if not stock_list:
+        logger.error("预过滤后无候选股票，请检查过滤条件是否过严")
+        return pd.DataFrame()
+
+    logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
 
     # 计算每只股票的因子指标
     stocks_factors = []
@@ -154,36 +215,55 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     # 获取 Path Memory 参数
     pm_cfg = adv_cfg.get('path_memory', {})
     vr_min_periods = pm_cfg.get('min_periods', 120)
+    min_periods_required = max(60, vr_min_periods)
 
-    for i, code in enumerate(stock_list):
-        try:
-            # 获取数据
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
-            if df.empty:
+    # === 并行获取数据阶段 ===
+    max_workers = pre_filter_cfg.get('parallel_workers',
+                                      config.get('small_capital', {}).get('parallel_workers', 3))
+    logger.info(f"并行获取 {len(stock_list)} 只股票数据 (workers={max_workers})...")
+
+    results_lock = threading.Lock()
+    processed_count = [0]  # 使用列表以便在闭包中修改
+
+    def process_result(code: str, df: pd.DataFrame, status: str):
+        """处理单个股票的获取结果"""
+        nonlocal success_count, fail_count
+
+        with results_lock:
+            processed_count[0] += 1
+            pct = 100 * processed_count[0] // len(stock_list)
+            if processed_count[0] % max(1, len(stock_list) // 10) == 0:
+                logger.info(f"进度: {processed_count[0]}/{len(stock_list)} ({pct}%)")
+
+        if status != "success" or df.empty:
+            with results_lock:
                 fail_count += 1
-                continue
+            return
 
+        try:
             # 清洗数据
             df = clean_data(df)
 
-            # 检查数据长度（Path Memory 需要至少 120 天）
-            min_periods_required = max(60, vr_min_periods)
+            # 检查数据长度
             if len(df) < min_periods_required:
-                fail_count += 1
-                continue
+                with results_lock:
+                    fail_count += 1
+                return
 
             # 计算所有指标
             df_with_indicators = calculate_all_indicators(df)
             latest = get_latest_indicators(df_with_indicators)
 
             if not latest or all(v is None for v in latest.values()):
-                fail_count += 1
-                continue
+                with results_lock:
+                    fail_count += 1
+                return
 
             # 检查 Path Memory 因子
             if latest.get('path_memory') is None:
-                fail_count += 1
-                continue
+                with results_lock:
+                    fail_count += 1
+                return
 
             # 获取价格和成交额
             latest_price = df['close'].iloc[-1]
@@ -192,21 +272,40 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             # ST 检查 (简化: 通过名称判断)
             is_st = False
 
-            stocks_factors.append({
+            factor_data = {
                 'code': code,
                 'price': latest_price,
                 'avg_turnover': avg_turnover,
                 'is_st': is_st,
                 **latest
-            })
-            success_count += 1
+            }
 
-            if (i + 1) % 50 == 0:
-                logger.info(f"已处理 {i+1}/{len(stock_list)} 只股票")
+            with results_lock:
+                stocks_factors.append(factor_data)
+                success_count += 1
 
         except Exception as e:
             logger.debug(f"处理 {code} 时发生异常：{str(e)}")
-            fail_count += 1
+            with results_lock:
+                fail_count += 1
+
+    # 使用 ThreadPoolExecutor 并行获取数据
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_single_stock_data,
+                          (code, paths_cfg['data_dir'], False, config)): code
+            for code in stock_list
+        }
+
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                _, df, status = future.result()
+                process_result(code, df, status)
+            except Exception as e:
+                logger.debug(f"{code} 处理异常: {e}")
+                with results_lock:
+                    fail_count += 1
 
     logger.info(f"指标计算完成: 成功 {success_count}, 失败 {fail_count}")
 
@@ -217,8 +316,8 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     # 使用高级多因子打分器筛选
     screener = AdvancedMultiFactorScreener(config)
 
-    top_n = selection_cfg.get('save_top_n', 20)
-    df_result = screener.screen(stocks_factors, asset_type="stock", top_n=top_n)
+    scoring_pool_size = selection_cfg.get('scoring_pool_size', 20)
+    df_result = screener.screen(stocks_factors, asset_type="stock", top_n=scoring_pool_size)
 
     if df_result.empty:
         logger.warning("高级多因子筛选后无股票，尝试放宽阈值...")
@@ -228,7 +327,7 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
         alt_adv['quality_threshold'] = 0.55  # 降低阈值
         alt_config['advanced_screening'] = alt_adv
         screener = AdvancedMultiFactorScreener(alt_config)
-        df_result = screener.screen(stocks_factors, asset_type="stock", top_n=top_n)
+        df_result = screener.screen(stocks_factors, asset_type="stock", top_n=scoring_pool_size)
 
     if df_result.empty:
         logger.error("高级多因子筛选无结果")
@@ -279,11 +378,11 @@ def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict)
     """
     import yaml
     
-    # 获取前 N 只最佳股票 (默认前 20 只)
-    top_n = config.get('selection', {}).get('save_top_n', 20)
-    selected_stocks = df_selection.head(top_n)['code'].tolist()
-    
-    logger.info(f"\n正在更新配置文件，保存前 {top_n} 只最佳股票...")
+    # 获取前 N 只最佳股票 (默认前 5 只，用于实际交易)
+    save_top_n = config.get('selection', {}).get('save_top_n', 5)
+    selected_stocks = df_selection.head(save_top_n)['code'].tolist()
+
+    logger.info(f"\n正在更新配置文件，保存前 {save_top_n} 只最佳股票到 stocks 列表...")
     
     # 读取原始配置文件
     config_path = "config.yaml"
@@ -1103,7 +1202,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
                         'quantity': buy_qty,
                         'amount': round(buy_qty * buy_price, 2),
                         'reason': f'网格第{i}层买入，间距{atr_adjusted_spacing:.1f}%',
-                        'valid_date': (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
+                        'valid_date': get_next_trading_day(datetime.now()).strftime('%Y-%m-%d'),
                         'priority': i,
                         'strategy_version': version,
                         'param_source': param_source
@@ -1131,7 +1230,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
                         'quantity': sell_qty,
                         'amount': round(sell_qty * sell_price, 2),
                         'reason': f'网格第{i}层卖出，间距{atr_adjusted_spacing:.1f}%',
-                        'valid_date': (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d'),
+                        'valid_date': get_next_trading_day(datetime.now()).strftime('%Y-%m-%d'),
                         'priority': i,
                         'strategy_version': version,
                         'param_source': param_source
@@ -1211,24 +1310,30 @@ class WalkForwardWindow:
     def __init__(self, current_date: datetime = None):
         """
         初始化 Walk-Forward 窗口
-        
+
         参数:
-            current_date: 当前日期 T（默认使用今天）
+            current_date: 当前日期 T（默认使用今天，对齐到真实交易日）
         """
-        self.current_date = current_date or datetime.now()
-        
+        # 关键修正：current_date 必须对齐到真实交易日
+        raw_date = current_date or datetime.now()
+        self.current_date = align_to_trading_day(raw_date, direction='backward')
+
         # === 计算各时间窗口边界 ===
         # 使用 pandas 的 DateOffset 确保正确处理非交易日
-        
+        # 然后对齐到真实交易日
+
         # T - 3 个月（样本内结束/样本外开始）
-        self.oos_start = self.current_date - pd.DateOffset(months=3)
-        
+        oos_start_raw = self.current_date - pd.DateOffset(months=3)
+        self.oos_start = align_to_trading_day(oos_start_raw, direction='backward')
+
         # T - 1 年（样本内开始）
-        self.ins_start = self.current_date - pd.DateOffset(years=1)
-        
+        ins_start_raw = self.current_date - pd.DateOffset(years=1)
+        self.ins_start = align_to_trading_day(ins_start_raw, direction='backward')
+
         # T - 1.5 年（选股池构建开始）
-        self.universe_start = self.current_date - pd.DateOffset(years=1, months=6)
-        
+        universe_start_raw = self.current_date - pd.DateOffset(years=1, months=6)
+        self.universe_start = align_to_trading_day(universe_start_raw, direction='backward')
+
         # 格式化日期字符串（用于日志和数据过滤）
         self.current_date_str = self.current_date.strftime('%Y-%m-%d')
         self.oos_start_str = self.oos_start.strftime('%Y-%m-%d')

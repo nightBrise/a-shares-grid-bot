@@ -140,7 +140,7 @@ net_profit = sell_amount - sell_fee - buy_amount - buy_fee
 
 ## 配置参数
 
-在 `config_base.yaml` 中：
+在 `config.yaml` 中：
 
 ```yaml
 backtest:

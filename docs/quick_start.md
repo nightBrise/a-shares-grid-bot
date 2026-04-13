@@ -1,4 +1,4 @@
-# 📋 A 股网格交易系统 v1.2.0 - 快速概览
+# 📋 A 股网格交易系统 v0.2.0 - 快速概览
 
 ## 一分钟了解项目
 
@@ -35,10 +35,7 @@ conda activate rain
 ### 步骤 2: 配置
 
 ```bash
-# 复制配置文件
-cp config_base.yaml config.yaml
-
-# 编辑 stocks 列表
+# 编辑股票池列表
 vim config.yaml
 ```
 
@@ -69,7 +66,7 @@ auto_grid_trading_system/
 ├── screener.py              # 高级多因子选股器 (~820 行)
 ├── grid_engine.py           # 动态网格引擎 (~550 行)
 │
-├── config_base.yaml         # 基础配置
+├── config.yaml              # 主配置文件
 │
 ├── README.md                # 主文档（必读）⭐
 ├── VERSION.md               # 版本说明
@@ -225,7 +222,7 @@ auto_grid_trading_system/
 
 ## 版本信息
 
-- **当前版本**: v1.2.0
+- **当前版本**: v0.2.0
 - **发布日期**: 2026-04-12
 - **Python**: 3.11+
 - **许可证**: CC BY-NC-SA 4.0

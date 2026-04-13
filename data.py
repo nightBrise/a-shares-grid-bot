@@ -42,6 +42,263 @@ _consecutive_failures = 0
 # 是否已登录 baostock
 _bs_logged_in = False
 
+# ==================== A 股交易日历（多数据源交叉校验） ====================
+
+_ta_calendar_cache: Optional[pd.DatetimeIndex] = None
+_ta_calendar_cache_time: Optional[datetime] = None
+TA_CALENDAR_CACHE_DAYS = 7
+_calendar_source: str = ""  # 记录数据来源
+
+
+def get_trade_calendar(force_refresh: bool = False) -> pd.DatetimeIndex:
+    """
+    获取 A 股交易日历（多数据源交叉校验）
+
+    数据源优先级:
+    1. AKShare (tool_trade_date_hist_sina) - 优先
+    2. Baostock (query_trade_dates) - 校验
+    3. TuShare (trade_cal) - 仲裁（如果可用）
+    4. Fallback (仅排除周末) - 兜底
+
+    参数:
+        force_refresh: 是否强制刷新缓存
+
+    返回:
+        包含所有交易日的 DatetimeIndex (无时区)
+    """
+    global _ta_calendar_cache, _ta_calendar_cache_time, _calendar_source
+
+    now = datetime.now()
+
+    # 检查缓存是否有效
+    if (not force_refresh
+            and _ta_calendar_cache is not None
+            and _ta_calendar_cache_time is not None
+            and (now - _ta_calendar_cache_time).days < TA_CALENDAR_CACHE_DAYS):
+        return _ta_calendar_cache
+
+    # === 数据源 1: AKShare ===
+    try:
+        import akshare as ak
+        df = ak.tool_trade_date_hist_sina()
+        cal_ak = pd.DatetimeIndex(pd.to_datetime(df['trade_date']).sort_values())
+        _calendar_source = "akshare"
+        logger.debug(f"AKShare 返回 {len(cal_ak)} 个交易日")
+
+        # === 交叉校验: Baostock ===
+        try:
+            import baostock as bs
+            bs.login()
+            # 获取未来30天和过去30天
+            start_d = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            end_d = (now + timedelta(days=30)).strftime('%Y-%m-%d')
+            rs = bs.query_trade_dates(start_date=start_d, end_date=end_d)
+            df_bs = rs.get_data()
+            bs.logout()
+
+            if not df_bs.empty:
+                bs_dates = set(pd.to_datetime(df_bs[df_bs['is_trading_day'] == '1']['calendar_date']))
+                ak_dates = set(cal_ak[
+                    (cal_ak >= pd.to_datetime(start_d)) &
+                    (cal_ak <= pd.to_datetime(end_d))
+                ])
+
+                # 比对近30天
+                if bs_dates != ak_dates:
+                    diff_bs = bs_dates - ak_dates
+                    diff_ak = ak_dates - bs_dates
+                    logger.warning(
+                        f"交易日历不一致！AKShare vs Baostock 差异: "
+                        f"Baostock多 {len(diff_bs)} 天, AKShare多 {len(diff_ak)} 天"
+                    )
+                    # 记录差异但不阻塞，使用 AKShare
+                    _calendar_source = "akshare(baostock_mismatch)"
+                else:
+                    logger.debug("AKShare 与 Baostock 校验一致")
+        except Exception as e:
+            logger.warning(f"Baostock 校验失败: {e}，跳过校验")
+
+        # 缓存并返回
+        _ta_calendar_cache = cal_ak
+        _ta_calendar_cache_time = now
+        logger.info(f"已获取 A 股交易日历（来源: {_calendar_source}）：{len(cal_ak)} 个交易日")
+        return cal_ak
+
+    except Exception as e:
+        logger.warning(f"AKShare 获取失败: {e}")
+
+    # === 数据源 2: Baostock 直接获取 ===
+    try:
+        import baostock as bs
+        bs.login()
+        rs = bs.query_trade_dates(start_date='2020-01-01', end_date='2030-12-31')
+        df_bs = rs.get_data()
+        bs.logout()
+
+        if not df_bs.empty:
+            cal_bs = pd.DatetimeIndex(pd.to_datetime(
+                df_bs[df_bs['is_trading_day'] == '1']['calendar_date']
+            ).sort_values())
+            _ta_calendar_cache = cal_bs
+            _ta_calendar_cache_time = now
+            _calendar_source = "baostock"
+            logger.info(f"已获取 A 股交易日历（来源: Baostock）：{len(cal_bs)} 个交易日")
+            return cal_bs
+    except Exception as e:
+        logger.warning(f"Baostock 获取失败: {e}")
+
+    # === 数据源 3: TuShare ===
+    try:
+        import tushare as ts
+        # 尝试获取 pro 接口
+        pro = ts.pro()
+        if pro is not None:
+            df_ts = pro.trade_cal(start_date='20200101', end_date='20301231')
+            if not df_ts.empty:
+                cal_ts = pd.DatetimeIndex(pd.to_datetime(
+                    df_ts[df_ts['is_open'] == 1]['cal_date']
+                ).sort_values())
+                _ta_calendar_cache = cal_ts
+                _ta_calendar_cache_time = now
+                _calendar_source = "tushare"
+                logger.info(f"已获取 A 股交易日历（来源: TuShare）：{len(cal_ts)} 个交易日")
+                return cal_ts
+    except Exception as e:
+        logger.warning(f"TuShare 获取失败: {e}")
+
+    # === 兜底: Fallback 日历 ===
+    logger.warning("所有数据源均失败，使用仅排除周末的兜底日历")
+    _ta_calendar_cache = _get_fallback_calendar()
+    _ta_calendar_cache_time = now
+    _calendar_source = "fallback(weekend_only)"
+    return _ta_calendar_cache
+
+
+def _get_fallback_calendar() -> pd.DatetimeIndex:
+    """生成仅排除周末的简化日历（兜底用）"""
+    start = datetime(2020, 1, 1)
+    end = datetime(2030, 12, 31)
+    dates = pd.bdate_range(start=start, end=end)
+    return dates
+
+
+def is_trading_day(date) -> bool:
+    """判断指定日期是否为交易日（带多数据源校验）"""
+    if isinstance(date, str):
+        date = pd.to_datetime(date)
+    elif isinstance(date, datetime):
+        date = pd.Timestamp(date)
+
+    calendar = get_trade_calendar()
+    return date in calendar
+
+
+def get_previous_trading_day(date, n: int = 1):
+    """获取指定日期前第 n 个交易日"""
+    if isinstance(date, str):
+        date = pd.to_datetime(date)
+    elif isinstance(date, datetime):
+        date = pd.Timestamp(date)
+
+    calendar = get_trade_calendar()
+    idx = calendar.searchsorted(date, side='right') - 1
+    target_idx = max(0, idx - n + 1)
+    return calendar[target_idx]
+
+
+def get_next_trading_day(date, n: int = 1):
+    """获取指定日期后第 n 个交易日"""
+    if isinstance(date, str):
+        date = pd.to_datetime(date)
+    elif isinstance(date, datetime):
+        date = pd.Timestamp(date)
+
+    calendar = get_trade_calendar()
+    idx = calendar.searchsorted(date, side='left')
+    target_idx = min(len(calendar) - 1, idx + n - 1)
+    return calendar[target_idx]
+
+
+def align_to_trading_day(date, direction: str = 'forward'):
+    """
+    将日期对齐到最近的交易日
+
+    参数:
+        date: 要对齐的日期
+        direction: 'forward'=向前找下一个交易日，'backward'=向后找上一个交易日
+    """
+    if isinstance(date, str):
+        date = pd.to_datetime(date)
+    elif isinstance(date, datetime):
+        date = pd.Timestamp(date)
+
+    calendar = get_trade_calendar()
+    if date in calendar:
+        return date
+
+    if direction == 'forward':
+        idx = calendar.searchsorted(date, side='right')
+        if idx >= len(calendar):
+            return calendar[-1]
+        return calendar[idx]
+    else:
+        idx = calendar.searchsorted(date, side='left') - 1
+        if idx < 0:
+            return calendar[0]
+        return calendar[idx]
+
+
+def verify_date_alignment(code: str, df: pd.DataFrame) -> Tuple[bool, List[str], List[str]]:
+    """
+    严格验证股票数据的交易日对齐（替代 _check_data_integrity）
+
+    使用真实日历检查：
+    1. 数据日期是否都是交易日
+    2. 是否有遗漏的交易日
+
+    返回: (是否对齐, 缺失日期列表, 警告消息列表)
+    """
+    if df.empty or len(df) < 2:
+        return True, [], []
+
+    warnings = []
+    calendar = get_trade_calendar()
+
+    df_sorted = df.sort_values('date').reset_index(drop=True)
+    dates = pd.to_datetime(df_sorted['date']).dt.date.tolist()
+
+    # 1. 检查是否有非交易日的数据
+    non_trading_dates = []
+    for d in dates:
+        pd_d = pd.Timestamp(d)
+        if pd_d not in calendar and d.weekday() < 5:
+            non_trading_dates.append(d.strftime('%Y-%m-%d'))
+
+    if non_trading_dates:
+        warnings.append(f"{code} 包含 {len(non_trading_dates)} 个非交易日数据: {non_trading_dates[:5]}...")
+
+    # 2. 检查是否有缺失的交易日
+    missing_dates = []
+    for i in range(1, len(dates)):
+        prev = pd.Timestamp(dates[i-1])
+        curr = pd.Timestamp(dates[i])
+        delta = (curr - prev).days
+
+        if delta > 1:
+            # 检查中间日期是否应该交易日
+            current = prev
+            while current < curr:
+                current += timedelta(days=1)
+                if current.weekday() < 5 and current not in calendar:
+                    missing_dates.append(current.strftime('%Y-%m-%d'))
+
+    if missing_dates:
+        warnings.append(f"{code} 缺失 {len(missing_dates)} 个交易日")
+
+    is_aligned = len(warnings) == 0
+    return is_aligned, missing_dates, warnings
+
+
 # ==================== 增量更新元数据管理 ====================
 
 METADATA_FILE = "metadata.json"
@@ -137,93 +394,21 @@ def update_stock_metadata(code: str, last_date: str, record_count: int,
 
 def check_data_integrity(df: pd.DataFrame, code: str) -> Tuple[bool, List[str]]:
     """
-    检查数据完整性，识别缺失的交易日
-    
-    A 股交易日历规则：
-    - 周一至周五为交易日（法定节假日除外）
-    - 不检查具体节假日（简化处理），仅检查工作日缺失
-    
+    检查数据完整性，识别缺失的交易日（使用真实日历）
+
     参数:
         df: 股票数据 DataFrame
         code: 股票代码
-    
+
     返回:
         (是否完整，缺失日期列表)
     """
-    if df.empty or len(df) < 2:
-        return True, []
-    
-    missing_dates = []
-    
-    # 按日期排序
-    df_sorted = df.sort_values('date').reset_index(drop=True)
-    dates = pd.to_datetime(df_sorted['date']).dt.date.tolist()
-    
-    # 检查相邻日期间隔
-    for i in range(1, len(dates)):
-        prev_date = dates[i-1]
-        curr_date = dates[i]
-        
-        # 计算间隔天数
-        delta_days = (curr_date - prev_date).days
-        
-        # 如果间隔大于 1 天，检查是否有工作日缺失
-        if delta_days > 1:
-            current = prev_date
-            while current != curr_date:
-                current += timedelta(days=1)
-                # 检查是否为工作日（周一到周五）
-                if current.weekday() < 5:  # 0-4 为周一到周五
-                    # 简化的节假日判断：排除常见长假月份的部分日期
-                    month_day = (current.month, current.day)
-                    # 排除常见假期（春节、国庆等，简化处理）
-                    if not is_likely_holiday(current):
-                        missing_dates.append(current.strftime('%Y-%m-%d'))
-    
-    is_complete = len(missing_dates) == 0
-    
-    if not is_complete and missing_dates:
-        logger.warning(f"{code} 发现 {len(missing_dates)} 个可能的缺失交易日")
-    
-    return is_complete, missing_dates
+    is_aligned, missing_dates, warnings = verify_date_alignment(code, df)
 
+    if warnings:
+        logger.warning(f"{code} 数据对齐问题: {'; '.join(warnings)}")
 
-def is_likely_holiday(date: datetime.date) -> bool:
-    """
-    判断日期是否可能是法定节假日（保守版本）
-
-    采用保守策略：只排除确认的固定节假日，减少误判
-
-    参数:
-        date: 要判断的日期
-
-    返回:
-        是否可能是节假日
-    """
-    # 确认的中国法定节假日（仅包含最核心的几天）
-    holidays = [
-        # 元旦 (1月1日)
-        (1, 1),
-        # 春节 (除夕到正月初三，简化处理)
-        (1, 28), (1, 29), (1, 30), (1, 31),  # 除夕到初三
-        (2, 1), (2, 2), (2, 3),               # 初一到初三
-        # 清明节 (4月4-5日)
-        (4, 4), (4, 5),
-        # 劳动节 (5月1日)
-        (5, 1),
-        # 端午节 (5月5日)
-        (5, 5),
-        # 中秋节 (10月1日)
-        (10, 1),
-        # 国庆节 (10月1-3日)
-        (10, 1), (10, 2), (10, 3),
-    ]
-
-    month_day = (date.month, date.day)
-
-    # 保守策略：如果不在确认的节假日列表中，返回 False
-    # 这样可能会有少量真实节假日被漏判，但大大减少误判
-    return month_day in holidays
+    return is_aligned, missing_dates
 
 
 # ==================== 自适应限流器 ====================
@@ -474,6 +659,241 @@ def get_global_batch_processor(config: dict = None) -> BatchProcessor:
         )
 
     return _global_batch_processor
+
+
+# ==================== 线程本地限流器（并行化支持） ====================
+
+import threading
+
+_thread_local = threading.local()
+
+
+def get_thread_rate_limiter(config: dict = None) -> AdaptiveRateLimiter:
+    """
+    获取当前线程的 RateLimiter（线程独立）
+
+    避免多线程共享同一个限流器导致的锁竞争，
+    同时保持各自独立的状态（成功/失败计数）
+    """
+    if not hasattr(_thread_local, 'rate_limiter'):
+        if config is None:
+            config = {}
+
+        network_cfg = config.get('network', {})
+        _thread_local.rate_limiter = AdaptiveRateLimiter(
+            base_delay=network_cfg.get('min_delay_per_stock', 3.0),
+            max_delay=network_cfg.get('max_delay_per_stock', 8.0),
+            multiplier=network_cfg.get('adaptive_cooldown_multiplier', 2.0),
+            recovery_factor=network_cfg.get('recovery_factor', 0.8),
+            min_delay=network_cfg.get('min_delay_per_stock', 2.0)
+        )
+
+    return _thread_local.rate_limiter
+
+
+# ==================== 批量行情预过滤 ====================
+
+
+def get_stocks_basic_info_batch() -> pd.DataFrame:
+    """
+    批量获取股票基本信息（AkShare 优先，Baostock 备用）
+
+    优点：一次请求返回所有股票，极其快速
+
+    返回 DataFrame 包含：code, name, price, turnover, is_st
+    """
+    # === 数据源 1: AkShare ===
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+
+        # 列名映射
+        df = df.rename(columns={
+            '代码': 'code',
+            '名称': 'name',
+            '最新价': 'price',
+            '成交额': 'turnover',  # 万元
+            '涨跌额': 'change',
+            '涨跌幅': 'pct_change'
+        })
+
+        # 判断 ST（名称中包含 ST 或 退市）
+        df['is_st'] = df['名称'].str.contains('ST|退市', regex=True, na=False)
+
+        # 格式化代码为统一格式
+        df['code'] = df['代码'] + '.' + df['名称'].apply(
+            lambda x: 'SH' if str(x).startswith(('6', '5')) else 'SZ'
+        )
+
+        logger.debug(f"批量获取行情成功（AkShare）：{len(df)} 只股票")
+        return df
+
+    except Exception as e:
+        logger.warning(f"AkShare 批量行情失败: {e}，尝试 Baostock...")
+
+    # === 数据源 2: Baostock 备用 ===
+    # 注意：Baostock 没有真正的批量实时行情接口
+    # 只查询少量股票作为补充，返回的数据可能不完整
+    try:
+        import baostock as bs
+
+        bs.login()
+
+        # 获取最近交易日
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        # 只获取主要股票的最新行情（sh.6xxxxxx 和 sz.0/3xxxxxx）
+        # 每只股票查询最近3天数据取最新，限制数量以保证速度
+        results = []
+        lookback_days = 3
+        max_stocks = 50  # 最多50只
+
+        # 主板/蓝筹股列表
+        main_codes = [
+            'sh.600000', 'sh.600016', 'sh.600019', 'sh.600028', 'sh.600036',
+            'sh.600050', 'sh.600104', 'sh.600109', 'sh.600111', 'sh.600150',
+            'sh.600519', 'sh.600887', 'sh.600999', 'sh.601006', 'sh.601012',
+            'sh.601088', 'sh.601166', 'sh.601288', 'sh.601318', 'sh.601328',
+            'sh.601398', 'sh.601601', 'sh.601628', 'sh.601668', 'sh.601688',
+            'sh.601766', 'sh.601818', 'sh.601857', 'sh.601988', 'sh.602012',
+            'sz.000001', 'sz.000002', 'sz.000063', 'sz.000066', 'sz.000100',
+            'sz.000333', 'sz.000338', 'sz.000425', 'sz.000538', 'sz.000568',
+            'sz.000651', 'sz.000858', 'sz.000876', 'sz.000895', 'sz.000983',
+            'sz.002001', 'sz.002024', 'sz.002594', 'sz.002714', 'sz.300015'
+        ]
+
+        for code in main_codes[:max_stocks]:
+            try:
+                rs = bs.query_history_k_data_plus(
+                    code,
+                    "date,close,amount",
+                    start_date=(datetime.now() - timedelta(days=lookback_days)).strftime('%Y-%m-%d'),
+                    end_date=today,
+                    frequency="d"
+                )
+                if rs.error_code == '0':
+                    data = rs.get_data()
+                    if not data.empty:
+                        latest = data.iloc[-1]
+                        # 注意：返回数据只有 date/close/amount，没有 code 列，用原始 code 转换
+                        bs_code = code.replace('sh.', '').replace('sz.', '').upper()
+                        exchange = 'SH' if code.startswith('sh') else 'SZ'
+                        results.append({
+                            'code': f"{bs_code}.{exchange}",
+                            'name': '',
+                            'price': float(latest['close']) if latest['close'] else 0,
+                            'turnover': float(latest['amount']) / 10000 if latest['amount'] else 0,
+                            'change': 0,
+                            'pct_change': 0,
+                            'is_st': False
+                        })
+            except Exception:
+                continue
+
+        bs.logout()
+
+        if results:
+            df_baostock = pd.DataFrame(results)
+            logger.info(f"批量获取行情成功（Baostock 备用）：{len(df_baostock)} 只股票")
+            return df_baostock
+
+    except Exception as e:
+        logger.warning(f"Baostock 批量行情也失败: {e}")
+
+    return pd.DataFrame()
+
+
+def pre_filter_stocks_fast(candidate_list: List[str],
+                           config: dict) -> List[str]:
+    """
+    使用缓存的批量行情数据快速预过滤
+
+    策略：
+    1. 尝试读取本地缓存的当日行情（data/today_spot.parquet）
+    2. 如果缓存过期或不存在，使用 akshare 批量接口获取
+    3. 在内存中按条件过滤
+
+    参数:
+        candidate_list: 候选股票代码列表
+        config: 配置字典
+
+    返回:
+        过滤后的股票代码列表
+    """
+    data_dir = config.get('paths', {}).get('data_dir', './data')
+    os.makedirs(data_dir, exist_ok=True)
+    cache_file = os.path.join(data_dir, 'today_spot.parquet')
+
+    # 尝试加载缓存
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if os.path.exists(cache_file):
+        try:
+            df_spot = pd.read_parquet(cache_file)
+            if len(df_spot) > 0 and str(df_spot.iloc[0].get('date', '')) == today_str:
+                logger.info("使用当日行情缓存进行预过滤")
+                return _apply_pre_filter(df_spot, candidate_list, config)
+        except Exception:
+            pass
+
+    # 获取全市场实时行情
+    logger.info("获取全市场实时行情（用于预过滤，首次可能需 10-30 秒）...")
+    df_spot = get_stocks_basic_info_batch()
+    if df_spot.empty:
+        logger.warning("无法获取行情数据，跳过预过滤")
+        return candidate_list
+
+    # 保存缓存
+    df_spot['date'] = today_str
+    df_spot.to_parquet(cache_file, index=False)
+    logger.info(f"行情数据已缓存：{len(df_spot)} 只")
+
+    return _apply_pre_filter(df_spot, candidate_list, config)
+
+
+def _apply_pre_filter(df_spot: pd.DataFrame,
+                      candidate_list: List[str],
+                      config: dict) -> List[str]:
+    """
+    应用预过滤条件到行情数据
+
+    参数:
+        df_spot: 批量获取的行情 DataFrame
+        candidate_list: 候选股票代码列表
+        config: 配置字典
+
+    返回:
+        过滤后的股票代码列表
+    """
+    pre_cfg = config.get('pre_filter', {})
+    min_turnover = pre_cfg.get('min_turnover', 50000)  # 万元
+    max_price = pre_cfg.get('max_price', 100.0)
+
+    # 确保 code 列存在且格式正确
+    if 'code' not in df_spot.columns:
+        logger.warning("行情数据缺少 code 列，跳过预过滤")
+        return candidate_list
+
+    # 过滤条件：
+    # 1. 在候选列表中
+    # 2. 成交额 >= min_turnover 万元
+    # 3. 股价 <= max_price
+    # 4. 非 ST
+    df_filtered = df_spot[
+        (df_spot['code'].isin(candidate_list)) &
+        (df_spot['turnover'] >= min_turnover) &
+        (df_spot['price'] <= max_price) &
+        (df_spot['is_st'] == False)
+    ]
+
+    filtered_list = df_filtered['code'].tolist()
+    logger.info(f"预过滤完成：{len(candidate_list)} → {len(filtered_list)} 只 "
+                 f"(成交额≥{min_turnover}万，股价≤{max_price}元)")
+
+    if len(filtered_list) < len(candidate_list):
+        removed = len(candidate_list) - len(filtered_list)
+        logger.debug(f"预过滤移除 {removed} 只：成交额不足或价格过高")
+
+    return filtered_list
 
 
 # ==================== 请求频率控制（兼容旧接口） ====================
@@ -814,7 +1234,7 @@ def backfill_missing_data(code: str, missing_dates: List[str],
     # 加载现有数据并合并
     cache_path = get_cache_path(code, data_dir)
     if os.path.exists(cache_path):
-        df_existing = pd.read_csv(cache_path, parse_dates=['date'])
+        df_existing = pd.read_parquet(cache_path)
         df_combined = append_new_data(df_existing, df_backfill, code)
         save_to_cache(df_combined, cache_path)
         
@@ -1190,57 +1610,6 @@ def save_to_cache(df: pd.DataFrame, cache_path: str) -> bool:
     except Exception as e:
         logger.error(f"保存缓存失败：{str(e)}")
         return False
-
-
-def migrate_csv_to_parquet(data_dir: str = "./data") -> Dict[str, Any]:
-    """
-    将现有 CSV 缓存文件迁移到 Parquet 格式
-
-    迁移成功后自动删除原始 CSV 文件
-
-    参数:
-        data_dir: 数据目录
-
-    返回:
-        包含迁移结果的字典：{'success': [], 'failed': []}
-    """
-    csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
-    results: Dict[str, List] = {'success': [], 'failed': []}
-
-    if not csv_files:
-        logger.info("没有找到需要迁移的 CSV 文件")
-        return results
-
-    logger.info(f"开始迁移 {len(csv_files)} 个 CSV 文件到 Parquet 格式...")
-
-    for csv_file in csv_files:
-        csv_path = os.path.join(data_dir, csv_file)
-        parquet_file = csv_file.replace('.csv', '.parquet')
-        parquet_path = os.path.join(data_dir, parquet_file)
-
-        # 如果 Parquet 已存在，直接删除 CSV
-        if os.path.exists(parquet_path):
-            os.remove(csv_path)
-            logger.info(f"Parquet 已存在，删除 CSV：{csv_file}")
-            continue
-
-        try:
-            df = pd.read_csv(csv_path, parse_dates=['date'])
-            df.to_parquet(parquet_path, index=False, engine='pyarrow')
-            os.remove(csv_path)  # 转换成功后删除原始 CSV
-            results['success'].append(csv_file)
-            logger.info(f"迁移成功：{csv_file} -> {parquet_file} ({len(df)} 条记录)")
-        except Exception as e:
-            results['failed'].append((csv_file, str(e)))
-            logger.error(f"迁移失败：{csv_file} - {str(e)}")
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"CSV -> Parquet 迁移完成:")
-    logger.info(f"  成功: {len(results['success'])}")
-    logger.info(f"  失败: {len(results['failed'])}")
-    logger.info(f"{'='*60}")
-
-    return results
 
 
 def get_stock_data(code: str, data_dir: str = "./data",

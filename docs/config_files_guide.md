@@ -1,21 +1,21 @@
-# 配置文件详解 - A 股网格交易系统 v1.0.0
+# 配置文件详解 - A 股网格交易系统 v0.2.0
 
 ## 📋 配置文件概览
 
-系统共有 4 个配置文件，各自承担不同职责：
+系统共有 2 个配置文件，各自承担不同职责：
 
 | 文件名 | 类型 | 作用 | 是否必需 | 建议保留 |
 |--------|------|------|----------|----------|
-| `config_base.yaml` | 静态配置 | **主配置文件**，包含所有参数定义和详细说明 | ✅ 必需 | ✅ 保留 |
-| `config_enhanced.yaml` | 静态配置 | 增强配置模板，包含完整风控参数示例 | ⚠️ 参考 | ✅ 保留（作为示例） |
+| `config.yaml` | 静态配置 | **主配置文件**，包含所有参数定义和详细说明 | ✅ 必需 | ✅ 保留 |
 | `config_state.json` | 动态状态 | 自动维护的运行状态（选股结果、优化历史等） | ✅ 必需 | ✅ 保留（自动生成） |
-| `config.yaml` | 工作配置 | 用户实际使用的配置文件（由 base 复制） | ✅ 必需 | ✅ 保留（用户编辑） |
+
+> **注意**: `config_base.yaml` 已废弃，与 `config.yaml` 内容相同，仅为兼容性保留。
 
 ---
 
 ## 🔍 详细分析
 
-### 1. config_base.yaml - 基础配置文件
+### 1. config.yaml - 主配置文件
 
 **作用**: 
 - 包含所有可配置参数的**完整定义**
@@ -68,13 +68,11 @@ logging:                      # 日志配置
 - ✅ **适合作为参考**：不知道某个参数时查阅此文件
 
 **是否需要保留**: ✅ **必须保留**
-- 这是配置的"源头"，所有参数的定义都在这里
+- 这是系统的主配置文件，所有参数的定义都在这里
 - 新用户通过此文件了解系统支持哪些配置
-- 不应直接修改此文件，而是复制为 `config.yaml` 后修改
+- 直接编辑此文件即可
 
----
-
-### 2. config_enhanced.yaml - 增强配置文件
+> **注意**: `config_base.yaml` 是此文件的副本，已废弃。
 
 **作用**:
 - 展示**高级功能**的配置方法
@@ -184,19 +182,16 @@ walk_forward:
 
 ---
 
-### 4. config.yaml - 工作配置文件
+### 2. config.yaml - 主配置文件
 
 **作用**:
-- **用户实际使用的配置文件**
-- 从 `config_base.yaml` 复制而来
+- **系统主配置文件**
+- 包含所有可配置参数的完整定义和中文注释
 - 用户根据自己需求修改此文件
 
 **使用流程**:
 ```bash
-# 1. 首次使用时复制
-cp config_base.yaml config.yaml
-
-# 2. 编辑配置文件
+# 编辑配置文件
 vim config.yaml
 
 # 3. 运行系统
@@ -221,13 +216,7 @@ python main.py --config config.yaml
 
 ```
 ┌─────────────────────┐
-│ config_base.yaml    │  ◄─── 基础模板（参数最全，注释最详细）
-│ (基础配置模板)      │
-└──────────┬──────────┘
-           │ 复制
-           ▼
-┌─────────────────────┐
-│ config.yaml         │  ◄─── 用户工作配置（实际使用）
+│ config.yaml         │  ◄─── 主配置文件（实际使用）
 │ (用户工作配置)      │
 └──────────┬──────────┘
            │ 运行时读取
@@ -238,9 +227,8 @@ python main.py --config config.yaml
 └─────────────────────┘
 
 ┌─────────────────────┐
-│ config_enhanced.    │  ◄─── 增强示例（参考用）
-│ yaml                │
-│ (增强配置示例)      │
+│ config_base.yaml    │  ◄─── 已废弃（与 config.yaml 相同）
+│ (废弃，仅兼容保留)  │
 └─────────────────────┘
 ```
 
@@ -252,22 +240,18 @@ python main.py --config config.yaml
 
 | 文件 | 保留建议 | Git 管理 | 说明 |
 |------|----------|----------|------|
-| `config_base.yaml` | ✅ 保留 | ✅ 提交 | 基础模板，包含完整参数说明 |
-| `config_enhanced.yaml` | ✅ 保留（重命名） | ✅ 提交 | 建议改为 `config_enhanced_example.yaml` |
-| `config_state.json` | ✅ 保留 | ❌ 忽略 | 自动生​​成，包含敏感信息 |
-| `config.yaml` | ✅ 保留 | ❌ 忽略 | 用户工作配置，包含个人设置 |
+| `config.yaml` | ✅ 保留 | ❌ 忽略 | 主配置文件，包含个人设置 |
+| `config_base.yaml` | ⚠️ 废弃 | ✅ 提交 | 已废弃，仅为兼容性保留 |
+| `config_state.json` | ✅ 保留 | ❌ 忽略 | 自动生成，包含敏感信息 |
 
 ### 推荐的项目结构
 
 ```
 auto_grid_trading_system/
-├── config_base.yaml              # ✅ 提交：基础配置模板
-├── config_enhanced_example.yaml  # ✅ 提交：增强配置示例（重命名）
-├── config.example.yaml           # ✅ 提交：简化版模板（可选）
+├── config.yaml                   # ❌ 忽略：主配置文件（用户编辑）
+├── config_base.yaml             # ✅ 提交：废弃兼容保留
 │
-├── config.yaml                   # ❌ 忽略：用户工作配置
 ├── config_state.json             # ❌ 忽略：动态状态
-├── config_custom_*.yaml          # ❌ 忽略：用户自定义配置
 │
 └── .gitignore
 ```
@@ -278,10 +262,9 @@ auto_grid_trading_system/
 # 用户配置文件（包含个人设置和敏感信息）
 config.yaml
 config_state.json
-config_custom_*.yaml
 
 # 数据和输出
-data/*.csv
+data/*.parquet
 output/*.csv
 output/*.json
 output/log.txt
@@ -297,34 +280,13 @@ output/log.txt
 ### 新用户快速开始
 
 ```bash
-# 1. 复制基础配置
-cp config_base.yaml config.yaml
-
-# 2. 编辑配置（修改股票池、参数等）
+# 编辑配置（修改股票池、参数等）
 vim config.yaml
 
 # 3. 运行系统
 python main.py
 
 # 4. （可选）使用增强配置
-cp config_enhanced.yaml config.yaml
-# 编辑并添加风控参数、持仓信息等
-```
-
-### 多场景配置
-
-```bash
-# 保守策略
-cp config_base.yaml config_conservative.yaml
-# 编辑：调小 grid_spacing, 降低仓位...
-
-# 激进策略
-cp config_base.yaml config_aggressive.yaml
-# 编辑：调大 grid_spacing, 提高仓位...
-
-# 分别运行
-python main.py --config config_conservative.yaml
-python main.py --config config_aggressive.yaml
 ```
 
 ---
@@ -333,36 +295,14 @@ python main.py --config config_aggressive.yaml
 
 ### 必须保留的文件
 
-1. **`config_base.yaml`** - 基础配置模板（参数定义最全）
+1. **`config.yaml`** - 主配置文件（实际使用）
 2. **`config_state.json`** - 动态状态（系统自动维护）
-3. **`config.yaml`** - 用户工作配置（实际使用）
 
-### 建议保留的文件
+### 废弃文件
 
-1. **`config_enhanced.yaml`** - 增强配置示例（建议重命名为 `config_enhanced_example.yaml`）
-   - 展示高级功能配置方法
-   - 作为参考模板很有价值
-
-### 改进建议
-
-1. **重命名** `config_enhanced.yaml` → `config_enhanced_example.yaml`
-   - 更清晰地表明这是示例文件
-   - 避免用户直接使用
-
-2. **创建简化版模板** `config.example.yaml`
-   - 只包含最常用参数
-   - 适合新手快速上手
-
-3. **更新 .gitignore**
-   - 忽略 `config.yaml` 和 `config_state.json`
-   - 保护用户隐私和敏感信息
-
-4. **在 README.md 中明确说明**
-   - 各配置文件的作用
-   - 应该修改哪个文件
-   - 哪些文件不应该提交到 Git
+1. **`config_base.yaml`** - 已废弃，与 config.yaml 相同，仅为兼容性保留
 
 ---
 
-**Last Updated**: 2026-03-18  
-**Version**: v1.0.0
+**Last Updated**: 2026-04-13
+**Version**: v0.2.0

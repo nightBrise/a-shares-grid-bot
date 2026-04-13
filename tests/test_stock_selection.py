@@ -450,7 +450,7 @@ def test_full_selection_pipeline():
     import yaml
     
     # 加载配置
-    config_path = "config_base.yaml"
+    config_path = "config.yaml"
     if not os.path.exists(config_path):
         print(f"✗ 配置文件不存在：{config_path}")
         return False
