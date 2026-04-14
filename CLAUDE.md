@@ -56,7 +56,7 @@ AkShare/Baostock → data.py → indicators.py/screener.py → grid_engine.py �
 
 1. **select** - 多因子横截面打分筛选股票（四因子正交化 + 双轨权重）
 2. **optimize** - Optuna贝叶斯优化最大化Calmar Ratio
-3. **signal** - 基于ATR动态调整网格间距，生成次日买卖计划
+3. **signal** - 基于波动率动态调整网格间距，生成次日买卖计划
 4. **wf** - Walk-Forward滚动窗口分析
 
 ### Walk-Forward时间窗口
@@ -82,8 +82,10 @@ T = 当前日期
 
 ### 动态网格引擎
 
-- 网格间距 = k × ATR(20)
+- 网格间距 = base_spacing × clip(vol_ratio, 0.8, 1.2)，统一使用百分比量纲
 - 低波动(k=2.5)、中波动(k=2.0)、高波动(k=1.5)
+- T+1 强制平仓：仅对可用持仓执行平仓，避免冻结份额导致委托拒单
+- 支持 20 日滚动中位数波动率平滑，避免信号闪烁
 
 ### 风控机制
 
