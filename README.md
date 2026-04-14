@@ -3,7 +3,7 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v1.3.0-yellow.svg)](VERSION.md)
+[![Version](https://img.shields.io/badge/version-v1.3.1-yellow.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 > ⚠️ **模块状态**：选股模块 ✅ 已稳定运行 | 网格参数计算模块 🔄 优化中
@@ -255,7 +255,12 @@ conda env create -f environment.yml
 
 ## 📝 版本历史
 
-### v1.3.0 (2026-04-14) - 市场状态门控 + 因子模型优化
+### v1.3.1 (2026-04-14) - 动态网格引擎修复
+
+**核心改进**:
+- ✅ 统一动态网格间距量纲（百分比 vs ATR 绝对价格）
+- ✅ T+1 强制平仓逻辑修复（仅对可用持仓执行平仓）
+- ✅ 支持 20 日滚动中位数波动率平滑，避免信号闪烁
 
 **核心改进**:
 - ✅ 市场状态门控 RegimeFilter（三级响应 + 硬底线）

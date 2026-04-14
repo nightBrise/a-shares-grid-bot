@@ -1,4 +1,4 @@
-# 项目结构说明 - A 股网格交易系统 v1.0.0
+# 项目结构说明 - A 股网格交易系统 v1.3.1
 
 ## 完整目录结构
 
@@ -243,7 +243,7 @@ class HTTPSessionManager:
 
 **主要章节**:
 ```yaml
-version: "1.0.0"           # 系统版本
+version: "1.3.1"           # 系统版本
 mode: select               # 运行模式
 stocks: [...]              # 股票池
 grid:                      # 网格参数
@@ -264,7 +264,7 @@ logging:                   # 日志配置
 **结构**:
 ```json
 {
-  "version": "1.0.0",
+  "version": "1.3.1",
   "selection_status": {
     "completed": true,
     "last_selection_date": "2026-03-18",
@@ -469,5 +469,5 @@ def your_function(config: dict):
 
 ---
 
-**Last Updated**: 2026-03-18  
-**Version**: v1.0.0
+**Last Updated**: 2026-04-14
+**Version**: v1.3.1
