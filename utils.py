@@ -62,17 +62,19 @@ def get_version() -> str:
 # ==================== 搜索空间计算 ====================
 
 
-def calculate_grid_search_space(cash: float) -> dict:
+def calculate_grid_search_space(cash: float, initial_position: float = 0.45) -> dict:
     """
     根据资金规模自动计算网格参数搜索空间
 
     核心约束:
-    1. 每格金额 × 层数 ≤ 可用资金 × 60%  （预留40%现金缓冲）
-    2. 网格间距 > 2 × 往返摩擦成本 ≈ 0.24%
-    3. 单格金额 ≤ 总资金 × 10%
+    1. 网格资金池 = cash × (1 - initial_position)  （55%用于网格补仓）
+    2. 网格总采购额 ≤ 网格资金池 × 95%  （5%安全缓冲）
+    3. 网格间距 > 2 × 往返摩擦成本 ≈ 0.24%
+    4. 单格金额 ≤ 总资金 × 10%
 
     参数:
         cash: 总资金（元）
+        initial_position: 初始仓位比例（决定网格资金池大小，默认0.45）
 
     返回:
         包含搜索空间的字典:
@@ -81,6 +83,8 @@ def calculate_grid_search_space(cash: float) -> dict:
         - max_grids_range: 最大网格层数范围 [min, max]
         - grid_spacing_range: 网格间距范围 [min, max]
         - initial_position_range: 初始仓位范围 [min, max]
+        - grid_pool: 实际网格资金池（元）
+        - max_grid_investment: 最大网格采购额（×0.95缓冲）
     """
     # 资金级别判断
     if cash < 100000:
@@ -103,13 +107,14 @@ def calculate_grid_search_space(cash: float) -> dict:
         grid_amount_choices = [10000, 20000, 30000, 50000]
 
     # 计算最大网格层数
-    # 约束: grid_amount × max_grids ≤ cash × initial_position × 0.6
-    initial_position = 0.45  # 固定初始仓位45%
-    max_investment = cash * initial_position * 0.6
-    max_grids = max(4, min(15, int(max_investment / grid_amount_min)))
+    # 实际网格资金池 = alloc × (1 - initial_position)
+    grid_pool = cash * (1 - initial_position)
+    # 95%安全系数
+    max_grid_investment = grid_pool * 0.95
+    max_grids = max(4, min(15, int(max_grid_investment / grid_amount_min)))
 
     # 网格间距范围（固定，防止参数漂移）
-    # 下限: 2 × 摩擦成本(佣金+印花税+滑点 ≈ 0.12%) × 2 = 0.24%
+    # 下限: 2 × 往返摩擦成本(佣金+印花税+滑点 ≈ 0.12%) × 2 = 0.24%
     # 上限: 3.5%
     grid_spacing_min = 0.015  # 1.5%
     grid_spacing_max = 0.035  # 3.5%
@@ -124,6 +129,8 @@ def calculate_grid_search_space(cash: float) -> dict:
         'max_grids_range': [4, max_grids],
         'grid_spacing_range': [grid_spacing_min, grid_spacing_max],
         'initial_position_range': [initial_position_min, initial_position_max],
+        'grid_pool': grid_pool,
+        'max_grid_investment': max_grid_investment,
     }
 
 

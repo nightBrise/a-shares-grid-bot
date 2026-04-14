@@ -249,12 +249,25 @@ Optuna 参数优化使用以下搜索空间：
 
 | 参数 | 类型 | 范围 | 步长/选项 |
 |------|------|------|-----------|
-| `grid_spacing` | float | 1.0% ~ 5.0% | 0.1% |
-| `grid_amount` | categorical | - | [5000, 10000, 20000, 50000] |
-| `initial_position` | float | 30% ~ 70% | 5% |
-| `max_grids` | int | 5 ~ 15 | 1 |
+| `grid_spacing` | float | 1.5% ~ 3.5% | 0.1% |
+| `grid_amount` | categorical | - | 根据资金级别离散候选 |
+| `initial_position` | float | 40% ~ 50% | 1% |
+| `max_grids` | int | 4 ~ 15 | 1 |
 
-目标函数：**最大化 Calmar Ratio**（年化收益 / 最大回撤）
+目标函数：**最大化复合分数**（多目标惩罚函数）
+
+```
+复合分数 = Calmar − 回撤惩罚 − 交易频率惩罚 − 成本惩罚 − 网格密度惩罚
+```
+
+| 惩罚项 | 阈值 | 量级 |
+|--------|------|------|
+| 回撤硬约束 | max_dd > 12% → 无效 | - |
+| 回撤软惩罚 | >6% 时线性增长 | max 0.25 |
+| 交易频率 | >4笔/月/股时惩罚 | max ~0.4 |
+| 成本率 | >3% 初始本金时惩罚 | max ~1.0 |
+| 网格密度 | density > 1.5 时对数惩罚 | max ~0.4 |
+| 负年化收益 | score − 1.5 | 硬下移 |
 
 ## 配置文件兼容性
 
@@ -382,6 +395,12 @@ python main.py --mode wf --wf-date 2024-09-30
 2. López de Prado, M. (2018). "Advances in Financial Machine Learning." Wiley.
 
 ## 版本历史
+
+- **v1.1** (2026-04-14): 多目标惩罚函数
+  - 替换单一 Calmar Ratio 为复合分数
+  - 新增回撤硬约束（12%）、频率惩罚、成本惩罚、密度惩罚
+  - 修复负收益策略的符号反转问题
+  - `calculate_composite_score()` 量纲对齐验证
 
 - **v1.0** (2026-03-18): 初始实现
   - WalkForwardWindow 类
