@@ -3,8 +3,10 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v0.2.0-yellow.svg)](VERSION.md)
+[![Version](https://img.shields.io/badge/version-v1.3.0-yellow.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
+
+> ⚠️ **模块状态**：选股模块 ✅ 已稳定运行 | 网格参数计算模块 🔄 优化中
 
 ---
 
@@ -75,6 +77,7 @@ auto_grid_trading_system/
 ├── indicators.py            # 技术指标 Numba JIT (~630 行)
 ├── screener.py              # 高级多因子选股器 (~820 行)
 ├── grid_engine.py           # 动态网格引擎 (~550 行)
+├── regime_filter.py         # 市场状态门控 (~400 行)
 │
 ├── config.yaml              # 主配置文件
 │
@@ -252,6 +255,17 @@ conda env create -f environment.yml
 
 ## 📝 版本历史
 
+### v1.3.0 (2026-04-14) - 市场状态门控 + 因子模型优化
+
+**核心改进**:
+- ✅ 市场状态门控 RegimeFilter（三级响应 + 硬底线）
+  - 正常区/预警区/熔断软区/熔断硬底线
+  - 3日平滑 + 连续2日确认机制
+  - 宽基指数（沪深300）ADX + 波动率分位数判断
+- ✅ OU半衰期7天下限过滤微观噪声
+- ✅ F3波动率打分改为高斯核倒U型 + 横截面辅过滤
+- ✅ grid_engine 集成门控参数动态调整
+
 ### v0.2.0 (2026-04-13) - 交易日严格对齐
 
 **核心改进**:
@@ -328,4 +342,4 @@ conda env create -f environment.yml
 
 **🎉 开始你的量化交易之旅！**
 
-*Last Updated: 2026-04-12*
+*Last Updated: 2026-04-14*

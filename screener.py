@@ -563,13 +563,15 @@ class AdvancedMultiFactorScreener:
 
     def _vol_quality(self, volatility: float) -> float:
         """
-        计算波动质量得分（倒U型函数）。
+        计算波动质量得分（高斯核倒U型函数）。
 
         波动率在 optimal_vol 附近得最高分，越远得分越低。
+        使用高斯核：exp(-(σ-σ_opt)² / 2σ₀²)
         """
         if pd.isna(volatility):
             return 0.0
-        score = 1 - abs(volatility - self.vol_optimal) / self.vol_tolerance
+        sigma_0 = self.vol_tolerance  # 0.15
+        score = np.exp(-((volatility - self.vol_optimal) ** 2) / (2 * (sigma_0 ** 2)))
         return max(0.0, min(1.0, score))
 
     def _percentile_normalize(self, series: pd.Series, inverse: bool = True) -> pd.Series:
@@ -743,9 +745,13 @@ class AdvancedMultiFactorScreener:
         if "adx" in result.columns:
             result["F2_norm"] = self._percentile_normalize(result["adx"], inverse=True)
 
-        # Step 2: F3 波动质量（倒U型）
+        # Step 2: F3 波动质量（高斯核倒U型）+ 横截面辅过滤
         if "volatility_60d" in result.columns:
             result["F3_norm"] = result["volatility_60d"].apply(self._vol_quality)
+
+            # 辅过滤：剔除横截面波动率排名后20%尾部的标的（极端高低）
+            vol_rank = result["volatility_60d"].rank(pct=True)
+            result = result[(vol_rank >= 0.20) & (vol_rank <= 0.80)]
 
         # Step 3: F4 Path_Memory（负向，越小越好）
         if "path_memory" in result.columns:

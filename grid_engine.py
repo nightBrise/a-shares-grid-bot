@@ -99,10 +99,13 @@ class DynamicGridEngine:
         dyn_grid_cfg = self.config.get("dynamic_grid", {})
 
         # 基础参数
-        self.base_spacing = grid_cfg.get("base_spacing", 2.0)  # %
+        self.base_spacing = grid_cfg.get("base_spacing", 0.02)  # 小数格式 (2.0%)
         self.atr_period = grid_cfg.get("atr_period", 20)
         self.base_atr_coef = grid_cfg.get("atr_coef", 1.5)
-        self.max_grids = grid_cfg.get("max_grids", 10)
+        self.max_grids = grid_cfg.get("max_grids", 5)
+        # 间距硬约束（防止参数漂移）
+        self.min_spacing = grid_cfg.get("min_spacing", 0.015)  # 1.5%
+        self.max_spacing = grid_cfg.get("max_spacing", 0.035)  # 3.5%
 
         # 波动率区间配置
         regime_k = dyn_grid_cfg.get("volatility_regime_k", VOLATILITY_REGIME_K)
@@ -116,6 +119,9 @@ class DynamicGridEngine:
         self.vol_low_threshold = vol_thresh.get("low", 0.20)
         self.vol_high_threshold = vol_thresh.get("high", 0.35)
 
+        # ATR 通道系数 (用于上下轨计算)
+        self.rail_z_coef = dyn_grid_cfg.get("rail_z_coef", 2.0)
+
         # T+1 适配
         self.t1_min_spacing_coef = dyn_grid_cfg.get("t1_min_spacing_coef", 1.5)
         self.daily_vol_period = 20
@@ -128,10 +134,51 @@ class DynamicGridEngine:
         # 持仓限制
         self.max_position_pct = dyn_grid_cfg.get("position_limit_pct", 0.05)
 
+        # 市场状态门控参数（可动态传入或从配置读取默认）
+        self.regime_params = None  # 运行时由外部传入
+
+    def set_regime_params(self, regime_params: dict) -> None:
+        """
+        设置市场状态门控参数。
+
+        Parameters:
+            regime_params: 从 RegimeFilter.check() 返回的 params 字典
+            {
+                "max_position_per_stock": 0.30,
+                "initial_position": 0.45,
+                "grid_spacing_multiplier": 1.0,
+                "max_grids": 5
+            }
+        """
+        self.regime_params = regime_params
+        logger.debug(
+            f"市场参数已更新: max_pos={regime_params.get('max_position_per_stock', 0.3):.0%}, "
+            f"spacing_mult={regime_params.get('grid_spacing_multiplier', 1.0):.1f}x, "
+            f"max_grids={regime_params.get('max_grids', 5)}"
+        )
+
+    def get_effective_max_position(self) -> float:
+        """获取有效的单股最大仓位（考虑门控）"""
+        if self.regime_params:
+            return self.regime_params.get("max_position_per_stock", self.max_position_pct)
+        return self.max_position_pct
+
+    def get_effective_max_grids(self) -> int:
+        """获取有效的最大网格层数（考虑门控）"""
+        if self.regime_params:
+            return self.regime_params.get("max_grids", self.max_grids)
+        return self.max_grids
+
+    def get_effective_spacing_multiplier(self) -> float:
+        """获取有效的网格间距乘数（考虑门控）"""
+        if self.regime_params:
+            return self.regime_params.get("grid_spacing_multiplier", 1.0)
+        return 1.0
+
         logger.info(
-            f"DynamicGridEngine 初始化: base_spacing={self.base_spacing}%, "
+            f"DynamicGridEngine 初始化: base_spacing={self.base_spacing:.3f}, "
             f"max_grids={self.max_grids}, "
-            f"t1_coef={self.t1_min_spacing_coef}"
+            f"spacing_clip=[{self.min_spacing:.3f}, {self.max_spacing:.3f}]"
         )
 
     def determine_volatility_regime(
@@ -202,17 +249,19 @@ class DynamicGridEngine:
             t1_min_spacing = self.calculate_t1_min_spacing(daily_volatility)
             atr_adjusted_spacing = max(atr_adjusted_spacing, t1_min_spacing)
 
-        # 限制间距在合理范围
-        spacing_pct = np.clip(atr_adjusted_spacing, 1.0, 5.0)
+        # Step 4: 应用间距钳位（防止参数漂移）
+        spacing_pct = np.clip(atr_adjusted_spacing, self.min_spacing, self.max_spacing)
 
-        # Step 4: 使用 2*σ_60d 计算轨道
-        sigma_60d = volatility_60d * ref_price
-        upper_rail_pct = 2 * sigma_60d / ref_price  # 偏离比例
-        lower_rail_pct = 2 * sigma_60d / ref_price  # 偏离比例
+        # Step 5: 使用 ATR 通道计算上下轨（修正量纲问题）
+        # 上轨 = P_ref + z × ATR，下轨 = P_ref - z × ATR
+        upper_rail_price = ref_price + self.rail_z_coef * atr_20
+        lower_rail_price = ref_price - self.rail_z_coef * atr_20
+        upper_rail_pct = self.rail_z_coef * atr_20 / ref_price  # 偏离比例
+        lower_rail_pct = self.rail_z_coef * atr_20 / ref_price  # 偏离比例
 
-        # Step 5: 确定在轨道内能容纳的网格层数
+        # Step 6: 确定在轨道内能容纳的网格层数
         total_range_pct = 2 * upper_rail_pct  # 上轨到下轨的总范围
-        n_grids = max(3, int(total_range_pct / (spacing_pct / 100)))
+        n_grids = max(3, int(total_range_pct / spacing_pct))
         n_grids = min(n_grids, self.max_grids)
 
         return GridParameters(
@@ -230,6 +279,7 @@ class DynamicGridEngine:
         ref_price: float,
         params: GridParameters,
         direction: str = "both",
+        spacing_multiplier: float = 1.0,
     ) -> Tuple[List[float], List[float]]:
         """
         生成网格买入和卖出价格。
@@ -238,6 +288,7 @@ class DynamicGridEngine:
             ref_price: 参考价格 (网格中心)
             params: GridParameters 对象
             direction: 'both', 'buy', 或 'sell'
+            spacing_multiplier: 间距乘数（市场状态门控）
 
         Returns:
             (buy_prices, sell_prices) 价格列表
@@ -245,11 +296,14 @@ class DynamicGridEngine:
         buy_prices = []
         sell_prices = []
 
+        # 应用间距乘数
+        effective_spacing = params.spacing_pct * spacing_multiplier
+
         for i in range(1, params.n_grids + 1):
             # 买入价格: 低于参考价
-            buy_price = ref_price * (1 - params.spacing_pct / 100 * i)
+            buy_price = ref_price * (1 - effective_spacing / 100 * i)
             # 卖出价格: 高于参考价
-            sell_price = ref_price * (1 + params.spacing_pct / 100 * i)
+            sell_price = ref_price * (1 + effective_spacing / 100 * i)
 
             if direction in ["both", "buy"]:
                 buy_prices.append(round(buy_price, 2))
@@ -327,6 +381,8 @@ class DynamicGridEngine:
         cash: float = 0.0,
         grid_amount: float = 10000.0,
         prev_close: Optional[float] = None,
+        can_buy: bool = True,
+        can_open_new: bool = True,
     ) -> List[GridSignal]:
         """
         为股票生成完整的网格信号集。
@@ -361,8 +417,11 @@ class DynamicGridEngine:
                 )
                 return signals
 
+        # 应用网格间距乘数（市场状态门控）
+        spacing_mult = self.get_effective_spacing_multiplier()
+
         # 生成网格价格
-        buy_prices, sell_prices = self.generate_grid_prices(ref_price, params)
+        buy_prices, sell_prices = self.generate_grid_prices(ref_price, params, spacing_multiplier=spacing_mult)
 
         # 检查强制平仓触发
         force_action = self.check_force_close(
@@ -384,13 +443,22 @@ class DynamicGridEngine:
                 )
             )
 
-        # 生成买入信号 (如果有现金和持仓空间)
-        max_position_value = cash * 0.3  # 单股最多 30% 仓位
+        # 获取动态仓位限制
+        effective_max_position = self.get_effective_max_position()
+        max_position_value = cash * effective_max_position
         position_value = current_position * ref_price
+
+        # 检查能否买入/开新仓
+        if not can_buy:
+            logger.debug(f"{code}: 市场状态禁止买入信号")
 
         for i, buy_price in enumerate(buy_prices):
             # 检查是否应该买入
             if position_value >= max_position_value:
+                break
+
+            # 检查能否开新仓（仓位已满时不允许）
+            if not can_open_new and position_value <= 0:
                 break
 
             # 检查价格是否合理 (不能跌为负)

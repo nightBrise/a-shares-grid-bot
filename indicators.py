@@ -178,6 +178,10 @@ def _ou_half_life_vectorized(log_prices: np.ndarray) -> float:
     # 半衰期 = ln(2) / (-beta)
     half_life = np.log(2) / (-beta)
 
+    # 过滤微观噪声：半衰期 < 7天视为订单簿噪声，网格高频触发将吞噬手续费
+    if half_life < 7.0:
+        return np.inf
+
     # 限制合理范围 (1 天到 500 天)
     if half_life < 1 or half_life > 500:
         return np.inf

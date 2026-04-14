@@ -25,7 +25,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from utils import (
     load_config, calculate_transaction_fee, validate_buy_quantity,
-    check_limit_status, check_t1_rule, format_number, safe_divide
+    check_limit_status, check_t1_rule, format_number, safe_divide,
+    calculate_grid_search_space
 )
 
 # 新模块：多因子选股 (可选)
@@ -482,42 +483,44 @@ def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict)
 def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
                            grid_amount: float, initial_position: float,
                            max_grids: int, commission_rate: float,
-                           stamp_tax: float, slippage_rate: float = 0.001) -> Dict:
+                           stamp_tax: float, slippage_rate: float = 0.001,
+                           initial_cash: float = 1000000.0) -> Dict:
     """
     网格交易回测引擎（增强版 - 包含滑点）
-    
+
     原理:
     - 将资金分成多份，在价格下跌时买入，上涨时卖出
     - 记录每次交易，计算最终收益
     - 考虑滑点成本（买入价上浮，卖出价下浮）
-    
+
     参数:
         df: 历史行情数据 (包含 close 列)
-        grid_spacing: 网格间距 (%)
+        grid_spacing: 网格间距 (小数格式，如 0.02 表示 2%)
         grid_amount: 每格买入金额 (元)
-        initial_position: 初始仓位 (%)
+        initial_position: 初始仓位 (小数格式，如 0.45 表示 45%)
         max_grids: 最大网格层数
         commission_rate: 佣金费率
         stamp_tax: 印花税率
         slippage_rate: 滑点比率（默认 0.1%，即千 1）
-    
+        initial_cash: 初始资金（默认 100 万，支持小资金优化）
+
     返回:
         回测结果字典 (包含收益率、最大回撤、卡尔玛比率等)
     """
     if df.empty or len(df) < 10:
         return {'calmar_ratio': 0, 'total_return': 0, 'max_drawdown': 1}
-    
+
     prices = df['close'].values
-    
+
     # 初始化状态
-    cash = 1000000.0  # 假设初始资金 100 万
+    cash = initial_cash  # 使用传入的初始资金
     position = 0  # 持仓股数
     avg_cost = 0  # 平均成本
     total_slippage_cost = 0.0  # 累计滑点成本
-    
+
     # 初始建仓
     first_price = prices[0]
-    initial_investment = cash * (initial_position / 100)
+    initial_investment = cash * initial_position  # 小数格式（0.45 = 45%）
     position = int(initial_investment / first_price / 100) * 100  # 100 的整数倍
     
     # 应用滑点：买入成交价 = 理论价 × (1 + 滑点率)
@@ -759,11 +762,15 @@ def run_optimization(config: dict) -> Dict:
         # === 定义 Optuna 目标函数 ===
         def objective(trial):
             """Optuna 优化目标函数"""
-            # 参数搜索空间
-            grid_spacing = trial.suggest_float('grid_spacing', 1.0, 5.0, step=0.1)
-            grid_amount = trial.suggest_categorical('grid_amount', [5000, 10000, 20000, 50000])
-            initial_position = trial.suggest_float('initial_position', 30, 70, step=5)
-            max_grids = trial.suggest_int('max_grids', 5, 15)
+            # 参数搜索空间（小资金优化）
+            # 间距: 1.5%~3.5%，确保 > 2×摩擦成本
+            grid_spacing = trial.suggest_float('grid_spacing', 0.015, 0.035, step=0.001)
+            # 每格金额: [2000, 3000, 4000]，避免超出单股30%仓位上限
+            grid_amount = trial.suggest_categorical('grid_amount', [2000, 3000, 4000])
+            # 初始仓位: 40%~50%，预留足够现金应对连续下跌
+            initial_position = trial.suggest_float('initial_position', 0.40, 0.50, step=0.01)
+            # 网格层数: 4~6，确保 amount × grids <= 现金 × 60%
+            max_grids = trial.suggest_int('max_grids', 4, 6)
             
             # 样本内回测
             result = backtest_grid_strategy(
@@ -781,13 +788,19 @@ def run_optimization(config: dict) -> Dict:
             return result['calmar_ratio']
         
         # === 执行优化 ===
-        n_trials = backtest_cfg.get('n_trials', 50)
+        n_trials = backtest_cfg.get('n_trials', 150)
+        n_startup = backtest_cfg.get('n_startup_trials', 20)
         logger.info(f"开始 Optuna 优化，试验次数：{n_trials}")
-        
+
+        sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
+        pruner = optuna.pruners.MedianPruner()
+
         study = optuna.create_study(
             direction='maximize',
             study_name=f'{code}_grid_optimization',
-            load_if_exists=False
+            load_if_exists=False,
+            sampler=sampler,
+            pruner=pruner
         )
         
         study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
@@ -1805,11 +1818,33 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
     logger.info(f"In-Sample 期间：{ins_start} 至 {ins_end} (T-1Y ~ T-3M)")
     logger.info(f"Out-of-Sample 期间：{oos_start} 至 {oos_end} (T-3M ~ T)")
     logger.info("=" * 70)
-    
+
     grid_cfg = config.get('grid', {})
     backtest_cfg = config.get('backtest', {})
     paths_cfg = config.get('paths', {})
-    
+    capital_cfg = config.get('capital', {})
+
+    # 从配置读取资金参数
+    total_cash = capital_cfg.get('total', 100000)  # 默认10万
+    max_position_pct = capital_cfg.get('max_position_per_stock', 0.30)
+    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.40)
+
+    # 计算每只股票分配的资金
+    investable_cash = total_cash * (1 - cash_reserve_ratio)
+    max_stocks_by_money = max(1, int(investable_cash / (total_cash * max_position_pct)))
+    max_stocks = min(max_stocks_by_money, len(stock_pool))
+    allocated_cash = investable_cash / max_stocks if max_stocks > 0 else investable_cash
+
+    logger.info(f"资金配置: 总资金={total_cash}元, 单股上限={max_position_pct*100}%, "
+                f"现金保留={cash_reserve_ratio*100}%")
+    logger.info(f"投入股票数: {max_stocks}, 每只分配: {allocated_cash:.0f}元")
+
+    # 计算搜索空间（根据分配的资金）
+    search_space = calculate_grid_search_space(allocated_cash)
+    logger.info(f"搜索空间: grid_amount={search_space['grid_amount_choices']}, "
+                f"max_grids={search_space['max_grids_range']}, "
+                f"spacing={search_space['grid_spacing_range']}")
+
     if not stock_pool:
         logger.error("股票池为空，无法优化")
         return {}
@@ -1864,21 +1899,28 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
         def objective(trial):
             """
             Optuna 优化目标函数
-            
-            搜索空间:
-            - grid_spacing: 1.0% ~ 5.0%, step=0.1%
-            - grid_amount: [5000, 10000, 20000, 50000]
-            - initial_position: 30% ~ 70%, step=5%
-            - max_grids: 5 ~ 15
-            
+
+            搜索空间（根据资金自动计算）:
+            - grid_spacing: {search_space['grid_spacing_range']}
+            - grid_amount: {search_space['grid_amount_choices']}
+            - initial_position: {search_space['initial_position_range']}
+            - max_grids: {search_space['max_grids_range']}
+
             目标：最大化 Calmar Ratio
             """
-            # 参数搜索空间
-            grid_spacing = trial.suggest_float('grid_spacing', 1.0, 5.0, step=0.1)
-            grid_amount = trial.suggest_categorical('grid_amount', [5000, 10000, 20000, 50000])
-            initial_position = trial.suggest_float('initial_position', 30, 70, step=5)
-            max_grids = trial.suggest_int('max_grids', 5, 15)
-            
+            # 参数搜索空间（根据资金规模自动计算）
+            grid_spacing = trial.suggest_float('grid_spacing',
+                search_space['grid_spacing_range'][0],
+                search_space['grid_spacing_range'][1], step=0.001)
+            grid_amount = trial.suggest_categorical('grid_amount',
+                search_space['grid_amount_choices'])
+            initial_position = trial.suggest_float('initial_position',
+                search_space['initial_position_range'][0],
+                search_space['initial_position_range'][1], step=0.01)
+            max_grids = trial.suggest_int('max_grids',
+                search_space['max_grids_range'][0],
+                search_space['max_grids_range'][1])
+
             # In-Sample 回测（仅使用样本内数据）
             result = backtest_grid_strategy(
                 df_ins,  # 关键：仅使用 In-Sample 数据
@@ -1888,20 +1930,27 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
                 max_grids=max_grids,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
                 stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+                initial_cash=allocated_cash  # 使用分配的资金
             )
             
             # 返回 Calmar Ratio（最大化）
             return result['calmar_ratio']
         
         # === 执行优化 ===
-        n_trials = backtest_cfg.get('n_trials', 50)
+        n_trials = backtest_cfg.get('n_trials', 150)
+        n_startup = backtest_cfg.get('n_startup_trials', 20)
         logger.info(f"开始 Optuna 优化，试验次数：{n_trials}")
-        
+
+        sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
+        pruner = optuna.pruners.MedianPruner()
+
         study = optuna.create_study(
             direction='maximize',
             study_name=f'{code}_wf_optimization_{wf_window.current_date_str}',
-            load_if_exists=False
+            load_if_exists=False,
+            sampler=sampler,
+            pruner=pruner
         )
         
         study.optimize(objective, n_trials=n_trials, show_progress_bar=False)

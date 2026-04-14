@@ -291,6 +291,96 @@ python main.py
 
 ---
 
+## 🔧 搜索空间自动计算
+
+### 核心约束
+
+系统根据 `capital.total` 配置自动计算网格参数搜索空间：
+
+1. **资金约束**: 每格金额 × 层数 ≤ 可用资金 × 60%（预留40%现金缓冲）
+2. **摩擦成本**: 网格间距 > 2 × 往返摩擦成本 ≈ 0.24%
+3. **仓位约束**: 单格金额 ≤ 总资金 × 10%
+
+### 计算公式
+
+| 参数 | 公式 | 说明 |
+|------|------|------|
+| `grid_amount` | `cash × [3%, 8%]` | 每格占资金比例 |
+| `max_grids` | `floor(cash × 0.45 × 0.6 / min_amount)` | 资金能支撑的层数 |
+| `grid_spacing` | `[1.5%, 3.5%]` | 固定范围，防摩擦 |
+| `initial_position` | `[40%, 50%]` | 固定范围，保缓冲 |
+
+### 资金级别
+
+| 级别 | 资金范围 | `grid_amount` 候选 | `max_grids` 范围 |
+|------|----------|---------------------|------------------|
+| `small` | <10万 | [2000, 3000, 4000, 5000] | [4, 6] |
+| `medium` | 10-50万 | [5000, 8000, 10000, 15000] | [4, 9] |
+| `large` | >50万 | [10000, 20000, 30000, 50000] | [4, 9] |
+
+### 配置示例
+
+```yaml
+# === 资金配置 ===
+capital:
+  # 用户投入的总资金（元）- 用于自动计算搜索空间
+  total: 50000
+  tier: "auto"  # 自动判断资金级别
+```
+
+### 计算函数
+
+位于 `utils.py` 的 `calculate_grid_search_space(cash)` 函数：
+
+```python
+from utils import calculate_grid_search_space
+
+# 根据资金计算搜索空间
+search_space = calculate_grid_search_space(50000)
+# {'tier': 'small', 'grid_amount_choices': [2000, 3000, 4000, 5000],
+#  'max_grids_range': [4, 6], 'grid_spacing_range': [0.015, 0.035],
+#  'initial_position_range': [0.40, 0.50]}
+```
+
+---
+
+### 投资组合级资金分配
+
+系统根据总资金自动计算投入股票数量和每只股票分配金额：
+
+**配置项**:
+```yaml
+capital:
+  total: 50000           # 总资金
+  max_position_per_stock: 0.30  # 单股最大仓位（30%）
+  cash_reserve_ratio: 0.40      # 现金保留（40%）
+```
+
+**计算公式**:
+```python
+investable_cash = total_cash × (1 - cash_reserve_ratio)  # 可投入资金
+per_stock_max = total_cash × max_position_per_stock       # 单股上限
+max_stocks = investable_cash / per_stock_max              # 最大股票数
+allocated_cash = investable_cash / max_stocks             # 每只分配
+```
+
+**示例（5万资金）**:
+```
+总资金: 50000元
+现金保留: 40% → 可投入 30000元
+单股上限: 30% → 每股最多 15000元
+最大股票数: 30000 / 15000 = 2 只
+每只分配: 30000 / 2 = 15000元
+```
+
+**对应搜索空间**（每只股票 15000 元）:
+```python
+{'tier': 'small', 'grid_amount_choices': [2000, 3000, 4000, 5000],
+ 'max_grids_range': [4, 4], ...}
+```
+
+---
+
 ## 📝 总结
 
 ### 必须保留的文件

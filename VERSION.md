@@ -1,6 +1,61 @@
 # 版本发布说明
 
-当前版本：**v0.2.0** (2026-04-13) ⚠️ 测试版 - 项目未完全验证
+当前版本：**v1.3.0** (2026-04-14) ⚠️ 测试版
+
+**模块状态**：
+- ✅ 选股模块 - 已稳定运行
+- 🔄 网格参数计算模块 - 优化中
+
+---
+
+## v1.3.0 (2026-04-14) - 市场状态门控 + 因子模型优化
+
+### 核心改进
+
+#### 1. 市场状态门控（Regime Filter）
+- 新增 `regime_filter.py` 模块，基于宽基指数（沪深300）判断市场状态
+- 三级响应机制：
+  - 正常区：ADX<25 且 波动率分位30%~70%，max_position=30%，spacing=1.0x
+  - 预警区：ADX 25~35 或 波动率偏离边界，max_position=20%，spacing=1.2x
+  - 熔断软区：ADX>35 或 波动率分位>85%/<15%，max_position=10%，spacing=1.5x
+  - 熔断硬底线：全策略暂停，max_position=0%
+- 状态平滑：3日移动平均 + 连续2日确认机制
+- 硬底线触发条件：指数跌幅≥5%+跌停>200，或3日成交量萎缩
+
+#### 2. OU半衰期下限过滤
+- 半衰期 < 7天 视为订单簿微观噪声，返回 np.inf
+- 避免网格高频触发导致手续费吞噬利润
+
+#### 3. F3波动率打分升级
+- 改用高斯核倒U型函数：exp(-(σ-σ_opt)² / 2σ₀²)
+- 辅过滤：横截面排名剔除后20%尾部标的
+- 保持物理意义同时适应市场周期
+
+#### 4. 网格引擎集成门控参数
+- `DynamicGridEngine` 支持动态仓位上限、网格间距乘数
+- `generate_signals` 支持 can_buy/can_open_new 权限控制
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `regime_filter.py` | 市场状态门控核心模块 |
+
+### 配置新增
+
+```yaml
+regime_filter:
+  benchmark_index: "000300.SH"
+  adx_normal_max: 25
+  adx_warning_max: 35
+  vol_normal_low: 0.30
+  vol_normal_high: 0.70
+  smoothing_days: 3
+  confirm_days: 2
+  hard_stop:
+    index_drop_threshold: 0.05
+    limit_down_count: 200
+```
 
 ---
 

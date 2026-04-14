@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, time
 from typing import Optional, Tuple, Dict
 import yaml
+import pandas as pd
 
 
 # ==================== 配置加载 ====================
@@ -56,6 +57,123 @@ def get_version() -> str:
         return config.get('version', '1.0.0')
     except Exception:
         return "1.0.0"
+
+
+# ==================== 搜索空间计算 ====================
+
+
+def calculate_grid_search_space(cash: float) -> dict:
+    """
+    根据资金规模自动计算网格参数搜索空间
+
+    核心约束:
+    1. 每格金额 × 层数 ≤ 可用资金 × 60%  （预留40%现金缓冲）
+    2. 网格间距 > 2 × 往返摩擦成本 ≈ 0.24%
+    3. 单格金额 ≤ 总资金 × 10%
+
+    参数:
+        cash: 总资金（元）
+
+    返回:
+        包含搜索空间的字典:
+        - tier: 资金级别 ('small', 'medium', 'large')
+        - grid_amount_choices: 每格金额候选列表
+        - max_grids_range: 最大网格层数范围 [min, max]
+        - grid_spacing_range: 网格间距范围 [min, max]
+        - initial_position_range: 初始仓位范围 [min, max]
+    """
+    # 资金级别判断
+    if cash < 100000:
+        tier = "small"
+    elif cash < 500000:
+        tier = "medium"
+    else:
+        tier = "large"
+
+    # 计算每格金额范围 (总资金的3-8%)
+    grid_amount_min = max(2000, cash * 0.03)
+    grid_amount_max = min(cash * 0.08, cash * 0.10)
+
+    # 离散化每格金额候选值
+    if tier == "small":
+        grid_amount_choices = [2000, 3000, 4000, 5000]
+    elif tier == "medium":
+        grid_amount_choices = [5000, 8000, 10000, 15000]
+    else:
+        grid_amount_choices = [10000, 20000, 30000, 50000]
+
+    # 计算最大网格层数
+    # 约束: grid_amount × max_grids ≤ cash × initial_position × 0.6
+    initial_position = 0.45  # 固定初始仓位45%
+    max_investment = cash * initial_position * 0.6
+    max_grids = max(4, min(15, int(max_investment / grid_amount_min)))
+
+    # 网格间距范围（固定，防止参数漂移）
+    # 下限: 2 × 摩擦成本(佣金+印花税+滑点 ≈ 0.12%) × 2 = 0.24%
+    # 上限: 3.5%
+    grid_spacing_min = 0.015  # 1.5%
+    grid_spacing_max = 0.035  # 3.5%
+
+    # 初始仓位范围（固定）
+    initial_position_min = 0.40  # 40%
+    initial_position_max = 0.50  # 50%
+
+    return {
+        'tier': tier,
+        'grid_amount_choices': grid_amount_choices,
+        'max_grids_range': [4, max_grids],
+        'grid_spacing_range': [grid_spacing_min, grid_spacing_max],
+        'initial_position_range': [initial_position_min, initial_position_max],
+    }
+
+
+def allocate_capital_to_stocks(total_cash: float,
+                                max_position_pct: float,
+                                stock_selection_df: 'pd.DataFrame',
+                                cash_reserve_ratio: float = 0.40) -> tuple:
+    """
+    根据总资金和选股结果，自动分配资金到股票
+
+    参数:
+        total_cash: 总资金（元）
+        max_position_pct: 单股最大仓位占比（0.30 = 30%）
+        stock_selection_df: 选股结果 DataFrame（需包含 total_score 列）
+        cash_reserve_ratio: 现金保留比例（默认40%）
+
+    返回:
+        (allocated_stock_count: int, allocated_df: DataFrame)
+        allocated_df 包含: code, total_score, allocated_cash, position_limit
+
+    核心约束:
+        1. 每只股票分配资金 ≤ total_cash × max_position_pct
+        2. 总投入 ≤ total_cash × (1 - cash_reserve_ratio)
+        3. 按评分排序取 Top M
+    """
+    if stock_selection_df.empty:
+        return 0, pd.DataFrame()
+
+    # Step 1: 计算可投入资金（保留现金）
+    investable_cash = total_cash * (1 - cash_reserve_ratio)
+
+    # Step 2: 计算最大股票数
+    # 约束: 每只股票 ≤ max_position_pct × total_cash
+    per_stock_max = total_cash * max_position_pct
+    max_stocks_by_money = max(1, int(investable_cash / per_stock_max))
+
+    # Step 3: 限制在选股池范围内
+    available_stocks = len(stock_selection_df)
+    actual_stock_count = min(max_stocks_by_money, available_stocks)
+
+    # Step 4: 按评分排序，取 Top M
+    df_sorted = stock_selection_df.sort_values('total_score', ascending=False)
+    allocated_df = df_sorted.head(actual_stock_count).copy()
+
+    # Step 5: 计算每只股票分配金额（均分）
+    per_stock_allocation = investable_cash / actual_stock_count if actual_stock_count > 0 else 0
+    allocated_df['allocated_cash'] = per_stock_allocation
+    allocated_df['position_limit'] = per_stock_max
+
+    return actual_stock_count, allocated_df
 
 
 def setup_logging(output_dir: str = "./output", level: str = "INFO", 

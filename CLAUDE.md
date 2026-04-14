@@ -41,6 +41,7 @@ python -m pytest tests/test_stock_selection.py  # 单个测试
 | `grid_engine.py` | 动态网格引擎（波动率自适应k系数） |
 | `risk.py` | 增强风控：T+1追踪、分层滑点、费用计算 |
 | `risk_control.py` | 熔断风控（个股15%/全局10%） |
+| `regime_filter.py` | 市场状态门控（三级响应+硬底线） |
 | `data_http.py` | HTTP Session管理器（UA轮换、连接复用） |
 
 ### 数据流程
