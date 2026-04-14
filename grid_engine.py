@@ -214,12 +214,37 @@ class DynamicGridEngine:
         """
         return self.t1_min_spacing_coef * daily_volatility * 100
 
+    def calculate_volatility_adjusted_spacing(
+        self,
+        base_spacing_pct: float,
+        current_vol: float,
+        target_vol: float = 0.25,
+    ) -> float:
+        """
+        基于波动率比率调整网格间距百分比（统一量纲）。
+
+        回测优化的是百分比 grid_spacing，实盘也应用百分比间距，
+        通过波动率比率统一：adjusted = base_spacing * clip(vol_ratio, 0.8, 1.2)
+
+        Parameters:
+            base_spacing_pct: 基础间距百分比 (例如 0.02 = 2%)
+            current_vol: 当前波动率 (年化，0.25 = 25%)
+            target_vol: 目标波动率基准 (默认 25%)
+
+        Returns:
+            调整后的间距百分比
+        """
+        vol_ratio = current_vol / max(target_vol, 1e-4)
+        adjusted_pct = base_spacing_pct * np.clip(vol_ratio, 0.8, 1.2)
+        return np.clip(adjusted_pct, self.min_spacing, self.max_spacing)
+
     def calculate_grid_parameters(
         self,
         ref_price: float,
         atr_20: float,
         volatility_60d: float,
         daily_volatility: Optional[float] = None,
+        vol_smoothing_median: Optional[float] = None,
     ) -> GridParameters:
         """
         为股票计算动态网格参数。
@@ -229,6 +254,7 @@ class DynamicGridEngine:
             atr_20: 20日 ATR 值
             volatility_60d: 60日年化波动率
             daily_volatility: 可选的日波动率用于 T+1 计算
+            vol_smoothing_median: 可选的 20 日滚动中位数波动率（用于平滑，避免信号闪烁）
 
         Returns:
             GridParameters 对象，包含所有网格设置
@@ -236,23 +262,22 @@ class DynamicGridEngine:
         # Step 1: 确定波动率区间
         regime, k_coef = self.determine_volatility_regime(volatility_60d)
 
-        # Step 2: 计算基于 ATR 的基础间距
-        # ATR 比率 = ATR / price，表示价格波动相对于价格的比例
-        atr_ratio = atr_20 / ref_price if ref_price > 0 else 0.02
-
-        # 间距 = 基础间距 * (ATR比率 / 0.02) * k系数
-        # 0.02 是参考 ATR/价格 比率 (~2%)
-        atr_adjusted_spacing = self.base_spacing * (atr_ratio / 0.02) * k_coef
+        # Step 2: 使用波动率比率计算间距（统一量纲：百分比）
+        # 如果有平滑波动率则使用，否则用原始值
+        vol_for_spacing = vol_smoothing_median if vol_smoothing_median is not None else volatility_60d
+        spacing_pct = self.calculate_volatility_adjusted_spacing(
+            self.base_spacing, vol_for_spacing
+        )
 
         # Step 3: 应用 T+1 约束
         if daily_volatility is not None:
             t1_min_spacing = self.calculate_t1_min_spacing(daily_volatility)
-            atr_adjusted_spacing = max(atr_adjusted_spacing, t1_min_spacing)
+            spacing_pct = max(spacing_pct, t1_min_spacing)
 
-        # Step 4: 应用间距钳位（防止参数漂移）
-        spacing_pct = np.clip(atr_adjusted_spacing, self.min_spacing, self.max_spacing)
+        # Step 4: 再次钳位（确保 T+1 约束后不超出边界）
+        spacing_pct = np.clip(spacing_pct, self.min_spacing, self.max_spacing)
 
-        # Step 5: 使用 ATR 通道计算上下轨（修正量纲问题）
+        # Step 5: 使用 ATR 通道计算上下轨
         # 上轨 = P_ref + z × ATR，下轨 = P_ref - z × ATR
         upper_rail_price = ref_price + self.rail_z_coef * atr_20
         lower_rail_price = ref_price - self.rail_z_coef * atr_20
@@ -318,11 +343,20 @@ class DynamicGridEngine:
         ref_price: float,
         params: GridParameters,
         current_position: int,
+        available_position: int = 0,
     ) -> Optional[Tuple[str, int]]:
         """
-        检查是否触发强制平仓。
+        检查是否触发强制平仓（T+1 合规）。
 
         Trigger: 价格跌破下轨 3 格
+        平仓数量仅针对 T+1 可用的持仓，避免委托拒单或逻辑死锁。
+
+        Parameters:
+            current_price: 当前价格
+            ref_price: 参考价格
+            params: 网格参数
+            current_position: 当前总持仓（含当日买入，T+1 冻结）
+            available_position: T+1 可用持仓（可立即卖出）
 
         Returns:
             Tuple of (action, quantity_to_close) 或 None
@@ -334,11 +368,16 @@ class DynamicGridEngine:
         trigger_distance = params.spacing_pct / 100 * self.force_close_grids_below
         trigger_price = lower_rail_price * (1 - trigger_distance)
 
-        if current_price <= trigger_price and current_position > 0:
-            close_qty = int(current_position * self.force_close_pct)
+        if current_price <= trigger_price and available_position > 0:
+            # 仅对 T+1 可用份额执行平仓
+            close_qty = int(available_position * self.force_close_pct)
             close_qty = (close_qty // 100) * 100  # 整手
 
             if close_qty >= 100:
+                logger.info(
+                    f"触发下轨熔断: 计划卖出{close_qty}股, "
+                    f"T+1可用{available_position}股, 总持仓{current_position}股"
+                )
                 return ("force_close_sell", close_qty)
 
         return None
@@ -423,9 +462,9 @@ class DynamicGridEngine:
         # 生成网格价格
         buy_prices, sell_prices = self.generate_grid_prices(ref_price, params, spacing_multiplier=spacing_mult)
 
-        # 检查强制平仓触发
+        # 检查强制平仓触发（T+1 合规：传入 available_position）
         force_action = self.check_force_close(
-            ref_price, ref_price, params, current_position
+            ref_price, ref_price, params, current_position, available_position
         )
 
         if force_action:
