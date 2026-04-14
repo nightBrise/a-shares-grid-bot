@@ -331,57 +331,18 @@ capital:
 
 ### 计算函数
 
-位于 `utils.py` 的 `calculate_grid_search_space(cash)` 函数：
+位于 `strategy.py` 的 `build_adaptive_search_space()` 函数（内部使用）：
 
 ```python
-from utils import calculate_grid_search_space
+from strategy import build_adaptive_search_space
 
-# 根据资金计算搜索空间
-search_space = calculate_grid_search_space(50000)
-# {'tier': 'small', 'grid_amount_choices': [2000, 3000, 4000, 5000],
-#  'max_grids_range': [4, 6], 'grid_spacing_range': [0.015, 0.035],
-#  'initial_position_range': [0.40, 0.50]}
+# 根据资金计算搜索空间（启动时动态裁剪）
+search_space = build_adaptive_search_space(15000, 0.45)
+# {'grid_amount_choices': [2000], 'max_grids_range': [3, 3],
+#  'grid_spacing_range': [0.015, 0.035], 'grid_pool': 8250.0, ...}
 ```
 
----
-
-### 投资组合级资金分配
-
-系统根据总资金自动计算投入股票数量和每只股票分配金额：
-
-**配置项**:
-```yaml
-capital:
-  total: 50000           # 总资金
-  max_position_per_stock: 0.30  # 单股最大仓位（30%）
-  cash_reserve_ratio: 0.40      # 现金保留（40%）
-```
-
-**计算公式**:
-```python
-investable_cash = total_cash × (1 - cash_reserve_ratio)  # 可投入资金
-per_stock_max = total_cash × max_position_per_stock       # 单股上限
-max_stocks = investable_cash / per_stock_max              # 最大股票数
-allocated_cash = investable_cash / max_stocks             # 每只分配
-```
-
-**示例（5万资金）**:
-```
-总资金: 50000元
-现金保留: 40% → 可投入 30000元
-单股上限: 30% → 每股最多 15000元
-最大股票数: 30000 / 15000 = 2 只
-每只分配: 30000 / 2 = 15000元
-
-**网格资金池**:
-- 网格补仓池 = 15000 × (1 − 0.45) = 8250元
-- 最大采购额 = 8250 × 0.95 = 7838元
-
-**对应搜索空间**（每只股票 15000 元）:
-```python
-{'tier': 'small', 'grid_amount_choices': [2000, 3000, 4000, 5000],
- 'max_grids_range': [4, 4], 'grid_pool': 8250.0, 'max_grid_investment': 7837.5, ...}
-```
+**说明**：搜索空间在优化器启动时动态裁剪，确保 `grid_amount × max_grids ≤ grid_pool × 0.95`。
 
 ---
 

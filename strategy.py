@@ -25,17 +25,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from utils import (
     load_config, calculate_transaction_fee, validate_buy_quantity,
-    check_limit_status, check_t1_rule, format_number, safe_divide,
-    calculate_grid_search_space
+    check_limit_status, check_t1_rule, format_number, safe_divide
 )
 
 # 新模块：多因子选股 (可选)
 try:
     from indicators import calculate_all_indicators, get_latest_indicators
     from screener import (
-        MultiFactorScreener,
         AdvancedMultiFactorScreener,
-        screen_universe,
         screen_universe_advanced,
     )
     NEW_SCREENER_AVAILABLE = True
@@ -45,7 +42,7 @@ except ImportError:
 
 # 新模块：动态网格引擎 (可选)
 try:
-    from grid_engine import DynamicGridEngine
+    import grid_engine
     GRID_ENGINE_AVAILABLE = True
 except ImportError:
     GRID_ENGINE_AVAILABLE = False
@@ -761,10 +758,10 @@ def run_optimization(config: dict) -> Dict:
     logger.info(f"资金配置: 总资金={total_cash}元, 每股分配={allocated_cash:.0f}元, "
                 f"网格池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
 
-    # 搜索空间
-    search_space = calculate_grid_search_space(allocated_cash, initial_position)
-    logger.info(f"搜索空间: grid_amount={search_space['grid_amount_choices']}, "
-                f"max_grids={search_space['max_grids_range']}")
+    # 搜索空间（启动时动态裁剪，避免无效采样）
+    search_space = build_adaptive_search_space(allocated_cash, initial_position)
+    logger.info(f"搜索空间（已裁剪）: grid_amount={search_space['grid_amount_choices']}, "
+                f"max_grids={search_space['max_grids_range']}, grid_pool={search_space['grid_pool']:.0f}元")
 
     # 准备数据
     all_results = []
@@ -1837,6 +1834,75 @@ def build_universe_with_wf(config: dict, wf_window: WalkForwardWindow) -> pd.Dat
     return df_selection
 
 
+# ==================== 搜索空间动态裁剪 ====================
+
+def build_adaptive_search_space(allocated_cash: float, init_pos: float) -> dict:
+    """
+    启动时动态裁剪搜索空间，避免 Optuna 采样无效组合
+
+    核心约束: grid_amount × max_grids ≤ grid_pool × 0.95
+
+    参数:
+        allocated_cash: 单股分配资金（元）
+        init_pos: 初始仓位比例（决定网格资金池大小）
+
+    返回:
+        裁剪后的搜索空间字典
+    """
+    # 实际网格资金池 = alloc × (1 - initial_position)
+    grid_pool = allocated_cash * (1 - init_pos)
+    # 95% 安全系数
+    max_invest = grid_pool * 0.95
+
+    # 基础每格金额下限
+    amount_min = max(2000, allocated_cash * 0.03)
+
+    # 离散候选值（按资金级别）
+    if allocated_cash < 100000:
+        raw_amounts = [2000, 3000, 4000, 5000]
+        max_grids_raw = 6
+    elif allocated_cash < 500000:
+        raw_amounts = [5000, 8000, 10000, 15000]
+        max_grids_raw = 9
+    else:
+        raw_amounts = [10000, 20000, 30000, 50000]
+        max_grids_raw = 9
+
+    # 动态裁剪：基于保守估计的 max_grids（取最小4层）过滤 grid_amount
+    # 确保所有 valid_amounts 在 max_grids=4 时都满足约束
+    conservative_grids = 4
+    valid_amounts = [a for a in raw_amounts if a * conservative_grids <= max_invest]
+
+    if not valid_amounts:
+        # 降级：找不到满足4层的grid_amount，计算 amount_min 支持的最大层数
+        valid_amounts = [amount_min]
+        feasible_grids = int(max_invest / amount_min)
+        max_grids = min(max_grids_raw, feasible_grids)
+        # 确保 lower <= upper
+        if max_grids < 4:
+            max_grids_range = [max(1, max_grids), max_grids] if max_grids >= 1 else [1, 1]
+        else:
+            max_grids_range = [4, max_grids]
+    else:
+        # 基于最大有效金额计算 max_grids 上限（确保所有 valid_amounts 都满足约束）
+        max_valid_amount = max(valid_amounts)
+        feasible_grids = int(max_invest / max_valid_amount)
+        max_grids = min(max_grids_raw, feasible_grids)
+        # 修正：确保 max_grids 与所有 valid_amounts 兼容
+        if max_valid_amount * 4 > max_invest:
+            max_grids = min(max_grids, feasible_grids)
+        max_grids_range = [4, max_grids] if max_grids >= 4 else [max(1, max_grids), max_grids]
+
+    return {
+        'grid_amount_choices': valid_amounts,
+        'max_grids_range': max_grids_range,
+        'grid_spacing_range': [0.015, 0.035],
+        'initial_position_range': [0.40, 0.50],
+        'grid_pool': grid_pool,
+        'max_invest': max_invest,
+    }
+
+
 # ==================== 多目标惩罚函数 ====================
 
 def calculate_composite_score(
@@ -1866,7 +1932,7 @@ def calculate_composite_score(
         cost_ratio_limit: 摩擦成本/初始本金上限(默认3%)
 
     返回:
-        复合分数(越高越好)，或 -999 表示该参数组合无效
+        复合分数(越高越好)，返回 -999 表示最大回撤超限，-5.0 表示流动性越界
     """
     # 1. 提取关键指标
     calmar = result.get('calmar_ratio', 0)
@@ -1876,9 +1942,9 @@ def calculate_composite_score(
     total_slippage = result.get('total_slippage_cost', 0)
     initial_cash = result.get('initial_cash', 1000000.0)
 
-    # 2. 硬约束：流动性越界 → 无效
+    # 2. 硬约束：流动性越界 → 软惩罚（有限值避免污染 TPE 分布）
     if result.get('reason') == 'GRID_POOL_EXCEEDED':
-        return -999
+        return -5.0
 
     # 3. 硬约束：最大回撤超过上限 → 无效
     if max_dd > max_drawdown_limit:
@@ -1900,10 +1966,10 @@ def calculate_composite_score(
 
     # 6. 成本惩罚：使用 initial_cash 作分母，防除零奇点
     #    摩擦率 = (滑点 + 估算手续费) / 初始本金
-    #    超过 3% 阈值开始惩罚，上限约 1.0
+    #    超过 3% 阈值开始惩罚，上限 0.3（避免淹没 Calmar 信号）
     estimated_fees = abs(result.get('total_return', 0)) * initial_cash * 0.0007
     friction_ratio = (total_slippage + estimated_fees) / initial_cash
-    cost_penalty = max(0.0, (friction_ratio - cost_ratio_limit) * 10.0)
+    cost_penalty = max(0.0, min((friction_ratio - cost_ratio_limit) * 5.0, 0.3))
 
     # 7. 网格密度惩罚：对数平滑，量级控制在 [0, 0.4]
     #    density_metric = max_grids / (spacing * 100)
@@ -1994,11 +2060,11 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
     logger.info(f"投入股票数: {max_stocks}, 每只分配: {allocated_cash:.0f}元, "
                 f"网格资金池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
 
-    # 计算搜索空间（根据分配的资金和初始仓位）
-    search_space = calculate_grid_search_space(allocated_cash, initial_position)
-    logger.info(f"搜索空间: grid_amount={search_space['grid_amount_choices']}, "
+    # 计算搜索空间（启动时动态裁剪，避免无效采样）
+    search_space = build_adaptive_search_space(allocated_cash, initial_position)
+    logger.info(f"搜索空间（已裁剪）: grid_amount={search_space['grid_amount_choices']}, "
                 f"max_grids={search_space['max_grids_range']}, "
-                f"spacing={search_space['grid_spacing_range']}")
+                f"grid_pool={search_space['grid_pool']:.0f}元")
 
     if not stock_pool:
         logger.error("股票池为空，无法优化")
