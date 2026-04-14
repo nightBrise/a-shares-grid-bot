@@ -769,8 +769,9 @@ def run_optimization(config: dict) -> Dict:
     for code in stocks[:max_stocks]:
         logger.info(f"\n处理股票：{code}")
 
-        # 获取历史数据
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
+        # 获取历史数据（仅对选出的 top_n 股票执行增量更新）
+        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                           selected_stocks=stocks)
 
         if df.empty or len(df) < backtest_cfg.get('days', 250):
             logger.warning(f"{code} 数据不足，跳过")
@@ -909,6 +910,34 @@ def run_optimization(config: dict) -> Dict:
         }, f, ensure_ascii=False, indent=2)
 
     logger.info(f"\n优化报告已保存到：{report_file}")
+
+    # === 选择实盘交易股票：根据收益排序，选择理论收益最大的 n 只 ===
+    # 根据资金量确定实盘股票数量
+    trading_stocks_count = max(1, max_stocks)  # 默认全部参与，可根据资金调整
+    df_results = pd.DataFrame(all_results)
+    df_results = df_results.sort_values('out_of_sample_return', ascending=False)
+    trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
+
+    logger.info(f"\n实盘交易股票（按收益排序）:")
+    for i, code in enumerate(trading_stocks):
+        row = df_results[df_results['code'] == code].iloc[0]
+        logger.info(f"  {i+1}. {code} - 样本外收益: {row['out_of_sample_return']*100:.2f}%")
+
+    # 保存实盘股票到 config_state.json
+    from utils import load_state, save_state
+    state = load_state()
+    state['trading_stocks'] = trading_stocks
+    state['optimization_history'] = {
+        r['code']: {
+            'best_params': r['best_params'],
+            'out_of_sample_return': r['out_of_sample_return'],
+            'out_of_sample_calmar': r['out_of_sample_calmar'],
+            'out_of_sample_drawdown': r['out_of_sample_drawdown']
+        }
+        for r in all_results
+    }
+    save_state(state)
+    logger.info(f"实盘股票已保存到 config_state.json")
 
     return all_results
 
@@ -1106,7 +1135,8 @@ def generate_signals(config: dict) -> pd.DataFrame:
     for pos in positions_data:
         code = pos['code']
         try:
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
+            df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                                selected_stocks=stocks)
             if not df.empty:
                 current_price = df.iloc[-1]['close']
                 positions_with_price.append({
@@ -1137,23 +1167,37 @@ def generate_signals(config: dict) -> pd.DataFrame:
     if circuit_breaker_state.is_global_breaker:
         logger.error("🚨 全局熔断已触发！仅生成卖出信号，暂停所有买入")
     
+    # === 步骤 4: 确定实盘交易股票 ===
+    # 从 config_state.json 读取 trading_stocks
+    trading_stocks = state.get('trading_stocks', [])
+
+    if trading_stocks:
+        # 优先使用配置的实盘股票
+        signal_stocks = trading_stocks
+        logger.info(f"使用实盘交易股票：{signal_stocks}")
+    else:
+        # 如果没有配置，回退到使用全部 top_n 股票
+        signal_stocks = stocks
+        logger.info(f"未配置实盘股票，使用候选股票池：{signal_stocks}")
+
     # === 步骤 5: 生成交易信号 ===
     signals = []
     version = get_version()  # 获取策略版本号
-    
-    for code in stocks:
+
+    for code in signal_stocks:
         logger.info(f"\n{'-'*60}")
         logger.info(f"处理股票：{code}")
         logger.info(f"{'-'*60}")
         
         # 检查是否允许买入该股
         allow_buy = risk_manager.should_allow_buy(code)
-        
+
         if not allow_buy:
             logger.warning(f"⚠️  {code} 触发熔断（全局或个股），跳过买入信号生成")
-        
-        # 获取最新数据
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
+
+        # 获取最新数据（仅对实盘交易股票执行增量更新获取实时数据）
+        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                            selected_stocks=signal_stocks)
         
         if df.empty:
             logger.warning(f"{code} 无数据，跳过")
@@ -2085,9 +2129,10 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
         logger.info(f"\n{'='*70}")
         logger.info(f"处理股票：{code}")
         logger.info(f"{'='*70}")
-        
-        # 获取历史数据
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
+
+        # 获取历史数据（仅对选股池中的股票执行增量更新）
+        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                            selected_stocks=stocks_to_optimize)
         
         if df.empty:
             logger.warning(f"{code} 无数据，跳过")
@@ -2258,9 +2303,36 @@ def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
     
     with open(report_file, 'w', encoding='utf-8') as f:
         json.dump(report_data, f, ensure_ascii=False, indent=2)
-    
+
     logger.info(f"\n优化报告已保存到：{report_file}")
-    
+
+    # === 选择实盘交易股票：根据收益排序，选择理论收益最大的 n 只 ===
+    trading_stocks_count = max(1, len(stock_pool))
+    df_results = pd.DataFrame(all_results)
+    df_results = df_results.sort_values('out_of_sample_return', ascending=False)
+    wf_trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
+
+    logger.info(f"\n实盘交易股票（按收益排序）:")
+    for i, code in enumerate(wf_trading_stocks):
+        row = df_results[df_results['code'] == code].iloc[0]
+        logger.info(f"  {i+1}. {code} - 样本外收益: {row['out_of_sample_return']*100:.2f}%")
+
+    # 保存实盘股票到 config_state.json
+    from utils import load_state, save_state
+    state = load_state()
+    state['trading_stocks'] = wf_trading_stocks
+    state['optimization_history'] = {
+        r['code']: {
+            'best_params': r.get('best_params', {}),
+            'out_of_sample_return': r.get('out_of_sample_return', 0),
+            'out_of_sample_calmar': r.get('out_of_sample_calmar', 0),
+            'out_of_sample_drawdown': r.get('out_of_sample_drawdown', 0)
+        }
+        for r in all_results
+    }
+    save_state(state)
+    logger.info(f"实盘股票已保存到 config_state.json")
+
     return all_results
 
 

@@ -1245,11 +1245,12 @@ def backfill_missing_data(code: str, missing_dates: List[str],
     return True
 
 
-def incremental_update(code: str, data_dir: str = "./data", 
-                       adjust: str = "qfq", force_full: bool = False) -> pd.DataFrame:
+def incremental_update(code: str, data_dir: str = "./data",
+                       adjust: str = "qfq", force_full: bool = False,
+                       selected_stocks: Optional[List[str]] = None) -> pd.DataFrame:
     """
-    执行增量更新逻辑
-    
+    执行增量更新逻辑（仅针对选出的 top_n 股票）
+
     流程:
     1. 读取本地元数据，获取最后更新日期
     2. 计算需要更新的日期范围
@@ -1257,18 +1258,26 @@ def incremental_update(code: str, data_dir: str = "./data",
     4. 追加到本地文件
     5. 检查数据完整性，必要时补全
     6. 更新元数据
-    
+
     参数:
         code: 股票代码
         data_dir: 数据目录
         adjust: 复权类型
         force_full: 是否强制全量更新
-    
+        selected_stocks: 选出的 top_n 股票列表，非空时仅对这些股票执行增量更新
+
     返回:
         更新后的完整数据
     """
     cache_path = get_cache_path(code, data_dir)
-    
+
+    # === 步骤 0: 检查是否需要增量更新 ===
+    # 如果指定了 selected_stocks 且当前股票不在其中，跳过增量更新
+    if selected_stocks is not None and code not in selected_stocks:
+        logger.info(f"{code} 不在选出的 top_n 股票列表中，跳过增量更新，仅使用缓存")
+        df_existing = load_from_cache(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
+        return df_existing if not df_existing.empty else pd.DataFrame()
+
     # === 步骤 1: 读取元数据和本地数据 ===
     stock_meta = get_stock_metadata(code, data_dir)
     df_existing = load_from_cache(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
@@ -1617,6 +1626,7 @@ def get_stock_data(code: str, data_dir: str = "./data",
                    prefer_baostock: bool = True,
                    enable_incremental: bool = True,
                    force_full: bool = False,
+                   selected_stocks: Optional[List[str]] = None,
                    **kwargs) -> pd.DataFrame:
     """
     获取股票数据 (优先读取缓存，支持双数据源自动切换，增量更新引擎)
@@ -1629,6 +1639,7 @@ def get_stock_data(code: str, data_dir: str = "./data",
         prefer_baostock: 是否优先使用 Baostock（默认 True，更稳定）
         enable_incremental: 是否启用增量更新（默认启用）
         force_full: 是否强制全量更新（忽略增量逻辑）
+        selected_stocks: 选出的 top_n 股票列表，仅对这些股票执行增量更新
         **kwargs: 传递给 fetch_stock_history 的参数
 
     返回:
@@ -1636,10 +1647,11 @@ def get_stock_data(code: str, data_dir: str = "./data",
     """
     cache_path = get_cache_path(code, data_dir)
 
-    # === 增量更新模式 ===
+    # === 增量更新模式（仅针对选出的 top_n 股票）===
     if enable_incremental and not force_full:
         logger.info(f"{code} 使用增量更新引擎...")
-        return incremental_update(code, data_dir=data_dir, adjust='qfq', force_full=False)
+        return incremental_update(code, data_dir=data_dir, adjust='qfq', force_full=False,
+                                  selected_stocks=selected_stocks)
 
     # === 传统全量模式 ===
     # 尝试从缓存加载

@@ -16,7 +16,7 @@ import argparse
 from datetime import datetime
 
 # 定义版本号
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # 导入项目模块
 from utils import load_config, load_state, save_state, setup_logging, send_notification, get_version

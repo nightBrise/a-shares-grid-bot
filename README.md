@@ -3,7 +3,7 @@
 基于均值回归原理的量化交易自动化工具，实现智能选股、参数优化、信号生成和实时风控。
 
 [![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-v1.3.1-yellow.svg)](VERSION.md)
+[![Version](https://img.shields.io/badge/version-v1.4.0-yellow.svg)](VERSION.md)
 [![License](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey.svg)](LICENSE)
 
 > ⚠️ **模块状态**：选股模块 ✅ 已稳定运行 | 网格参数计算模块 🔄 优化中
@@ -127,15 +127,20 @@ auto_grid_trading_system/
 
 ### 2. 参数优化引擎
 
-**搜索空间**:
-- 网格间距：1.0% ~ 5.0%
-- 每格金额：5000/10000/20000/50000 元
-- 初始仓位：30% ~ 70%
-- 最大层数：5 ~ 15
+**搜索空间**（动态裁剪）:
+- 网格间距：根据资金自动计算 1.5% ~ 3.5%
+- 每格金额：根据资金级别自动选择
+- 初始仓位：40% ~ 50%
+- 最大层数：根据资金池动态计算
 
-**目标**: 最大化 Calmar Ratio (年化收益/最大回撤)
+**目标**: 最大化复合分数（Calmar − 回撤惩罚 − 频率惩罚 − 成本惩罚 − 密度惩罚）
 
-**输出**: `output/report.json`
+**选股 → 优化 → 实盘选择**:
+1. 贝叶斯优化（样本内）：Optuna 搜索最优参数
+2. 样本外回测：验证参数是否过拟合
+3. 按收益排序：选择样本外收益最高的 n 只作为实盘股票
+
+**输出**: `output/report.json`, `config_state.json['trading_stocks']`
 
 ### 3. 动态网格引擎
 
@@ -342,6 +347,32 @@ conda env create -f environment.yml
 本作品采用 [知识共享署名 - 非商业性使用 - 相同方式共享 4.0 国际许可协议](http://creativecommons.org/licenses/by-nc-sa/4.0/) 进行许可。
 
 详见 [LICENSE](LICENSE) 文件。
+
+---
+
+## 🚧 后续更新计划
+
+### 1. 灵活配置实盘股票数量
+
+| 配置方式 | 说明 | 优先级 |
+|---------|------|--------|
+| **资金驱动**（当前） | `max_stocks = min(资金可支撑数量, 候选股票数)` | ✅ 已实现 |
+| **显式配置** | 在 `config.yaml` 中指定 `trading_stocks_count` | 🔄 规划中 |
+| **收益阈值** | 设置收益门槛，超过门槛才参与实盘 | 🔄 规划中 |
+| **动态调整** | 根据收益率排名动态调整实盘股票数量 | 🔄 规划中 |
+
+### 2. 模拟器模块
+
+使用真实数据和虚拟资金，模拟当前选择的股票是否可以盈利：
+
+| 功能 | 说明 |
+|------|------|
+| **虚拟资金池** | 初始化虚拟现金和持仓 |
+| **逐日模拟** | 根据每日行情数据模拟网格交易 |
+| **收益追踪** | 记录每日净值、持仓成本、浮动盈亏 |
+| **统计报表** | 输出模拟期间的总收益、最大回撤、夏普比率等 |
+
+**输出**: `output/simulation_report.json`
 
 ---
 
