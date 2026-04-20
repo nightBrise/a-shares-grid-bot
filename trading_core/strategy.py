@@ -366,21 +366,50 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     return df_result
 
 
+def calculate_optimal_stock_count(config: dict) -> int:
+    """
+    根据资金量动态计算最优股票数量
+
+    公式: 可用资金 / 单股最小占用 → 向下取整
+
+    约束条件:
+    - 可用资金 = 总资金 × (1 - 现金保留比例)
+    - 单股最小占用 = 每格金额 × 2层 (至少2层才能有效运行网格)
+    - 最大不超过 20 只，最少 1 只
+
+    返回: 1-20 只
+    """
+    capital_cfg = config.get('capital', {})
+    grid_cfg = config.get('grid', {})
+
+    total = capital_cfg.get('total', 100000)
+    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.4)
+    grid_amount = grid_cfg.get('grid_amount', 3000)
+    max_grids = grid_cfg.get('max_grids', 5)
+
+    available_capital = total * (1 - cash_reserve_ratio)
+    min_per_stock = grid_amount * 2
+
+    count = int(available_capital / min_per_stock)
+    return max(1, min(count, 20))
+
+
 def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict):
     """
     将选股结果写入配置文件，并设置选股完成标记
-    
+
     参数:
         df_selection: 选股结果 DataFrame
         config: 当前配置字典
     """
     import yaml
-    
-    # 获取前 N 只最佳股票 (默认前 5 只，用于实际交易)
-    save_top_n = config.get('selection', {}).get('save_top_n', 5)
+
+    # 动态计算最优股票数量
+    save_top_n = calculate_optimal_stock_count(config)
     selected_stocks = df_selection.head(save_top_n)['code'].tolist()
 
-    logger.info(f"\n正在更新配置文件，保存前 {save_top_n} 只最佳股票到 stocks 列表...")
+    logger.info(f"\n根据资金 {config.get('capital', {}).get('total', 0)/10000:.1f}万 " +
+                f"动态计算最优股票数量: {save_top_n} 只")
     
     # 读取原始配置文件
     config_path = "config.yaml"
