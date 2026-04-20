@@ -14,13 +14,13 @@ import yaml
 
 # ==================== 配置加载 ====================
 
-def load_config(config_path: str = "config.yaml") -> dict:
+def load_config(config_path: str = "configuration/config.yaml") -> dict:
     """加载 YAML 静态配置文件"""
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 
-def load_state(state_path: str = "config_state.json") -> dict:
+def load_state(state_path: str = "configuration/config_state.json") -> dict:
     """加载 JSON 动态状态文件"""
     if not os.path.exists(state_path):
         # 如果状态文件不存在，返回默认状态

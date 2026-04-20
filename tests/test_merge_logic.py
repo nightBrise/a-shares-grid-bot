@@ -22,7 +22,7 @@ import os
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data import append_new_data
+from data_layer.fetcher import append_new_data
 
 
 def generate_mock_data(start_date: str, days: int, base_price: float = 100.0) -> pd.DataFrame:

@@ -22,9 +22,9 @@ from datetime import datetime, timedelta
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data import (
-    get_stock_data, 
-    load_metadata, 
+from data_layer.fetcher import (
+    get_stock_data,
+    load_metadata,
     check_data_integrity,
     METADATA_FILE
 )

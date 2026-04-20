@@ -16,7 +16,7 @@ try:
 except ImportError:
     raise ImportError("请安装 optuna: pip install optuna>=3.0.0")
 
-from data import (
+from data_layer.fetcher import (
     get_stock_data, clean_data, calculate_atr, calculate_hurst_exponent,
     align_to_trading_day, get_next_trading_day, get_trade_calendar,
     pre_filter_stocks_fast, get_thread_rate_limiter
@@ -30,8 +30,8 @@ from utils import (
 
 # 新模块：多因子选股 (可选)
 try:
-    from indicators import calculate_all_indicators, get_latest_indicators
-    from screener import (
+    from trading_core.indicators import calculate_all_indicators, get_latest_indicators
+    from trading_core.screener import (
         AdvancedMultiFactorScreener,
         screen_universe_advanced,
     )
@@ -42,7 +42,7 @@ except ImportError:
 
 # 新模块：动态网格引擎 (可选)
 try:
-    import grid_engine
+    import trading_core.grid_engine as grid_engine
     GRID_ENGINE_AVAILABLE = True
 except ImportError:
     GRID_ENGINE_AVAILABLE = False
@@ -50,7 +50,7 @@ except ImportError:
 
 # 新模块：增强风控 (可选)
 try:
-    from risk import EnhancedRiskControl
+    from risk_management.enhanced_risk import EnhancedRiskControl
     ENHANCED_RISK_AVAILABLE = True
 except ImportError:
     ENHANCED_RISK_AVAILABLE = False
@@ -711,7 +711,334 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
     }
 
 
-# ==================== 贝叶斯优化 ====================
+# ==================== 两阶段优化 ====================
+
+def run_two_phase_optimization(config: dict) -> Dict:
+    """
+    两阶段优化模式：合并贝叶斯优化 + WF微调
+
+    Phase 1 (贝叶斯优化):
+    - 数据范围：T-1Y ~ T-3M（样本内）
+    - 使用 Optuna 贝叶斯优化寻找初始最佳参数
+    - 优化目标：最大化复合分数
+
+    Phase 2 (WF微调):
+    - 数据范围：T-3M ~ T（样本外验证）
+    - 在WF窗口上验证 Phase 1 参数
+    - 如果验证有效，执行局部微调
+
+    参数:
+        config: 配置字典
+
+    返回:
+        最佳参数字典（含两阶段结果）
+    """
+    logger.info("=" * 70)
+    logger.info("两阶段优化：贝叶斯优化 + WF微调")
+    logger.info("=" * 70)
+
+    # 创建 WF 窗口
+    from utils import datetime
+    wf_window = WalkForwardWindow(datetime.now())
+
+    # 获取日期范围
+    ins_start, ins_end = wf_window.get_ins_sample_period()
+    oos_start, oos_end = wf_window.get_oos_sample_period()
+
+    logger.info(f"Phase 1 (贝叶斯优化): {ins_start} 至 {ins_end}")
+    logger.info(f"Phase 2 (WF微调): {oos_start} 至 {oos_end}")
+    logger.info("=" * 70)
+
+    stocks = config.get('stocks', [])
+    grid_cfg = config.get('grid', {})
+    backtest_cfg = config.get('backtest', {})
+    paths_cfg = config.get('paths', {})
+    capital_cfg = config.get('capital', {})
+
+    if not stocks:
+        logger.error("配置文件中未指定股票列表")
+        return {}
+
+    # 资金分配逻辑
+    total_cash = capital_cfg.get('total', 100000)
+    max_position_pct = capital_cfg.get('max_position_per_stock', 0.30)
+    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.40)
+    initial_position = capital_cfg.get('initial_position', 0.45)
+
+    investable_cash = total_cash * (1 - cash_reserve_ratio)
+    max_stocks_by_money = max(1, int(investable_cash / (total_cash * max_position_pct)))
+    max_stocks = min(max_stocks_by_money, len(stocks))
+    allocated_cash = investable_cash / max_stocks if max_stocks > 0 else investable_cash
+
+    grid_pool = allocated_cash * (1 - initial_position)
+
+    logger.info(f"资金配置: 总资金={total_cash}元, 每股分配={allocated_cash:.0f}元, "
+                f"网格池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
+
+    # 搜索空间
+    search_space = build_adaptive_search_space(allocated_cash, initial_position)
+    logger.info(f"Phase 1 搜索空间: grid_amount={search_space['grid_amount_choices']}, "
+                f"max_grids={search_space['max_grids_range']}")
+
+    all_results = []
+
+    for code in stocks[:max_stocks]:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"处理股票：{code}")
+        logger.info(f"{'='*70}")
+
+        # 获取历史数据
+        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                           selected_stocks=stocks)
+
+        if df.empty or len(df) < 250:
+            logger.warning(f"{code} 数据不足，跳过")
+            continue
+
+        # 清洗数据
+        df = clean_data(df)
+
+        # 按 WF 窗口切割数据
+        df_ins = wf_window.slice_dataframe_by_period(df, period='ins')
+        df_oos = wf_window.slice_dataframe_by_period(df, period='oos')
+
+        logger.info(f"Phase 1 数据：{len(df_ins)}天 ({ins_start} 至 {ins_end})")
+        logger.info(f"Phase 2 数据：{len(df_oos)}天 ({oos_start} 至 {oos_end})")
+
+        if len(df_ins) < 60:
+            logger.warning(f"{code} Phase 1 数据不足，跳过")
+            continue
+
+        # ========== Phase 1: 贝叶斯优化 ==========
+        logger.info("\n>>> Phase 1: 贝叶斯优化")
+
+        def objective_phase1(trial):
+            grid_spacing = trial.suggest_float('grid_spacing',
+                search_space['grid_spacing_range'][0],
+                search_space['grid_spacing_range'][1], step=0.001)
+            grid_amount = trial.suggest_categorical('grid_amount',
+                search_space['grid_amount_choices'])
+            ip = trial.suggest_float('initial_position',
+                search_space['initial_position_range'][0],
+                search_space['initial_position_range'][1], step=0.01)
+            max_g = trial.suggest_int('max_grids',
+                search_space['max_grids_range'][0],
+                search_space['max_grids_range'][1])
+
+            result = backtest_grid_strategy(
+                df_ins,
+                grid_spacing=grid_spacing,
+                grid_amount=grid_amount,
+                initial_position=ip,
+                max_grids=max_g,
+                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+                initial_cash=allocated_cash
+            )
+
+            return calculate_composite_score(
+                result=result,
+                grid_spacing=grid_spacing,
+                max_grids=max_g,
+                n_days=len(df_ins)
+            )
+
+        n_trials = backtest_cfg.get('n_trials', 150)
+        n_startup = backtest_cfg.get('n_startup_trials', 20)
+
+        sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
+        pruner = optuna.pruners.MedianPruner()
+
+        study = optuna.create_study(
+            direction='maximize',
+            study_name=f'{code}_phase1',
+            load_if_exists=False,
+            sampler=sampler,
+            pruner=pruner
+        )
+
+        study.optimize(objective_phase1, n_trials=n_trials, show_progress_bar=False)
+
+        phase1_params = study.best_params
+        phase1_score = study.best_value
+
+        logger.info(f"Phase 1 最佳参数:")
+        logger.info(f"  网格间距：{phase1_params['grid_spacing']:.3f}%")
+        logger.info(f"  每格金额：{phase1_params['grid_amount']}元")
+        logger.info(f"  初始仓位：{phase1_params['initial_position']*100:.0f}%")
+        logger.info(f"  最大网格：{phase1_params['max_grids']}层")
+        logger.info(f"  复合分数：{phase1_score:.4f}")
+
+        # Phase 1 样本外验证
+        result_oos_phase1 = backtest_grid_strategy(
+            df_oos,
+            grid_spacing=phase1_params['grid_spacing'],
+            grid_amount=phase1_params['grid_amount'],
+            initial_position=phase1_params['initial_position'],
+            max_grids=phase1_params['max_grids'],
+            commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+            slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+            initial_cash=allocated_cash
+        )
+
+        oos_score_phase1 = calculate_composite_score(
+            result=result_oos_phase1,
+            grid_spacing=phase1_params['grid_spacing'],
+            max_grids=phase1_params['max_grids'],
+            n_days=len(df_oos)
+        )
+
+        logger.info(f"Phase 1 OOS 验证 - 复合分数：{oos_score_phase1:.4f}, "
+                    f"Calmar：{result_oos_phase1['calmar_ratio']:.4f}, "
+                    f"回撤：{result_oos_phase1['max_drawdown']*100:.2f}%")
+
+        # ========== Phase 2: WF微调 ==========
+        logger.info("\n>>> Phase 2: WF微调")
+
+        # Phase 2 搜索空间：以 Phase 1 结果为中心 ±10%
+        fine_tune_range = 0.10
+        phase2_spacing_min = max(0.001, phase1_params['grid_spacing'] * (1 - fine_tune_range))
+        phase2_spacing_max = phase1_params['grid_spacing'] * (1 + fine_tune_range)
+        phase2_ip_min = max(0.20, phase1_params['initial_position'] * (1 - fine_tune_range))
+        phase2_ip_max = min(0.80, phase1_params['initial_position'] * (1 + fine_tune_range))
+
+        logger.info(f"Phase 2 搜索空间（以Phase1为中心±{fine_tune_range*100:.0f}%%）:")
+        logger.info(f"  grid_spacing: {phase2_spacing_min:.4f} ~ {phase2_spacing_max:.4f}")
+        logger.info(f"  initial_position: {phase2_ip_min:.4f} ~ {phase2_ip_max:.4f}")
+
+        def objective_phase2(trial):
+            grid_spacing = trial.suggest_float('grid_spacing',
+                phase2_spacing_min, phase2_spacing_max, step=0.0005)
+            # grid_amount 和 max_grids 保持 Phase 1 结果
+            ip = trial.suggest_float('initial_position',
+                phase2_ip_min, phase2_ip_max, step=0.005)
+
+            result = backtest_grid_strategy(
+                df_oos,  # Phase 2 使用 OOS 数据
+                grid_spacing=grid_spacing,
+                grid_amount=phase1_params['grid_amount'],
+                initial_position=ip,
+                max_grids=phase1_params['max_grids'],
+                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+                initial_cash=allocated_cash
+            )
+
+            return calculate_composite_score(
+                result=result,
+                grid_spacing=grid_spacing,
+                max_grids=phase1_params['max_grids'],
+                n_days=len(df_oos)
+            )
+
+        study_phase2 = optuna.create_study(
+            direction='maximize',
+            study_name=f'{code}_phase2',
+            load_if_exists=False,
+            sampler=optuna.samplers.TPESampler(n_startup_trials=5),
+            pruner=optuna.pruners.MedianPruner()
+        )
+
+        study_phase2.optimize(objective_phase2, n_trials=30, show_progress_bar=False)
+
+        final_params = {
+            'grid_spacing': study_phase2.best_params['grid_spacing'],
+            'grid_amount': phase1_params['grid_amount'],
+            'initial_position': study_phase2.best_params['initial_position'],
+            'max_grids': phase1_params['max_grids']
+        }
+        final_score = study_phase2.best_value
+
+        logger.info(f"Phase 2 微调后最佳参数:")
+        logger.info(f"  网格间距：{final_params['grid_spacing']:.4f}% (Phase1: {phase1_params['grid_spacing']:.4f}%)")
+        logger.info(f"  每格金额：{final_params['grid_amount']}元")
+        logger.info(f"  初始仓位：{final_params['initial_position']*100:.1f}% (Phase1: {phase1_params['initial_position']*100:.1f}%)")
+        logger.info(f"  最大网格：{final_params['max_grids']}层")
+        logger.info(f"  最终分数：{final_score:.4f}")
+
+        # 使用 Phase 2 参数在 OOS 上做最终验证
+        result_final = backtest_grid_strategy(
+            df_oos,
+            grid_spacing=final_params['grid_spacing'],
+            grid_amount=final_params['grid_amount'],
+            initial_position=final_params['initial_position'],
+            max_grids=final_params['max_grids'],
+            commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+            slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+            initial_cash=allocated_cash
+        )
+
+        logger.info(f"最终 OOS 验证 - Calmar：{result_final['calmar_ratio']:.4f}, "
+                    f"回撤：{result_final['max_drawdown']*100:.2f}%, "
+                    f"交易次数：{result_final['n_trades']}")
+
+        all_results.append({
+            'code': code,
+            'phase1_params': phase1_params,
+            'phase1_score': phase1_score,
+            'phase1_oos_score': oos_score_phase1,
+            'final_params': final_params,
+            'final_score': final_score,
+            'final_calmar': result_final['calmar_ratio'],
+            'final_drawdown': result_final['max_drawdown'],
+            'final_trades': result_final['n_trades'],
+            'final_return': result_final['total_return']
+        })
+
+    # 保存优化结果
+    output_dir = paths_cfg['output_dir']
+    report_file = os.path.join(output_dir, 'report.json')
+
+    with open(report_file, 'w', encoding='utf-8') as f:
+        json.dump({
+            'optimization_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'optimization_type': 'two_phase',
+            'phase1_period': f'{ins_start} 至 {ins_end}',
+            'phase2_period': f'{oos_start} 至 {oos_end}',
+            'capital_allocation': {
+                'total': total_cash,
+                'allocated_per_stock': allocated_cash,
+                'grid_pool_per_stock': grid_pool,
+                'num_stocks': max_stocks
+            },
+            'results': all_results
+        }, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"\n优化报告已保存到：{report_file}")
+
+    # 选择实盘交易股票
+    trading_stocks_count = max(1, max_stocks)
+    df_results = pd.DataFrame(all_results)
+    df_results = df_results.sort_values('final_return', ascending=False)
+    trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
+
+    logger.info(f"\n实盘交易股票（按收益排序）:")
+    for i, code in enumerate(trading_stocks):
+        row = df_results[df_results['code'] == code].iloc[0]
+        logger.info(f"  {i+1}. {code} - 最终收益: {row['final_return']*100:.2f}%, "
+                    f"Calmar: {row['final_calmar']:.4f}")
+
+    # 保存实盘股票到 config_state.json
+    from utils import load_state, save_state
+    state = load_state()
+    state['trading_stocks'] = trading_stocks
+    state['optimization_history'] = {
+        r['code']: {
+            'final_params': r['final_params'],
+            'final_return': r['final_return'],
+            'phase1_params': r['phase1_params']
+        } for r in all_results
+    }
+    save_state(state)
+
+    logger.info(f"实盘股票已保存到 config_state.json")
+
+    return all_results
+
 
 def run_optimization(config: dict) -> Dict:
     """
@@ -1119,7 +1446,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
     opt_history = load_optimization_history(config)
     
     # === 步骤 2: 初始化风控管理器 ===
-    from risk_control import RiskControlManager, create_risk_control_manager
+    from risk_management.circuit_breaker import RiskControlManager, create_risk_control_manager
     
     risk_manager = create_risk_control_manager(config)
     
@@ -1365,7 +1692,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
     df_signals = df_signals.sort_values(['code', 'priority', 'direction'])
     
     # === 步骤 7: 风控过滤（移除被禁止的买入信号） ===
-    from risk_control import filter_signals_by_risk
+    from risk_management.circuit_breaker import filter_signals_by_risk
     df_signals = filter_signals_by_risk(df_signals, circuit_breaker_state, risk_manager)
     
     # === 步骤 8: 输出信号 ===
@@ -2451,26 +2778,27 @@ def run_walk_forward_analysis(config: dict, current_date: datetime = None,
 def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
     """
     策略执行入口
-    
+
     参数:
         mode: 运行模式 ('select', 'optimize', 'signal')
         config_path: 配置文件路径
     """
     # 加载配置
     config = load_config(config_path)
-    
+
     # 如果未指定模式，使用配置文件中的模式
     if mode is None:
         mode = config.get('mode', 'select')
-    
+
     logger.info(f"\n当前运行模式：{mode.upper()}")
-    
+
     try:
         if mode == 'select':
             result = run_selection(config)
             return result
         elif mode == 'optimize':
-            result = run_optimization(config)
+            # 两阶段优化：贝叶斯优化 + WF微调
+            result = run_two_phase_optimization(config)
             return result
         elif mode == 'signal':
             result = generate_signals(config)
@@ -2478,7 +2806,7 @@ def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
         else:
             logger.error(f"未知模式：{mode}")
             return None
-            
+
     except Exception as e:
         logger.exception(f"策略执行失败：{str(e)}")
         raise
