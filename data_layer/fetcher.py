@@ -41,6 +41,177 @@ _last_request_time = 0
 _consecutive_failures = 0
 # 是否已登录 baostock
 _bs_logged_in = False
+# Baostock 服务端拒绝错误标记（用于区分网络错误和服务端限流）
+_bs_server_reject = False
+
+# 增量更新断点追踪
+_update_checkpoint: Dict[str, Dict] = {}  # code -> {'last_success': datetime, 'last_error': str, 'last_date': str}
+_CHECKPOINT_FILE = "configuration/update_checkpoint.json"
+
+# 候选股票列表缓存
+_CANDIDATE_FILE = "configuration/candidate_stocks.json"
+
+
+def load_candidate_stocks() -> Optional[Dict]:
+    """
+    加载候选股票列表缓存
+
+    返回:
+        {'date': str, 'stocks': List[str]} 或 None（不存在或已过期）
+    """
+    if not os.path.exists(_CANDIDATE_FILE):
+        return None
+
+    try:
+        with open(_CANDIDATE_FILE, 'r') as f:
+            data = json.load(f)
+
+        # 检查日期是否是今天
+        cache_date = data.get('date', '')
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        if cache_date != today:
+            logger.debug(f"候选股票缓存已过期 ({cache_date} != {today})")
+            return None
+
+        return data
+    except Exception as e:
+        logger.warning(f"加载候选股票缓存失败: {e}")
+        return None
+
+
+def save_candidate_stocks(stocks: List[str]) -> bool:
+    """
+    保存候选股票列表到缓存
+
+    参数:
+        stocks: 候选股票代码列表
+
+    返回:
+        是否成功
+    """
+    try:
+        data = {
+            'date': datetime.now().strftime('%Y-%m-%d'),
+            'stocks': stocks,
+            'count': len(stocks)
+        }
+        with open(_CANDIDATE_FILE, 'w') as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.debug(f"候选股票列表已缓存: {len(stocks)} 只")
+        return True
+    except Exception as e:
+        logger.error(f"保存候选股票缓存失败: {e}")
+        return False
+
+
+def load_update_checkpoint() -> Dict[str, Dict]:
+    """从文件加载增量更新断点"""
+    global _update_checkpoint
+    if os.path.exists(_CHECKPOINT_FILE):
+        try:
+            with open(_CHECKPOINT_FILE, 'r') as f:
+                data = json.load(f)
+                # 转换日期字符串回 datetime
+                for code, info in data.items():
+                    if 'last_success' in info and isinstance(info['last_success'], str):
+                        info['last_success'] = datetime.fromisoformat(info['last_success'])
+                _update_checkpoint = data
+                logger.debug(f"加载断点数据：{len(_update_checkpoint)} 只股票")
+        except Exception as e:
+            logger.warning(f"加载断点文件失败：{str(e)}")
+    return _update_checkpoint
+
+
+def save_update_checkpoint() -> None:
+    """保存断点到文件"""
+    try:
+        os.makedirs(os.path.dirname(_CHECKPOINT_FILE), exist_ok=True)
+        # 转换 datetime 为字符串以便 JSON 序列化
+        data_to_save = {}
+        for code, info in _update_checkpoint.items():
+            data_to_save[code] = {}
+            for k, v in info.items():
+                if isinstance(v, datetime):
+                    data_to_save[code][k] = v.isoformat()
+                else:
+                    data_to_save[code][k] = v
+        with open(_CHECKPOINT_FILE, 'w') as f:
+            json.dump(data_to_save, f, indent=2)
+        logger.debug(f"保存断点数据：{len(_update_checkpoint)} 只股票")
+    except Exception as e:
+        logger.error(f"保存断点文件失败：{str(e)}")
+
+
+def update_checkpoint(code: str, success: bool, last_date: str = None,
+                     error_msg: str = None, cache_exists: bool = False) -> None:
+    """
+    更新单只股票的断点信息
+
+    参数:
+        code: 股票代码
+        success: 是否成功获取数据
+        last_date: 最后数据的日期
+        error_msg: 错误信息（如失败）
+        cache_exists: 是否有本地缓存
+    """
+    global _update_checkpoint
+    if code not in _update_checkpoint:
+        _update_checkpoint[code] = {}
+
+    if success:
+        _update_checkpoint[code]['last_success'] = datetime.now()
+        _update_checkpoint[code]['last_date'] = last_date
+        _update_checkpoint[code]['last_error'] = None
+        _update_checkpoint[code]['cache_exists'] = cache_exists
+        _update_checkpoint[code]['consecutive_failures'] = 0
+    else:
+        if 'consecutive_failures' not in _update_checkpoint[code]:
+            _update_checkpoint[code]['consecutive_failures'] = 0
+        _update_checkpoint[code]['consecutive_failures'] += 1
+        _update_checkpoint[code]['last_error'] = error_msg
+
+    # 每 10 次更新保存一次
+    if len(_update_checkpoint) % 10 == 0:
+        save_update_checkpoint()
+
+
+def get_cache_status_for_stocks(codes: List[str]) -> Dict[str, Dict]:
+    """
+    获取股票缓存状态（哪些有缓存、哪些没有）
+
+    返回:
+        Dict[code, {'has_cache': bool, 'last_date': str, 'record_count': int}]
+    """
+    load_update_checkpoint()  # 确保断点已加载
+    status = {}
+    for code in codes:
+        cache_path = get_cache_path(code)
+        has_cache = os.path.exists(cache_path)
+        record_count = 0
+        last_date = None
+
+        if has_cache:
+            try:
+                df = pd.read_parquet(cache_path)
+                record_count = len(df)
+                last_date = df['date'].max().strftime('%Y-%m-%d') if not df.empty else None
+            except:
+                has_cache = False
+
+        # 优先使用断点数据
+        checkpoint_info = _update_checkpoint.get(code, {})
+
+        status[code] = {
+            'has_cache': has_cache,
+            'record_count': record_count,
+            'last_date': last_date or checkpoint_info.get('last_date'),
+            'last_success': checkpoint_info.get('last_success'),
+            'last_error': checkpoint_info.get('last_error'),
+            'consecutive_failures': checkpoint_info.get('consecutive_failures', 0),
+        }
+
+    return status
 
 # ==================== A 股交易日历（多数据源交叉校验） ====================
 
@@ -1044,7 +1215,10 @@ def fetch_from_baostock(code: str, start_date: str = None,
         if not hasattr(rs, 'error_code') or rs.error_code != '0':
             error_msg = getattr(rs, 'error_msg', 'Unknown error') if rs else 'None'
             logger.warning(f"Baostock 查询失败：{error_msg}")
-            return pd.DataFrame()
+            # 返回特殊标记，让调用方知道是服务端拒绝而非网络错误
+            return pd.DataFrame(columns=['date', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+        # 重置连接状态标志
+        _bs_connection_error = False
 
         # 转换为 DataFrame
         data_list = []
@@ -1280,7 +1454,11 @@ def incremental_update(code: str, data_dir: str = "./data",
 
     # === 步骤 1: 读取元数据和本地数据 ===
     stock_meta = get_stock_metadata(code, data_dir)
-    df_existing = load_from_cache(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
+    # 优先从季度文件读取历史数据
+    df_existing = load_quarter_history(codes=[code], data_dir=data_dir)
+    if df_existing.empty:
+        # 如果季度文件也没有，尝试旧缓存文件（兼容模式）
+        df_existing = load_from_cache(cache_path) if os.path.exists(cache_path) else pd.DataFrame()
     
     # === 步骤 2: 判断更新模式 ===
     today = datetime.now()
@@ -1302,12 +1480,19 @@ def incremental_update(code: str, data_dir: str = "./data",
                                           adjust=adjust, max_retries=5)
         
         if not df_full.empty:
-            save_to_cache(df_full, cache_path)
+            # 添加 code 列并写入季度文件
+            df_full_with_code = df_full.copy()
+            df_full_with_code['code'] = code
+            save_quarter_history(df_full_with_code, data_dir)
             last_date = df_full['date'].max().strftime('%Y-%m-%d')
             update_stock_metadata(code, last_date, len(df_full), data_dir, 
                                  update_mode='full', update_reason='initial_or_force')
             logger.info(f"{code} 全量更新完成：{len(df_full)}条记录")
-            
+
+            # 更新断点：成功
+            update_checkpoint(code, success=True, last_date=last_date,
+                            cache_exists=os.path.exists(cache_path))
+
             # 检查完整性
             is_complete, missing = check_data_integrity(df_full, code)
             if not is_complete and missing:
@@ -1348,7 +1533,9 @@ def incremental_update(code: str, data_dir: str = "./data",
         if df_incremental is not None and not df_incremental.empty:
             # === 步骤 4: 追加新数据 ===
             df_updated = append_new_data(df_existing, df_incremental, code)
-            save_to_cache(df_updated, cache_path)
+            # 添加 code 列并写入季度文件
+            df_updated['code'] = code
+            save_quarter_history(df_updated, data_dir)
             
             # === 步骤 5: 检查完整性 ===
             is_complete, missing = check_data_integrity(df_updated, code)
@@ -1379,36 +1566,52 @@ def incremental_update(code: str, data_dir: str = "./data",
             
             days_fetched = (today - last_update_date).days
             logger.info(f"Incremental update: {days_fetched} days data fetched for {code}")
-            
+
+            # 更新断点：成功
+            update_checkpoint(code, success=True, last_date=last_date,
+                            cache_exists=os.path.exists(cache_path))
+
             return df_updated
-        
+
         else:
             # 增量为空，可能数据源问题
             logger.warning(f"{code} 增量数据为空，可能网络问题或已停牌")
+            # 更新断点：失败（数据为空）
+            update_checkpoint(code, success=False, error_msg="增量数据为空",
+                            cache_exists=os.path.exists(cache_path))
             return df_existing
-            
+
     except Exception as e:
         # === 异常处理：降级为全量拉取近 1 年数据 ===
         logger.warning(f"{code} 增量更新失败 ({type(e).__name__}: {str(e)[:100]}...)，降级为全量更新...")
-        
+
         start_date = (today - timedelta(days=365)).strftime('%Y%m%d')
         df_fallback = fetch_stock_history(code, start_date=start_date, end_date=today_str,
                                           adjust=adjust, max_retries=5)
-        
+
         if not df_fallback.empty:
-            save_to_cache(df_fallback, cache_path)
+            # 添加 code 列并写入季度文件
+            df_fallback_with_code = df_fallback.copy()
+            df_fallback_with_code['code'] = code
+            save_quarter_history(df_fallback_with_code, data_dir)
             last_date = df_fallback['date'].max().strftime('%Y-%m-%d')
             update_stock_metadata(
-                code, 
-                last_date, 
-                len(df_fallback), 
+                code,
+                last_date,
+                len(df_fallback),
                 data_dir,
                 update_mode='fallback',
                 fallback_reason=str(type(e).__name__)
             )
+            # 更新断点：降级成功
+            update_checkpoint(code, success=True, last_date=last_date,
+                            cache_exists=os.path.exists(cache_path))
             logger.warning(f"{code} 降级更新完成：{len(df_fallback)}条记录")
             return df_fallback
         else:
+            # 更新断点：降级也失败
+            update_checkpoint(code, success=False, error_msg=f"降级失败: {str(e)[:50]}",
+                            cache_exists=os.path.exists(cache_path))
             logger.error(f"{code} 降级更新也失败，返回缓存数据（如有）")
             return df_existing
 
@@ -1448,6 +1651,7 @@ def fetch_stock_history(code: str, start_date: str = None,
         DataFrame 包含：date, open, high, low, close, volume, amount
     """
     global _consecutive_failures
+    global _bs_server_reject
 
     # 分离代码和交易所
     if '.' in code:
@@ -1511,17 +1715,32 @@ def fetch_stock_history(code: str, start_date: str = None,
             # 请求前等待（使用自适应限流器）
             rate_limiter.wait()
 
+            # 检查是否应该跳过 Baostock（服务端拒绝后一段时间内不重试）
+            skip_baostock = _bs_server_reject and aggressive_switch
+
             # 尝试各个数据源
+            baostock_server_reject = False  # 初始化，避免未定义错误
             for source in current_source_order:
+                # 如果之前 Baostock 被服务端拒绝，跳过它直接尝试 AkShare
+                if source == 'baostock' and skip_baostock:
+                    continue
+
                 if source == 'baostock' and BAOSTOCK_AVAILABLE and use_baostock_fallback:
                     logger.info(f"{code} 尝试从 Baostock 获取...")
                     df_bs = fetch_from_baostock(code, start_date, end_date, adjust)
                     if df_bs is not None and not df_bs.empty and len(df_bs) > 0:
                         logger.info(f"✓ {code} Baostock 成功获取 {len(df_bs)} 条记录")
                         rate_limiter.record_success()
+                        _bs_server_reject = False  # 重置拒绝标记
                         return df_bs
 
-                    # Baostock 失败，快速切换
+                    # 检测到 Baostock 服务端拒绝（error_code != '0'）
+                    if len(df_bs) == 0:
+                        baostock_server_reject = True
+                        logger.warning(f"{code} Baostock 服务端拒绝 (错误码非0)")
+                        _bs_server_reject = True  # 设置全局标记，避免后续重试
+
+                    # Baostock 失败，快速切换到 AkShare
                     if aggressive_switch:
                         logger.warning(f"{code} Baostock 失败，启用快速切换...")
                         continue
@@ -1561,13 +1780,21 @@ def fetch_stock_history(code: str, start_date: str = None,
             ]
             is_network_error = any(kw in error_msg for kw in network_keywords)
 
-            status = rate_limiter.get_status()
-            logger.warning(
-                f"{code} 获取失败 (尝试 {attempt+1}/{max_retries}): {error_type}: {error_msg[:80]}... "
-                f"[限流器: {status['mode']}, delay={status['current_delay']:.1f}s]"
-            )
+            # 检测 Baostock 服务端拒绝（error_code != '0' 返回空 DataFrame 导致）
+            is_server_reject = (baostock_server_reject or
+                              ('网络接收错误' in error_msg) or
+                              ('Baostock 查询失败' in error_msg))
 
-            if is_anti_bot_error:
+            status = rate_limiter.get_status()
+
+            if is_server_reject:
+                # 服务端拒绝：大幅增加等待时间，跳过 Baostock 切换到 AkShare
+                logger.warning(f"{code} Baostock 服务端限流，等待 {status['current_delay']:.1f}s 后尝试 AkShare...")
+                _bs_server_reject = True  # 设置全局标记
+                # 立即切换到 AkShare，不再重试 Baostock
+                rate_limiter.wait()  # 等待后再试
+                continue
+            elif is_anti_bot_error:
                 # 反爬虫错误，快速切换到 Baostock
                 if aggressive_switch and prefer_baostock:
                     logger.warning(f"{code} 反爬虫错误，快速切换数据源...")
@@ -1586,7 +1813,354 @@ def fetch_stock_history(code: str, start_date: str = None,
     # 所有重试都失败
     status = rate_limiter.get_status()
     logger.error(f"✗ {code} 最终无法获取数据 [限流器: {status['mode']}, delay={status['current_delay']:.1f}s]")
+    # 更新断点：失败
+    update_checkpoint(code, success=False, error_msg=f"所有重试失败: {status['mode']}",
+                    cache_exists=os.path.exists(get_cache_path(code, data_dir)))
     return pd.DataFrame()
+
+
+# ==================== 历史数据季度分区存储 ====================
+
+def get_history_dir(data_dir: str = "./data") -> str:
+    """获取历史数据目录路径"""
+    history_dir = os.path.join(data_dir, "history")
+    os.makedirs(history_dir, exist_ok=True)
+    return history_dir
+
+
+def get_quarter_file(date: datetime, data_dir: str = "./data") -> str:
+    """
+    根据日期获取对应的季度文件路径
+
+    参数:
+        date: 日期（datetime 或类似类型）
+        data_dir: 数据目录
+
+    返回:
+        季度文件路径，如 'data/history/2025_Q2.parquet'
+    """
+    history_dir = get_history_dir(data_dir)
+    year = date.year
+    month = date.month
+
+    # 确定季度
+    if 1 <= month <= 3:
+        quarter = 1
+    elif 4 <= month <= 6:
+        quarter = 2
+    elif 7 <= month <= 9:
+        quarter = 3
+    else:
+        quarter = 4
+
+    return os.path.join(history_dir, f"{year}_Q{quarter}.parquet")
+
+
+def get_quarter_from_date(date) -> Tuple[int, int]:
+    """根据日期获取 (year, quarter)"""
+    if isinstance(date, str):
+        date = pd.to_datetime(date)
+    year = date.year
+    month = date.month
+    if 1 <= month <= 3:
+        quarter = 1
+    elif 4 <= month <= 6:
+        quarter = 2
+    elif 7 <= month <= 9:
+        quarter = 3
+    else:
+        quarter = 4
+    return year, quarter
+
+
+def save_quarter_history(df: pd.DataFrame, data_dir: str = "./data",
+                         compression: str = 'snappy') -> bool:
+    """
+    将数据写入对应季度文件（追加模式，自动去重）
+
+    参数:
+        df: 包含 date, code, open, high, low, close, volume, amount 列的 DataFrame
+        data_dir: 数据目录
+        compression: 压缩算法，默认 snappy
+
+    返回:
+        是否成功
+    """
+    if df is None or df.empty:
+        return False
+
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # 添加年份和季度列用于分组
+    df['year'] = df['date'].dt.year
+    df['month'] = df['date'].dt.month
+    df['quarter'] = ((df['month'] - 1) // 3) + 1
+
+    # 按日期分组写入对应季度文件
+    for (year, quarter), group in df.groupby(['year', 'quarter']):
+        quarter_file = os.path.join(get_history_dir(data_dir), f"{year}_Q{quarter}.parquet")
+
+        # 读取现有数据（如果存在）
+        existing_df = pd.DataFrame()
+        if os.path.exists(quarter_file):
+            try:
+                existing_df = pd.read_parquet(quarter_file)
+            except Exception as e:
+                logger.warning(f"读取季度文件失败 {quarter_file}: {e}")
+
+        # 合并并去重
+        combined = pd.concat([existing_df, group], ignore_index=True)
+        combined = combined.drop_duplicates(subset=['date', 'code'], keep='last')
+
+        # 确保列顺序一致
+        required_cols = ['date', 'code', 'open', 'high', 'low', 'close', 'volume', 'amount']
+        combined = combined[[c for c in required_cols if c in combined.columns]]
+
+        # 写入文件
+        try:
+            combined.to_parquet(
+                quarter_file,
+                index=False,
+                engine='pyarrow',
+                compression=compression,
+            )
+            logger.debug(f"写入 {quarter_file}，共 {len(combined)} 条记录")
+        except Exception as e:
+            logger.error(f"写入季度文件失败 {quarter_file}: {e}")
+            return False
+
+    return True
+
+
+def load_quarter_history(codes: List[str] = None,
+                        start_date: str = None,
+                        end_date: str = None,
+                        data_dir: str = "./data") -> pd.DataFrame:
+    """
+    从季度文件加载历史数据
+
+    参数:
+        codes: 股票代码列表，None 表示所有股票
+        start_date: 开始日期（YYYYMMDD 或 YYYY-MM-DD）
+        end_date: 结束日期（YYYYMMDD 或 YYYY-MM-DD）
+        data_dir: 数据目录
+
+    返回:
+        合并后的 DataFrame
+    """
+    history_dir = get_history_dir(data_dir)
+
+    # 转换日期格式
+    if start_date and len(start_date) == 8:
+        start_date = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+    if end_date and len(end_date) == 8:
+        end_date = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+
+    start_dt = pd.to_datetime(start_date) if start_date else None
+    end_dt = pd.to_datetime(end_date) if end_date else None
+
+    # 读取所有季度文件
+    all_dfs = []
+    if os.path.exists(history_dir):
+        for f in os.listdir(history_dir):
+            if f.endswith('.parquet'):
+                try:
+                    df = pd.read_parquet(os.path.join(history_dir, f))
+                    all_dfs.append(df)
+                except Exception as e:
+                    logger.warning(f"读取文件失败 {f}: {e}")
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    # 合并所有数据
+    df = pd.concat(all_dfs, ignore_index=True)
+    df['date'] = pd.to_datetime(df['date'])
+
+    # 按代码过滤
+    if codes:
+        df = df[df['code'].isin(codes)]
+
+    # 按日期过滤
+    if start_dt:
+        df = df[df['date'] >= start_dt]
+    if end_dt:
+        df = df[df['date'] <= end_dt]
+
+    # 去重
+    df = df.drop_duplicates(subset=['date', 'code'], keep='last')
+
+    return df.sort_values('date').reset_index(drop=True)
+
+
+# ==================== 实时行情内存缓存 ====================
+
+class RealtimeSpotCache:
+    """实时行情内存缓存（内存安全版，支持主备切换）"""
+
+    def __init__(self, max_stocks: int = 100):
+        """
+        参数:
+            max_stocks: 最多缓存的股票数量（只关心候选股票）
+        """
+        self._cache: Dict[str, Dict] = {}
+        self._max_stocks = max_stocks
+        self._last_update: datetime = datetime.now()
+        self._primary = 'akshare'
+        self._sources = ['akshare', 'baostock']
+        self._update_count = 0
+
+    def update_batch(self, df: pd.DataFrame):
+        """批量更新行情"""
+        if df is None or df.empty:
+            return
+
+        # 只保留需要的列，减少内存占用
+        cols = ['code', 'price', 'turnover', 'volume', 'pct_change']
+        df = df[[c for c in cols if c in df.columns]].copy()
+
+        # 按成交额排序，只保留 top N 只股票
+        if len(df) > self._max_stocks:
+            df = df.nlargest(self._max_stocks, 'turnover')
+
+        # 更新缓存（原地更新，不创建新对象）
+        for _, row in df.iterrows():
+            self._cache[row['code']] = row.to_dict()
+
+        self._last_update = datetime.now()
+        self._update_count += 1
+
+    def get_spot(self, code: str) -> Optional[Dict]:
+        """获取单只股票实时行情"""
+        return self._cache.get(code)
+
+    def save_snapshot(self, path: str):
+        """收盘后保存快照到文件"""
+        if not self._cache:
+            return
+        pd.DataFrame.from_dict(self._cache, orient='index').to_parquet(path)
+
+    def get_last_update(self) -> datetime:
+        """获取最后更新时间"""
+        return self._last_update
+
+    def get_update_count(self) -> int:
+        """获取更新次数"""
+        return self._update_count
+
+
+# 全局实时行情缓存实例
+_realtime_spot_cache: Optional[RealtimeSpotCache] = None
+
+
+def get_realtime_spot_cache(max_stocks: int = 100) -> RealtimeSpotCache:
+    """获取全局实时行情缓存实例"""
+    global _realtime_spot_cache
+    if _realtime_spot_cache is None:
+        _realtime_spot_cache = RealtimeSpotCache(max_stocks=max_stocks)
+    return _realtime_spot_cache
+
+
+def fetch_spot_data_akshare(codes: List[str] = None) -> pd.DataFrame:
+    """从 AkShare 获取实时行情"""
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+
+        # 列名映射
+        df = df.rename(columns={
+            '代码': 'code',
+            '名称': 'name',
+            '最新价': 'price',
+            '成交额': 'turnover',
+            '涨跌幅': 'pct_change',
+            '成交量': 'volume',
+        })
+
+        # 格式化代码
+        df['code'] = df['代码'] + '.' + df['名称'].apply(
+            lambda x: 'SH' if str(x).startswith(('6', '5')) else 'SZ'
+        )
+
+        # 只保留需要的列
+        cols = ['code', 'price', 'turnover', 'volume', 'pct_change']
+        df = df[[c for c in cols if c in df.columns]]
+
+        # 按代码过滤
+        if codes:
+            df = df[df['code'].isin(codes)]
+
+        return df
+    except Exception as e:
+        logger.warning(f"AkShare 实时行情获取失败: {e}")
+        return pd.DataFrame()
+
+
+def fetch_spot_data_baostock(codes: List[str] = None) -> pd.DataFrame:
+    """从 Baostock 获取实时行情（有限支持）"""
+    global _bs_logged_in
+    if not BAOSTOCK_AVAILABLE:
+        return pd.DataFrame()
+
+    _ensure_baostock_login()
+
+    try:
+        # Baostock 批量查询有限制，这里简化处理
+        import baostock as bs
+        rs = bs.query_history_k_data_plus(
+            'sh.600000',
+            'date,code,open,high,low,close,volume,amount',
+            start_date=datetime.now().strftime('%Y-%m-%d'),
+            end_date=datetime.now().strftime('%Y-%m-%d'),
+            frequency='d'
+        )
+
+        if rs is None or rs.error_code != '0':
+            return pd.DataFrame()
+
+        data = []
+        while rs.next():
+            data.append(rs.get_row_data())
+
+        return pd.DataFrame(data, columns=rs.fields)
+    except Exception as e:
+        logger.warning(f"Baostock 实时行情获取失败: {e}")
+        return pd.DataFrame()
+
+
+def update_realtime_spot(codes: List[str] = None) -> bool:
+    """
+    更新实时行情（主备切换模式）
+
+    返回:
+        是否成功更新
+    """
+    cache = get_realtime_spot_cache()
+
+    # 尝试主数据源
+    if cache._primary == 'akshare':
+        df = fetch_spot_data_akshare(codes)
+        if df is not None and not df.empty:
+            cache.update_batch(df)
+            return True
+
+        # 主源失败，切换到备用
+        cache._primary = 'baostock'
+        df = fetch_spot_data_baostock(codes)
+        if df is not None and not df.empty:
+            cache.update_batch(df)
+            cache._primary = 'akshare'  # 恢复
+            return True
+    else:
+        df = fetch_spot_data_baostock(codes)
+        if df is not None and not df.empty:
+            cache.update_batch(df)
+            return True
+
+        cache._primary = 'akshare'
+
+    return False
 
 
 # ==================== 数据缓存 ====================
@@ -1682,6 +2256,11 @@ def get_stock_data(code: str, data_dir: str = "./data",
     # 保存到缓存
     if len(df) > 0:
         save_to_cache(df, cache_path)
+
+        # 同时写入季度文件
+        df_with_code = df.copy()
+        df_with_code['code'] = code
+        save_quarter_history(df_with_code, data_dir)
 
         # 更新元数据（全量模式）
         last_date = df['date'].max().strftime('%Y-%m-%d')

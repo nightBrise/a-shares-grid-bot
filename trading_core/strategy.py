@@ -19,7 +19,8 @@ except ImportError:
 from data_layer.fetcher import (
     get_stock_data, clean_data, calculate_atr, calculate_hurst_exponent,
     align_to_trading_day, get_next_trading_day, get_trade_calendar,
-    pre_filter_stocks_fast, get_thread_rate_limiter
+    pre_filter_stocks_fast, get_thread_rate_limiter,
+    load_candidate_stocks, save_candidate_stocks
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -118,6 +119,14 @@ def _fetch_single_stock_data(args: Tuple) -> Tuple[str, pd.DataFrame, str]:
         # 网络不稳定时优先使用缓存，避免重试等待
         df = get_stock_data(code, data_dir=data_dir, force_full=force_full,
                            enable_incremental=False, use_cache=True, fallback_to_cache=True)
+
+        # 即使缓存命中，也写入季度文件（本地IO，不触发限流）
+        if len(df) > 0:
+            from data_layer.fetcher import save_quarter_history
+            df_with_code = df.copy()
+            df_with_code['code'] = code
+            save_quarter_history(df_with_code, data_dir)
+
         return (code, df, "success")
     except Exception as e:
         logger.debug(f"{code} 获取失败: {e}")
@@ -160,7 +169,7 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     adv_cfg = config.get('advanced_screening', {})
 
     # 获取全市场股票列表
-    from data import get_all_a_stocks, get_stock_data, get_stocks_basic_info_batch
+    from data_layer.fetcher import get_all_a_stocks, get_stock_data, get_stocks_basic_info_batch
 
     df_all_stocks = get_all_a_stocks()
 
@@ -173,37 +182,95 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
     logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票")
 
-    # === 获取批量行情并按成交额排序 ===
+    # === 动态调整预过滤参数 ===
     pre_filter_cfg = config.get('pre_filter', {})
-    top_n_by_turnover = pre_filter_cfg.get('top_n_by_turnover', 200)
+    auto_adjust = pre_filter_cfg.get('auto_adjust', False)
 
-    df_spot = get_stocks_basic_info_batch()
+    if auto_adjust:
+        capital = config.get('capital', {}).get('total', 1000000)
+        grid_amount = config.get('grid_amount', 10000)
+        selection_cfg = config.get('selection', {})
 
-    if not df_spot.empty:
-        # 合并全市场列表和行情数据
-        df_merged = df_all_stocks.merge(df_spot[['code', 'price', 'turnover', 'is_st']], on='code', how='left')
+        # 新公式：每格金额 × 3层 × 50%预留 = 单股最小占用
+        # scoring_pool_size = clamp(资金量 × 0.5 / (每格金额 × 3), 3, 20)
+        per_stock_min = grid_amount * 3 * 0.5  # 单股最小占用（预留50%资金）
+        scoring_pool_size = max(3, min(20, int(capital * 0.5 / per_stock_min)))
 
-        # 按成交额降序排序，取 top N
-        df_merged = df_merged.sort_values('turnover', ascending=False)
-        top_n_list = df_merged['code'].head(top_n_by_turnover).tolist()
-        logger.info(f"按成交额排序后取 Top {top_n_by_turnover} 只候选")
+        # 预过滤上限 = 多因子候选数 × 3，最多 30 只
+        max_candidates = min(30, scoring_pool_size * 3)
 
-        # 预过滤：按用户配置的成交额/价格/ST 条件过滤
-        if pre_filter_cfg.get('enabled', True):
-            logger.info("执行预过滤阶段...")
-            stock_list = pre_filter_stocks_fast(top_n_list, config)
-        else:
-            stock_list = top_n_list
+        # 最低成交额联动：每格金额 × 50（确保日成交额能容纳每格交易量50倍）
+        dynamic_min_turnover = max(grid_amount * 50, 5000)  # 万元
+
+        # 更新配置（临时生效，不影响原文件）
+        pre_filter_cfg = pre_filter_cfg.copy()
+        pre_filter_cfg['max_candidates'] = max_candidates
+        pre_filter_cfg['min_turnover'] = dynamic_min_turnover
+        selection_cfg = selection_cfg.copy()
+        selection_cfg['scoring_pool_size'] = scoring_pool_size
+
+        config['selection'] = selection_cfg
+        logger.info(f"预过滤参数已动态调整: 资金量={capital/10000:.0f}万, 每格={grid_amount}元, "
+                   f"单股最小占用={per_stock_min:.0f}元, 最低成交额={dynamic_min_turnover/10000:.1f}亿, "
+                   f"预过滤上限={max_candidates}只, 多因子候选={scoring_pool_size}只")
+
+    # 先检查候选股票缓存是否存在且未过期
+    cached = load_candidate_stocks()
+    if cached is not None:
+        stock_list = cached['stocks']
+        logger.info(f"使用候选股票缓存: {len(stock_list)} 只 (缓存日期: {cached['date']})")
+
+        # 直接进入并行获取数据阶段
+        if not stock_list:
+            logger.error("候选股票列表为空")
+            return pd.DataFrame()
+
+        # 应用候选数量上限
+        max_candidates = pre_filter_cfg.get('max_candidates', 30)
+        if len(stock_list) > max_candidates:
+            stock_list = stock_list[:max_candidates]
+            logger.info(f"候选股票数量已限制为 {max_candidates} 只")
+
+        logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
     else:
-        # Fallback：无法获取行情时，按代码顺序
-        stock_list = df_all_stocks['code'].head(top_n_by_turnover).tolist()
-        logger.warning(f"无法获取批量行情，使用代码顺序候选 {len(stock_list)} 只")
+        # 无缓存，执行全市场获取流程
+        top_n_by_turnover = pre_filter_cfg.get('top_n_by_turnover', 200)
+        df_spot = get_stocks_basic_info_batch()
 
-    if not stock_list:
-        logger.error("预过滤后无候选股票，请检查过滤条件是否过严")
-        return pd.DataFrame()
+        if not df_spot.empty:
+            # 合并全市场列表和行情数据
+            df_merged = df_all_stocks.merge(df_spot[['code', 'price', 'turnover', 'is_st']], on='code', how='left')
 
-    logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
+            # 按成交额降序排序，取 top N
+            df_merged = df_merged.sort_values('turnover', ascending=False)
+            top_n_list = df_merged['code'].head(top_n_by_turnover).tolist()
+            logger.info(f"按成交额排序后取 Top {top_n_by_turnover} 只候选")
+
+            # 预过滤：按用户配置的成交额/价格/ST 条件过滤
+            if pre_filter_cfg.get('enabled', True):
+                logger.info("执行预过滤阶段...")
+                stock_list = pre_filter_stocks_fast(top_n_list, config)
+            else:
+                stock_list = top_n_list
+        else:
+            # Fallback：无法获取行情时，按代码顺序
+            stock_list = df_all_stocks['code'].head(top_n_by_turnover).tolist()
+            logger.warning(f"无法获取批量行情，使用代码顺序候选 {len(stock_list)} 只")
+
+        if not stock_list:
+            logger.error("预过滤后无候选股票，请检查过滤条件是否过严")
+            return pd.DataFrame()
+
+        logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
+
+        # 应用候选数量上限
+        max_candidates = pre_filter_cfg.get('max_candidates', 30)
+        if len(stock_list) > max_candidates:
+            stock_list = stock_list[:max_candidates]
+            logger.info(f"候选股票数量已限制为 {max_candidates} 只")
+
+        # 保存候选股票列表缓存
+        save_candidate_stocks(stock_list)
 
     # 计算每只股票的因子指标
     stocks_factors = []
@@ -412,7 +479,7 @@ def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict)
                 f"动态计算最优股票数量: {save_top_n} 只")
     
     # 读取原始配置文件
-    config_path = "config.yaml"
+    config_path = os.path.join(os.path.dirname(__file__), '..', 'configuration', 'config.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         config_lines = f.readlines()
     
@@ -2039,7 +2106,7 @@ def build_universe_with_wf(config: dict, wf_window: WalkForwardWindow) -> pd.Dat
     paths_cfg = config.get('paths', {})
     
     # 获取全市场股票列表
-    from data import get_all_a_stocks, prepare_selection_data
+    from data_layer.fetcher import get_all_a_stocks, prepare_selection_data
     
     df_all_stocks = get_all_a_stocks()
     
