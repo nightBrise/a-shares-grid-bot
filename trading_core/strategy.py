@@ -420,11 +420,12 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             f"{row['reason']} | 网格:{params.get('spacing_coef', 'N/A')}×ATR"
         )
 
-    # 保存选股结果
+    # 生成 Markdown 选股结果报告
     output_dir = paths_cfg['output_dir']
-    result_file = os.path.join(output_dir, "stock_selection_advanced.csv")
-    df_result.to_csv(result_file, index=False, encoding='utf-8-sig')
-    logger.info(f"\n高级多因子选股结果已保存到：{result_file}")
+    report_date = datetime.now().strftime('%Y%m%d')
+    report_file = os.path.join(output_dir, f"选股结果报告_{report_date}.md")
+
+    _generate_markdown_report(stocks_factors, df_result, report_file)
 
     # 自动更新配置文件
     if auto_update_config and len(df_result) > 0:
@@ -459,6 +460,153 @@ def calculate_optimal_stock_count(config: dict) -> int:
 
     count = int(available_capital / min_per_stock)
     return max(1, min(count, 20))
+
+
+def _generate_markdown_report(pre_filter_stocks: List[Dict], df_result: pd.DataFrame, output_path: str):
+    """
+    生成 Markdown 格式的选股结果报告
+
+    参数:
+        pre_filter_stocks: 预过滤后的股票列表（含因子数据）
+        df_result: 多因子筛选后的结果 DataFrame
+        output_path: 输出文件路径
+    """
+    from data_layer.fetcher import get_stocks_basic_info_batch
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    lines = []
+
+    # 获取股票中文名称
+    codes = [s['code'] for s in pre_filter_stocks]
+    stock_names = {}
+    # 已知股票名称映射（候选股列表）
+    KNOWN_NAMES = {
+        '000001.SZ': '平安银行',
+        '000063.SZ': '中兴通讯',
+        '000066.SZ': '中国长城',
+        '000100.SZ': 'TCL科技',
+        '000333.SZ': '美的集团',
+        '000338.SZ': '潍柴动力',
+        '000425.SZ': '徐工机械',
+        '000651.SZ': '格力电器',
+        '002001.SZ': '新和成',
+        '002714.SZ': '牧原股份',
+        '300015.SZ': '爱尔眼科',
+    }
+    stock_names = {c: KNOWN_NAMES.get(c, c) for c in codes}
+
+    # 标题
+    lines.append("# A股网格交易系统 - 选股结果报告\n")
+    lines.append(f"**生成日期**: {today}\n")
+    lines.append(f"**选股模式**: 高级多因子横截面打分\n")
+    lines.append("")
+
+    # 一、预过滤结果
+    lines.append("## 一、预过滤结果\n")
+    lines.append("")
+    lines.append("| 股票代码 | 股票名称 | 最新价 | 日均成交额(万) | 是否ST |\n")
+    lines.append("|---------|---------|--------|----------------|--------|\n")
+    for s in pre_filter_stocks:
+        code = s['code']
+        name = stock_names.get(code, code)
+        price = s.get('price', 0)
+        turnover = s.get('avg_turnover', 0)
+        is_st = "是" if s.get('is_st', False) else "否"
+        lines.append(f"| {code} | {name} | {price:.2f} | {turnover:,.0f} | {is_st} |\n")
+    lines.append("")
+    lines.append(f"共 **{len(pre_filter_stocks)}** 只股票通过预过滤门槛\n")
+    lines.append("")
+
+    # 二、多因子评分结果
+    lines.append("## 二、多因子评分结果\n")
+    lines.append("")
+    lines.append("### 2.1 评分因子说明\n")
+    lines.append("")
+    lines.append("| 因子 | 名称 | 计算方法 | 含义 |\n")
+    lines.append("|------|------|----------|------|\n")
+    lines.append("| F1 | Reversion_Speed | OU半衰期 | 均值回归速度，τ越短越好（τ<7天为噪声） |\n")
+    lines.append("| F2 | Trend_Strength | ADX | 趋势强度，ADX<25表示弱趋势，适合网格交易 |\n")
+    lines.append("| F3 | Vol_Quality | 波动质量 | 倒U型函数，σ=0.25最优 |\n")
+    lines.append("| F4 | Path_Memory | Variance Ratio | 路径记忆，越小越稳定（残差分形结构） |\n")
+    lines.append("")
+
+    # 质量阈值
+    threshold = df_result.iloc[0]['score_percentile'] if len(df_result) > 0 else 0
+    threshold_val = df_result.iloc[0].get('passes_threshold', True)
+    lines.append(f"**动态质量阈值**: {threshold:.1f}%百分位  |  **通过阈值股票数**: {df_result['passes_threshold'].sum() if 'passes_threshold' in df_result.columns else 'N/A'}\n")
+    lines.append("")
+
+    lines.append("### 2.2 评分结果\n")
+    lines.append("")
+    lines.append("| 排名 | 代码 | 股票名称 | 总分 | F1 | F2 | F3 | F4 | 通过阈值 |\n")
+    lines.append("|------|------|---------|------|----|----|----|----|----------|\n")
+
+    for _, row in df_result.iterrows():
+        code = row['code']
+        name = stock_names.get(code, code)
+        total = row.get('total_score', 0)
+        f1 = row.get('F1_norm', 0)
+        f2 = row.get('F2_norm', 0)
+        f3 = row.get('F3_norm', 0)
+        f4 = row.get('F4_ortho', 0)
+        passes = "✓" if row.get('passes_threshold', False) else "✗"
+        lines.append(f"| {int(row['rank'])} | {code} | {name} | {total:.4f} | {f1:.2f} | {f2:.2f} | {f3:.2f} | {f4:.2f} | {passes} |\n")
+    lines.append("")
+
+    # 三、Top 3 股票详情
+    lines.append("## 三、Top 3 股票详情\n")
+    lines.append("")
+    for _, row in df_result.head(3).iterrows():
+        code = row['code']
+        name = stock_names.get(code, code)
+        total = row.get('total_score', 0)
+        f1 = row.get('F1_norm', 0)
+        f2 = row.get('F2_norm', 0)
+        f3 = row.get('F3_norm', 0)
+        f4 = row.get('F4_ortho', 0)
+        params = row.get('grid_params', {})
+        passes = "通过" if row.get('passes_threshold', False) else "未通过"
+
+        lines.append(f"### {int(row['rank'])}. {code}（{name}）\n")
+        lines.append("")
+        lines.append(f"- **总分**: {total:.4f}\n")
+        lines.append(f"- **因子得分**: F1={f1:.2f}, F2={f2:.2f}, F3={f3:.2f}, F4={f4:.2f}\n")
+        lines.append(f"- **网格参数**: spacing_coef={params.get('spacing_coef', 'N/A')}, position_pct={params.get('position_pct', 0)*100 if params.get('position_pct') else 0:.1f}%\n")
+        lines.append(f"- **阈值判定**: {passes}\n")
+
+        # 核心优势说明
+        adx_val = row.get('adx', 0)
+        vol = row.get('volatility_60d', 0)
+        ou_hl = row.get('ou_half_life', 0)
+        adv = []
+        if adx_val < 20:
+            adv.append(f"ADX={adx_val:.1f}（极弱趋势）")
+        if vol and 0.15 <= vol <= 0.35:
+            adv.append(f"波动率适配极佳({vol:.1%})")
+        if ou_hl and ou_hl < 30:
+            adv.append(f"OU半衰期={ou_hl:.0f}天（快速回归）")
+        if adv:
+            lines.append(f"- **核心优势**: {', '.join(adv)}\n")
+        lines.append("")
+
+    # 四、下一阶段
+    lines.append("## 四、下一阶段\n")
+    lines.append("")
+    lines.append("可运行优化模式进行两阶段参数优化：\n")
+    lines.append("```bash\n")
+    lines.append("python main.py --mode optimize\n")
+    lines.append("```\n")
+    lines.append("")
+    lines.append("或直接生成交易信号：\n")
+    lines.append("```bash\n")
+    lines.append("python main.py --mode signal\n")
+    lines.append("```\n")
+
+    # 写入文件
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+    logger.info(f"选股结果报告已保存到：{output_path}")
 
 
 def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict):
