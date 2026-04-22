@@ -1,4 +1,4 @@
-# 项目结构说明 - A 股网格交易系统 v1.3.1
+# 项目结构说明 - A 股网格交易系统 v1.5.0
 
 ## 完整目录结构
 
@@ -41,7 +41,8 @@ auto_grid_trading_system/
 ├── 📂 output/                   # 输出目录（运行时自动生成）
 │   ├── signals.csv              # 交易信号
 │   ├── stock_selection.csv      # 选股结果
-│   └── report.json              # 优化报告
+│   ├── report.json              # 优化报告（JSON）
+│   └── 优化参数报告_{date}.md    # 优化参数解释报告
 │
 ├── 📂 docs/                     # 文档
 │   ├── project_structure.md     # 本文件：项目结构说明
@@ -99,6 +100,8 @@ def run_selection(config) -> pd.DataFrame
 def run_two_phase_optimization(config) -> Dict
 def generate_signals(config) -> pd.DataFrame
 def backtest_grid_strategy(df, ...) -> Dict
+def _optimize_single_stock_worker(...) -> dict   # 并行 worker 线程函数
+def _generate_optimization_markdown_report(...)    # Markdown 报告生成
 ```
 
 ### 3. data_layer/fetcher.py - 数据管理
@@ -257,7 +260,7 @@ class HTTPSessionManager:
 
 **主要章节**:
 ```yaml
-version: "1.3.1"           # 系统版本
+version: "1.5.0"           # 系统版本
 mode: select               # 运行模式
 stocks: [...]              # 股票池
 grid:                      # 网格参数
@@ -278,7 +281,7 @@ logging:                   # 日志配置
 **结构**:
 ```json
 {
-  "version": "1.3.1",
+  "version": "1.5.0",
   "selection_status": {
     "completed": true,
     "last_selection_date": "2026-04-20",
@@ -323,8 +326,11 @@ Phase 2 (WF微调):
   - 目标：在未见数据上验证并微调
 ```
 
+**并行化**: 多只股票同时执行 Phase1 + Phase2（ThreadPoolExecutor），通过 `parallel_optimization.enabled` 配置开关
+
 **输出**:
 - `output/report.json`
+- `output/优化参数报告_{date}.md`
 
 ### 3. signal - 信号模式
 
@@ -408,7 +414,8 @@ main.py
 | 全量数据下载 | ~5 秒 | 首次运行 |
 | 增量数据更新 | ~0.5 秒 | 第二次及以后 |
 | 选股计算 | ~2 秒 | 包含 Hurst 指数 |
-| 两阶段优化 | ~60 秒 | Phase1 + Phase2 |
+| 两阶段优化（串行） | ~60 秒 | Phase1 + Phase2 |
+| 两阶段优化（并行 N 只） | ~60/N 秒 | ThreadPoolExecutor 并行 |
 
 ## 扩展开发指南
 
@@ -452,5 +459,5 @@ def your_function(config: dict):
 
 ---
 
-**Last Updated**: 2026-04-20
-**Version**: v1.3.1
+**Last Updated**: 2026-04-22
+**Version**: v1.5.0

@@ -1,10 +1,30 @@
 # 版本发布说明
 
-当前版本：**v1.4.1** (2026-04-20) ⚠️ 测试版
+当前版本：**v1.5.0** (2026-04-22) ⚠️ 测试版
 
 **模块状态**：
 - ✅ 选股模块 - 已稳定运行
 - ✅ 网格参数计算模块 - 已完成
+
+---
+
+## v1.5.0 (2026-04-22) - 并行优化与 Markdown 报告
+
+### 核心改进
+
+#### 并行优化
+- 新增 `_optimize_single_stock_worker` 线程函数，多只股票同时执行 Phase1+Phase2
+- ThreadPoolExecutor 管理 worker，避免线程间 DataFrame 共享引用（通过 pickle 序列化）
+- 可通过 `parallel_optimization.enabled: false` 禁用并行回退串行
+
+#### Markdown 优化报告
+- 新增 `_generate_optimization_markdown_report`：生成可读参数解释报告
+- 输出 `output/优化参数报告_{date}.md`，包含参数解释、稳定性分析、风险提示
+
+#### 数据层 Bug 修复
+- `align_to_trading_day`：修复日期精度与日历不匹配导致的 searchsorted 错误
+- 增量更新跳过耗时自动补全（仅记录警告），提升数据更新速度
+- `fetch_stock_history` 失败时正确设置 `cache_exists=False`
 
 ---
 

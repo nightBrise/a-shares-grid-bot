@@ -94,6 +94,13 @@ T = 当前日期
 ```
 **严格禁止未来数据泄露** - 所有数据切片必须仅使用该时间点之前的数据。
 
+### 并行优化
+
+- 多只股票同时执行 Phase1 + Phase2（ThreadPoolExecutor）
+- 主线程完成数据准备，worker 线程执行 Optuna 优化
+- 通过 pickle 序列化 DataFrame 切片避免线程间共享引用
+- 可通过 `parallel_optimization.enabled: false` 禁用并行回退串行
+
 ## 关键实现
 
 ### 多因子选股模型（四因子正交化）
@@ -150,5 +157,7 @@ T = 当前日期
 ## 输出文件
 
 - `output/signals.csv` - 交易信号
-- `output/report.json` - 优化报告
+- `output/report.json` - 优化报告（JSON 格式）
+- `output/优化参数报告_{date}.md` - 优化参数解释报告（Markdown 格式）
 - `output/stock_selection.csv` - 选股结果
+- `output/选股结果报告_{date}.md` - 选股结果报告（Markdown 格式）

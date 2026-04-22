@@ -77,10 +77,11 @@ df_oos = wf_window.slice_dataframe_by_period(df, period='oos')
 ## 输出文件
 
 ```
-output/report.json
+output/report.json              # 优化报告（JSON 格式）
+output/优化参数报告_{date}.md    # 优化参数解释报告（Markdown 格式）
 ```
 
-结构：
+**report.json 结构**：
 ```json
 {
   "optimization_date": "2026-04-20 10:00:00",
@@ -173,5 +174,5 @@ score = Calmar
 
 ---
 
-**Last Updated**: 2026-04-20
-**Version**: v1.3.1
+**Last Updated**: 2026-04-22
+**Version**: v1.5.0

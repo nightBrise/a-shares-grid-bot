@@ -398,12 +398,16 @@ def align_to_trading_day(date, direction: str = 'forward'):
         date: 要对齐的日期
         direction: 'forward'=向前找下一个交易日，'backward'=向后找上一个交易日
     """
+    calendar = get_trade_calendar()
+
     if isinstance(date, str):
         date = pd.to_datetime(date)
     elif isinstance(date, datetime):
         date = pd.Timestamp(date)
 
-    calendar = get_trade_calendar()
+    # 转换为与日历相同的精度，避免 searchsorted 时单元不匹配
+    date = date.as_unit(calendar.unit, round_ok=True)
+
     if date in calendar:
         return date
 
@@ -1493,11 +1497,10 @@ def incremental_update(code: str, data_dir: str = "./data",
             update_checkpoint(code, success=True, last_date=last_date,
                             cache_exists=os.path.exists(cache_path))
 
-            # 检查完整性
+            # 检查完整性（仅当日志用，不触发耗时补全）
             is_complete, missing = check_data_integrity(df_full, code)
             if not is_complete and missing:
-                logger.info(f"{code} 检测到 {len(missing)} 个缺失日期，尝试补全...")
-                backfill_missing_data(code, missing, data_dir, adjust)
+                logger.warning(f"{code} 检测到 {len(missing)} 个缺失日期，跳过补全")
         
         return df_full if not df_full.empty else pd.DataFrame()
     
@@ -1536,28 +1539,18 @@ def incremental_update(code: str, data_dir: str = "./data",
             # 添加 code 列并写入季度文件
             df_updated['code'] = code
             save_quarter_history(df_updated, data_dir)
-            
-            # === 步骤 5: 检查完整性 ===
+
+            # === 步骤 5: 检查完整性（仅当日志用，不触发耗时补全）===
             is_complete, missing = check_data_integrity(df_updated, code)
-            
             if not is_complete and missing:
-                logger.info(f"{code} 检测到 {len(missing)} 个缺失日期，自动补全...")
-                backfill_success = backfill_missing_data(code, missing, data_dir, adjust)
-                
-                if backfill_success:
-                    # 重新加载完整数据
-                    df_updated = load_from_cache(cache_path)
-                    is_complete, missing = check_data_integrity(df_updated, code)
-                    
-                    if not is_complete:
-                        logger.warning(f"{code} 补全后仍有 {len(missing)} 个缺失日期")
-            
+                logger.warning(f"{code} 检测到 {len(missing)} 个缺失日期，已缓存数据覆盖优化周期，跳过补全")
+
             # === 步骤 6: 更新元数据 ===
             last_date = df_updated['date'].max().strftime('%Y-%m-%d')
             update_stock_metadata(
-                code, 
-                last_date, 
-                len(df_updated), 
+                code,
+                last_date,
+                len(df_updated),
                 data_dir,
                 update_mode='incremental',
                 incremental_days=(today - last_update_date).days,
@@ -1815,7 +1808,7 @@ def fetch_stock_history(code: str, start_date: str = None,
     logger.error(f"✗ {code} 最终无法获取数据 [限流器: {status['mode']}, delay={status['current_delay']:.1f}s]")
     # 更新断点：失败
     update_checkpoint(code, success=False, error_msg=f"所有重试失败: {status['mode']}",
-                    cache_exists=os.path.exists(get_cache_path(code, data_dir)))
+                    cache_exists=False)
     return pd.DataFrame()
 
 

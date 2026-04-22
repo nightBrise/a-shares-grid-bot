@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A 股网格交易系统 v1.3.1 - 主程序入口
+A 股网格交易系统 v1.5.0 - 主程序入口
 功能：统一调度选股、两阶段优化、信号生成三大模块
 
 使用方式:
@@ -17,7 +17,7 @@ import argparse
 from datetime import datetime
 
 # 定义版本号
-__version__ = "0.3.0"
+__version__ = "1.5.0"
 
 # 导入项目模块
 from utils.utils import load_config, load_state, save_state, setup_logging, send_notification, get_version

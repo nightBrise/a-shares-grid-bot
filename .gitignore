@@ -57,3 +57,4 @@ Thumbs.db
 
 # Optuna 研究存储
 optuna_study_*.db
+output/
