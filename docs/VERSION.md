@@ -1,10 +1,29 @@
 # 版本发布说明
 
-当前版本：**v1.5.0** (2026-04-22) ⚠️ 测试版
+当前版本：**v1.6.0** (2026-04-22) ⚠️ 测试版
 
 **模块状态**：
 - ✅ 选股模块 - 已稳定运行
 - ✅ 网格参数计算模块 - 已完成
+- ✅ RegimeFilter 全链路集成 - 新增
+
+---
+
+## v1.6.0 (2026-04-22) - RegimeFilter 全链路集成
+
+### 核心改进
+
+#### 市场状态感知
+- `run_two_phase_optimization` 中获取沪深300指数数据并调用 `RegimeFilter.check()`
+- 根据市场状态（normal/warning/soft_circuit_break）动态调整搜索空间
+- Phase1/Phase2 目标函数根据市场状态选择不同参数范围
+
+#### 信号生成增强
+- `generate_signals` 中增加市场状态检查
+- 买入信号通过熔断机制 + 市场状态双重检查
+
+#### Bug 修复
+- 修复 `RegimeFilter.check()` 中 `volume or pd.Series()` truthiness 错误
 
 ---
 

@@ -1,4 +1,4 @@
-# 配置文件详解 - A 股网格交易系统 v1.5.0
+# 配置文件详解 - A 股网格交易系统 v1.6.0
 
 ## 配置文件概览
 
@@ -21,7 +21,7 @@
 
 **内容结构**:
 ```yaml
-version: "1.0.0"              # 系统版本
+version: "1.5.0"              # 系统版本
 mode: select                  # 运行模式
 stocks: [...]                 # 示例股票池
 
@@ -78,14 +78,14 @@ python main.py
 **内容结构**:
 ```json
 {
-  "version": "1.0.0",
+  "version": "1.5.0",
 
   "selection_status": {
     "completed": false,
     "last_selection_date": "",
     "last_data_update_date": "",
     "selection_count": 0,
-    "strategy_version": "v1.0.0"
+    "strategy_version": "v1.5.0"
   },
 
   "runtime_state": {
@@ -255,4 +255,4 @@ output/log.txt
 ---
 
 **Last Updated**: 2026-04-22
-**Version**: v1.5.0
+**Version**: v1.6.0

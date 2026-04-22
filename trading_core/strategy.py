@@ -1,5 +1,5 @@
 """
-策略模块 - A 股网格交易系统 v4.0 (Lite 精简版)
+策略模块 - A 股网格交易系统 v1.6.0
 功能：选股、参数优化、信号生成 (核心大脑)
 """
 
@@ -642,7 +642,7 @@ def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict)
         f"  completed: true\n"
         f"  last_selection_date: \"{today_str}\"\n"
         f"  selection_count: {len(selected_stocks)}\n"
-        f"  version: \"v4.0\"\n"
+        f"  version: \"v1.6.0\"\n"
     )
     
     # 定位 stocks 段落和 selection_status 段落
@@ -967,7 +967,9 @@ def _optimize_single_stock_worker(
     ins_start: str,
     ins_end: str,
     oos_start: str,
-    oos_end: str
+    oos_end: str,
+    regime_state: str = 'normal',
+    regime_params: dict = None
 ) -> dict:
     """
     Worker 线程主函数：对单只股票执行完整两阶段优化（Phase1 贝叶斯 + Phase2 WF微调）
@@ -1007,17 +1009,28 @@ def _optimize_single_stock_worker(
         logger.info(f"[{code}] >>> Phase 1: 贝叶斯优化 (n_trials={n_trials})")
 
         def objective_phase1(trial):
+            # 根据市场状态动态调整搜索空间
+            if regime_state == 'soft_circuit_break':
+                spacing_range = [max(0.02, search_space['grid_spacing_range'][0]), min(0.04, search_space['grid_spacing_range'][1])]
+                max_grids_range = [3, 5]
+                ip_range = [0.20, 0.35]
+            elif regime_state == 'warning':
+                spacing_range = search_space['grid_spacing_range']
+                max_grids_range = [4, 7]
+                ip_range = [0.30, 0.40]
+            else:  # normal
+                spacing_range = search_space['grid_spacing_range']
+                max_grids_range = search_space['max_grids_range']
+                ip_range = search_space['initial_position_range']
+
             grid_spacing = trial.suggest_float(
-                'grid_spacing', search_space['grid_spacing_range'][0],
-                search_space['grid_spacing_range'][1], step=0.001)
+                'grid_spacing', spacing_range[0], spacing_range[1], step=0.001)
             grid_amount = trial.suggest_categorical(
                 'grid_amount', search_space['grid_amount_choices'])
             ip = trial.suggest_float(
-                'initial_position', search_space['initial_position_range'][0],
-                search_space['initial_position_range'][1], step=0.01)
+                'initial_position', ip_range[0], ip_range[1], step=0.01)
             max_g = trial.suggest_int(
-                'max_grids', search_space['max_grids_range'][0],
-                search_space['max_grids_range'][1])
+                'max_grids', max_grids_range[0], max_grids_range[1])
 
             result = backtest_grid_strategy(
                 df_ins,
@@ -1083,7 +1096,17 @@ def _optimize_single_stock_worker(
         # ========== Phase 2: WF微调 ==========
         logger.info(f"[{code}] >>> Phase 2: WF微调 (n_trials={phase2_trials})")
 
-        fine_tune_range = 0.10
+        # 根据市场状态调整微调范围
+        if regime_state == 'soft_circuit_break':
+            fine_tune_range = 0.05  # 更窄的搜索范围
+            max_grids_phase2 = min(phase1_params['max_grids'], 5)
+        elif regime_state == 'warning':
+            fine_tune_range = 0.08
+            max_grids_phase2 = min(phase1_params['max_grids'], 7)
+        else:  # normal
+            fine_tune_range = 0.10
+            max_grids_phase2 = phase1_params['max_grids']
+
         phase2_spacing_min = max(0.001, phase1_params['grid_spacing'] * (1 - fine_tune_range))
         phase2_spacing_max = phase1_params['grid_spacing'] * (1 + fine_tune_range)
         phase2_ip_min = max(0.20, phase1_params['initial_position'] * (1 - fine_tune_range))
@@ -1100,7 +1123,7 @@ def _optimize_single_stock_worker(
                 grid_spacing=grid_spacing,
                 grid_amount=phase1_params['grid_amount'],
                 initial_position=ip,
-                max_grids=phase1_params['max_grids'],
+                max_grids=max_grids_phase2,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
                 stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
                 slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
@@ -1110,7 +1133,7 @@ def _optimize_single_stock_worker(
             return calculate_composite_score(
                 result=result,
                 grid_spacing=grid_spacing,
-                max_grids=phase1_params['max_grids'],
+                max_grids=max_grids_phase2,
                 n_days=len(df_oos)
             )
 
@@ -1128,7 +1151,7 @@ def _optimize_single_stock_worker(
             'grid_spacing': study_phase2.best_params['grid_spacing'],
             'grid_amount': phase1_params['grid_amount'],
             'initial_position': study_phase2.best_params['initial_position'],
-            'max_grids': phase1_params['max_grids']
+            'max_grids': max_grids_phase2
         }
         final_score = study_phase2.best_value
 
@@ -1455,13 +1478,36 @@ def run_two_phase_optimization(config: dict) -> Dict:
 
     logger.info(f"Phase 1 (贝叶斯优化): {ins_start} 至 {ins_end}")
     logger.info(f"Phase 2 (WF微调): {oos_start} 至 {oos_end}")
-    logger.info("=" * 70)
 
     stocks = config.get('stocks', [])
     grid_cfg = config.get('grid', {})
     backtest_cfg = config.get('backtest', {})
     paths_cfg = config.get('paths', {})
     capital_cfg = config.get('capital', {})
+
+    # === 获取市场状态（RegimeFilter）===
+    from risk_management.market_regime import RegimeFilter
+    benchmark_code = config.get('regime_filter', {}).get('benchmark_index', '000300.SH')
+    benchmark_df = get_stock_data(benchmark_code, data_dir=paths_cfg.get('data_dir', './data'))
+
+    if not benchmark_df.empty:
+        benchmark_data = {
+            'close': benchmark_df['close'],
+            'high': benchmark_df.get('high', benchmark_df['close']),
+            'low': benchmark_df.get('low', benchmark_df['close']),
+            'volume': benchmark_df.get('volume', pd.Series())
+        }
+        regime_filter = RegimeFilter(config)
+        regime_result = regime_filter.check(benchmark_data)
+        regime_state = regime_result['state']
+        regime_params = regime_result['params']
+        logger.info(f"市场状态: {regime_state}, spacing={regime_params['grid_spacing_multiplier']:.1f}x, max_grids={regime_params['max_grids']}")
+    else:
+        regime_state = 'normal'
+        regime_params = {'grid_spacing_multiplier': 1.0, 'max_grids': 9, 'initial_position': 0.45}
+        logger.warning("无法获取基准指数数据，使用默认市场状态")
+
+    logger.info("=" * 70)
 
     if not stocks:
         logger.error("配置文件中未指定股票列表")
@@ -1558,7 +1604,9 @@ def run_two_phase_optimization(config: dict) -> Dict:
                     ins_start,
                     ins_end,
                     oos_start,
-                    oos_end
+                    oos_end,
+                    regime_state,
+                    regime_params
                 )
                 futures[future] = code
 
@@ -1621,17 +1669,28 @@ def run_two_phase_optimization(config: dict) -> Dict:
             logger.info("\n>>> Phase 1: 贝叶斯优化")
 
             def objective_phase1(trial):
+                # 根据市场状态动态调整搜索空间
+                if regime_state == 'soft_circuit_break':
+                    spacing_range = [max(0.02, search_space['grid_spacing_range'][0]), min(0.04, search_space['grid_spacing_range'][1])]
+                    max_grids_range = [3, 5]
+                    ip_range = [0.20, 0.35]
+                elif regime_state == 'warning':
+                    spacing_range = search_space['grid_spacing_range']
+                    max_grids_range = [4, 7]
+                    ip_range = [0.30, 0.40]
+                else:  # normal
+                    spacing_range = search_space['grid_spacing_range']
+                    max_grids_range = search_space['max_grids_range']
+                    ip_range = search_space['initial_position_range']
+
                 grid_spacing = trial.suggest_float('grid_spacing',
-                    search_space['grid_spacing_range'][0],
-                    search_space['grid_spacing_range'][1], step=0.001)
+                    spacing_range[0], spacing_range[1], step=0.001)
                 grid_amount = trial.suggest_categorical('grid_amount',
                     search_space['grid_amount_choices'])
                 ip = trial.suggest_float('initial_position',
-                    search_space['initial_position_range'][0],
-                    search_space['initial_position_range'][1], step=0.01)
+                    ip_range[0], ip_range[1], step=0.01)
                 max_g = trial.suggest_int('max_grids',
-                    search_space['max_grids_range'][0],
-                    search_space['max_grids_range'][1])
+                    max_grids_range[0], max_grids_range[1])
 
                 result = backtest_grid_strategy(
                     df_ins,
@@ -1705,8 +1764,17 @@ def run_two_phase_optimization(config: dict) -> Dict:
             # ========== Phase 2: WF微调 ==========
             logger.info("\n>>> Phase 2: WF微调")
 
-            # Phase 2 搜索空间：以 Phase 1 结果为中心 ±10%
-            fine_tune_range = 0.10
+            # 根据市场状态调整微调范围
+            if regime_state == 'soft_circuit_break':
+                fine_tune_range = 0.05  # 更窄的搜索范围
+                max_grids_phase2 = min(phase1_params['max_grids'], 5)
+            elif regime_state == 'warning':
+                fine_tune_range = 0.08
+                max_grids_phase2 = min(phase1_params['max_grids'], 7)
+            else:  # normal
+                fine_tune_range = 0.10
+                max_grids_phase2 = phase1_params['max_grids']
+
             phase2_spacing_min = max(0.001, phase1_params['grid_spacing'] * (1 - fine_tune_range))
             phase2_spacing_max = phase1_params['grid_spacing'] * (1 + fine_tune_range)
             phase2_ip_min = max(0.20, phase1_params['initial_position'] * (1 - fine_tune_range))
@@ -1719,7 +1787,6 @@ def run_two_phase_optimization(config: dict) -> Dict:
             def objective_phase2(trial):
                 grid_spacing = trial.suggest_float('grid_spacing',
                     phase2_spacing_min, phase2_spacing_max, step=0.0005)
-                # grid_amount 和 max_grids 保持 Phase 1 结果
                 ip = trial.suggest_float('initial_position',
                     phase2_ip_min, phase2_ip_max, step=0.005)
 
@@ -1728,7 +1795,7 @@ def run_two_phase_optimization(config: dict) -> Dict:
                     grid_spacing=grid_spacing,
                     grid_amount=phase1_params['grid_amount'],
                     initial_position=ip,
-                    max_grids=phase1_params['max_grids'],
+                    max_grids=max_grids_phase2,
                     commission_rate=backtest_cfg.get('commission_rate', 0.00015),
                     stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
                     slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
@@ -1738,7 +1805,7 @@ def run_two_phase_optimization(config: dict) -> Dict:
                 return calculate_composite_score(
                     result=result,
                     grid_spacing=grid_spacing,
-                    max_grids=phase1_params['max_grids'],
+                    max_grids=max_grids_phase2,
                     n_days=len(df_oos)
                 )
 
@@ -1756,7 +1823,7 @@ def run_two_phase_optimization(config: dict) -> Dict:
                 'grid_spacing': study_phase2.best_params['grid_spacing'],
                 'grid_amount': phase1_params['grid_amount'],
                 'initial_position': study_phase2.best_params['initial_position'],
-                'max_grids': phase1_params['max_grids']
+                'max_grids': max_grids_phase2
             }
             final_score = study_phase2.best_value
 
@@ -2328,8 +2395,28 @@ def generate_signals(config: dict) -> pd.DataFrame:
     
     if circuit_breaker_state.is_global_breaker:
         logger.error("🚨 全局熔断已触发！仅生成卖出信号，暂停所有买入")
-    
-    # === 步骤 4: 确定实盘交易股票 ===
+
+    # === 步骤 4.5: 市场状态检查 ===
+    from risk_management.market_regime import RegimeFilter
+    benchmark_code = config.get('regime_filter', {}).get('benchmark_index', '000300.SH')
+    benchmark_df = get_stock_data(benchmark_code, data_dir=paths_cfg.get('data_dir', './data'))
+
+    if not benchmark_df.empty:
+        benchmark_data = {
+            'close': benchmark_df['close'],
+            'high': benchmark_df.get('high', benchmark_df['close']),
+            'low': benchmark_df.get('low', benchmark_df['close']),
+            'volume': benchmark_df.get('volume', pd.Series())
+        }
+        regime_filter = RegimeFilter(config)
+        regime_result = regime_filter.check(benchmark_data)
+        regime_can_buy = regime_result['can_buy']
+        logger.info(f"市场状态: {regime_result['log_msg']}")
+    else:
+        regime_can_buy = True
+        logger.warning("无法获取基准指数数据，市场状态检查跳过")
+
+    # === 步骤 5: 确定实盘交易股票 ===
     # 从 config_state.json 读取 trading_stocks
     trading_stocks = state.get('trading_stocks', [])
 
@@ -2351,11 +2438,12 @@ def generate_signals(config: dict) -> pd.DataFrame:
         logger.info(f"处理股票：{code}")
         logger.info(f"{'-'*60}")
         
-        # 检查是否允许买入该股
-        allow_buy = risk_manager.should_allow_buy(code)
+        # 检查是否允许买入该股（熔断 + 市场状态双重检查）
+        allow_buy = risk_manager.should_allow_buy(code) and regime_can_buy
 
         if not allow_buy:
-            logger.warning(f"⚠️  {code} 触发熔断（全局或个股），跳过买入信号生成")
+            reason = '熔断' if not risk_manager.should_allow_buy(code) else '市场状态限制'
+            logger.warning(f"⚠️  {code} 不允许买入: {reason}")
 
         # 获取最新数据（仅对实盘交易股票执行增量更新获取实时数据）
         df = get_stock_data(code, data_dir=paths_cfg['data_dir'],

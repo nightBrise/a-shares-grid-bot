@@ -413,7 +413,7 @@ class RegimeFilter:
         volume_shrink_days = benchmark_data.get("volume_shrink_days", 0)
 
         if self.check_hard_stop_conditions(
-            index_return, limit_down_count, volume_shrink_days, volume or pd.Series()
+            index_return, limit_down_count, volume_shrink_days, volume if volume is not None else pd.Series()
         ):
             state = RegimeState.HARD_CIRCUIT_BREAK
             self._confirmed_state = state

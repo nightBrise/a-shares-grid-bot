@@ -1,5 +1,5 @@
 """
-工具模块 - A 股网格交易系统 v1.5.0
+工具模块 - A 股网格交易系统 v1.6.0
 功能：A 股风控、费用计算、日志、通知预留
 """
 
@@ -25,13 +25,13 @@ def load_state(state_path: str = "configuration/config_state.json") -> dict:
     if not os.path.exists(state_path):
         # 如果状态文件不存在，返回默认状态
         return {
-            "version": "1.0.0",
+            "version": "1.6.0",
             "selection_status": {
                 "completed": False,
                 "last_selection_date": "",
                 "last_data_update_date": "",
                 "selection_count": 0,
-                "strategy_version": "v1.0.0"
+                "strategy_version": "v1.6.0"
             },
             "runtime_state": {
                 "last_run_date": "",
