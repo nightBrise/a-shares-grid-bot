@@ -30,6 +30,14 @@ except ImportError:
     BAOSTOCK_AVAILABLE = False
     logger.warning("baostock 未安装，将仅使用 akshare 数据源")
 
+# 腾讯财经数据接口（第3备用数据源）
+try:
+    from data_layer.tencent_fetcher import fetch_from_tencent
+    TENCENT_AVAILABLE = True
+except ImportError:
+    TENCENT_AVAILABLE = False
+    logger.warning("腾讯财经模块未找到，将仅使用 akshare/baostock 数据源")
+
 
 logger = logging.getLogger("grid_trading")
 
@@ -1626,7 +1634,7 @@ def fetch_stock_history(code: str, start_date: str = None,
     - 自适应限流器（指数退避 + 成功后恢复）
     - 快速失败切换（aggressive_switch）
     - 优先 Baostock（更稳定）
-    - AkShare/Baostock 双数据源
+    - AkShare/Baostock/腾讯 三数据源互相备用
 
     参数:
         code: 股票代码 (格式：600519.SH)
@@ -1689,27 +1697,54 @@ def fetch_stock_history(code: str, start_date: str = None,
             return df[available_cols]
         return pd.DataFrame()
 
-    # 确定数据源顺序
+    def fetch_from_tencent_impl():
+        """从腾讯财经获取数据（第3备用源）"""
+        if not TENCENT_AVAILABLE:
+            return pd.DataFrame()
+
+        # 腾讯API使用 YYYY-MM-DD 格式日期
+        def fmt_date(d):
+            if len(d) == 8 and d.isdigit():
+                return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+            return d
+
+        t_start = fmt_date(start_date)
+        t_end = fmt_date(end_date)
+
+        df = fetch_from_tencent(code, start_date=t_start, end_date=t_end, adjust=adjust)
+
+        if df is not None and not df.empty and len(df) > 0:
+            # 腾讯API不提供成交额，用 close * volume 估算
+            if 'amount' not in df.columns and 'close' in df.columns and 'volume' in df.columns:
+                df['amount'] = df['close'] * df['volume']
+                logger.debug(f"{code} 腾讯数据缺少成交额，使用 close*volume 估算")
+
+            required_cols = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+            available_cols = [col for col in required_cols if col in df.columns]
+            return df[available_cols]
+        return pd.DataFrame()
+
+    # 确定数据源顺序（腾讯始终在最后作为兜底）
     if prefer_baostock:
-        source_order = ['baostock', 'akshare']
+        source_order = ['baostock', 'akshare', 'tencent']
     else:
-        source_order = ['akshare', 'baostock']
+        source_order = ['akshare', 'baostock', 'tencent']
 
     # 重试逻辑
     for attempt in range(max_retries):
         try:
-            # 每次重试都重新确定数据源顺序（基于 prefer_baostock，非修改后的 source_order）
-            # 这样确保反爬虫切换后，下次重试仍按原始偏好选择数据源
+            # 每次重试都重新确定数据源顺序（基于 prefer_baostock，腾讯始终在最后兜底）
             if prefer_baostock:
-                current_source_order = ['baostock', 'akshare']
+                current_source_order = ['baostock', 'akshare', 'tencent']
             else:
-                current_source_order = ['akshare', 'baostock']
+                current_source_order = ['akshare', 'baostock', 'tencent']
 
             # 请求前等待（使用自适应限流器）
             rate_limiter.wait()
 
             # 尝试各个数据源
             baostock_server_reject = False  # 初始化，避免未定义错误
+            tencent_tried = False  # 标记是否已尝试腾讯
             for source in current_source_order:
                 # 每次迭代都重新检查 Baostock 跳过条件（避免跨 source 传递）
                 skip_baostock = _bs_server_reject and aggressive_switch
@@ -1748,6 +1783,15 @@ def fetch_stock_history(code: str, start_date: str = None,
                         logger.info(f"✓ {code} AkShare 成功获取 {len(df)} 条记录")
                         rate_limiter.record_success()
                         return df
+
+                elif source == 'tencent' and TENCENT_AVAILABLE:
+                    logger.info(f"{code} 尝试从腾讯财经获取...")
+                    tencent_tried = True
+                    df_t = fetch_from_tencent_impl()
+                    if df_t is not None and not df_t.empty and len(df_t) > 0:
+                        logger.info(f"✓ {code} 腾讯财经成功获取 {len(df_t)} 条记录")
+                        rate_limiter.record_success()
+                        return df_t
 
             # 所有源都失败，抛出异常
             raise Exception("所有数据源均未返回有效数据")
