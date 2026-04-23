@@ -1708,14 +1708,15 @@ def fetch_stock_history(code: str, start_date: str = None,
             # 请求前等待（使用自适应限流器）
             rate_limiter.wait()
 
-            # 检查是否应该跳过 Baostock（服务端拒绝后一段时间内不重试）
-            skip_baostock = _bs_server_reject and aggressive_switch
-
             # 尝试各个数据源
             baostock_server_reject = False  # 初始化，避免未定义错误
             for source in current_source_order:
+                # 每次迭代都重新检查 Baostock 跳过条件（避免跨 source 传递）
+                skip_baostock = _bs_server_reject and aggressive_switch
+
                 # 如果之前 Baostock 被服务端拒绝，跳过它直接尝试 AkShare
                 if source == 'baostock' and skip_baostock:
+                    logger.debug(f"{code} 跳过 Baostock (服务端拒绝标记)")
                     continue
 
                 if source == 'baostock' and BAOSTOCK_AVAILABLE and use_baostock_fallback:
@@ -1731,11 +1732,13 @@ def fetch_stock_history(code: str, start_date: str = None,
                     if len(df_bs) == 0:
                         baostock_server_reject = True
                         logger.warning(f"{code} Baostock 服务端拒绝 (错误码非0)")
-                        _bs_server_reject = True  # 设置全局标记，避免后续重试
+                        # 标记仅在同一 attempt 内生效，避免跳过来自同一 attempt 的 AkShare
+                        _bs_server_reject = True
 
                     # Baostock 失败，快速切换到 AkShare
                     if aggressive_switch:
                         logger.warning(f"{code} Baostock 失败，启用快速切换...")
+                        baostock_server_reject = False  # 清除标记，避免异常处理误判
                         continue
 
                 elif source == 'akshare' and AKSHARE_AVAILABLE:
