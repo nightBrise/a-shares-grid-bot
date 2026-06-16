@@ -1,5 +1,5 @@
 """
-实盘熔断风控模块 - A 股网格交易系统 v1.6.0
+实盘熔断风控模块 - A 股网格交易系统 v2.0.0
 功能：
   - 实时监控持仓浮动盈亏
   - 监控总账户净值回撤
@@ -14,8 +14,10 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 from dataclasses import dataclass, asdict
+
+from trading_core.defaults import get_defaults
 
 logger = logging.getLogger("grid_trading")
 
@@ -95,16 +97,15 @@ class RiskControlManager:
             config: 配置字典（包含 risk_control 配置项）
         """
         self.config = config
-        self.enabled = config.get('risk_control', {}).get('enabled', True)
+
+        defaults = get_defaults()
+        rc_cfg = {**defaults.get("risk_control", {}), **config.get('risk_control', {})}
+
+        self.enabled = rc_cfg.get('enabled', True)
         
         # 风控阈值
-        self.single_stock_loss_threshold = config.get(
-            'risk_control', {}
-        ).get('single_stock_loss_threshold', 0.15)  # 15%
-        
-        self.max_drawdown_threshold = config.get(
-            'risk_control', {}
-        ).get('max_drawdown_threshold', 0.10)  # 10%
+        self.single_stock_loss_threshold = rc_cfg.get('single_stock_loss_threshold', 0.15)
+        self.max_drawdown_threshold = rc_cfg.get('max_drawdown_threshold', 0.10)
         
         # 熔断状态持久化文件
         self.state_file = config.get('paths', {}).get(
@@ -121,7 +122,7 @@ class RiskControlManager:
         )
         
         # 历史峰值（用于计算回撤）
-        self.peak_value = config.get('risk_control', {}).get('initial_peak', 1000000.0)
+        self.peak_value = rc_cfg.get('initial_peak', 1000000.0)
         
         # 加载历史状态
         self._load_state()
@@ -316,7 +317,7 @@ class RiskControlManager:
         self._save_state()
         
         # 输出检查结果
-        logger.info(f"熔断检查结果:")
+        logger.info("熔断检查结果:")
         logger.info(f"  全局熔断：{'是' if self.current_state.is_global_breaker else '否'}")
         logger.info(f"  个股熔断：{len(self.current_state.single_stock_breakers)}只")
         
@@ -468,7 +469,7 @@ def filter_signals_by_risk(signals_df, risk_state: CircuitBreakerState,
     返回:
         过滤后的信号 DataFrame
     """
-    import pandas as pd
+#     import pandas as pd
     
     if signals_df.empty:
         return signals_df
@@ -537,12 +538,12 @@ if __name__ == "__main__":
     # 构建账户状态
     account = rc.get_account_status(positions_data, cash=500000)
     
-    print(f"\n账户状态:")
+    print("\n账户状态:")
     print(f"  总市值：{account.total_value:,.2f}")
     print(f"  历史峰值：{account.peak_value:,.2f}")
     print(f"  当前回撤：{account.drawdown*100:.2f}%")
     
-    print(f"\n持仓明细:")
+    print("\n持仓明细:")
     for pos in account.positions:
         print(f"  {pos.code}: 成本={pos.cost_price:.2f}, 当前={pos.current_price:.2f}, "
               f"盈亏={pos.unrealized_pnl:.2f} ({pos.unrealized_pnl_pct*100:.2f}%)")
@@ -550,7 +551,7 @@ if __name__ == "__main__":
     # 执行熔断检查
     state = rc.check_circuit_breaker(account)
     
-    print(f"\n熔断状态:")
+    print("\n熔断状态:")
     print(f"  全局熔断：{state.is_global_breaker}")
     print(f"  个股熔断：{state.single_stock_breakers}")
     

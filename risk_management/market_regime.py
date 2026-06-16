@@ -15,9 +15,11 @@ regime_filter.py - 市场状态门控模块
 """
 
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+
+from trading_core.defaults import get_defaults
 
 import numpy as np
 import pandas as pd
@@ -92,7 +94,8 @@ class RegimeFilter:
         """
         self.config = config or {}
 
-        rf_cfg = self.config.get("regime_filter", {})
+        defaults = get_defaults()
+        rf_cfg = {**defaults.get("regime_filter", {}), **self.config.get("regime_filter", {})}
 
         # 基准指数
         self.benchmark_index = rf_cfg.get("benchmark_index", "000300.SH")
@@ -112,7 +115,7 @@ class RegimeFilter:
         self.confirm_days = rf_cfg.get("confirm_days", 2)
 
         # 硬底线触发条件
-        hard_cfg = rf_cfg.get("hard_stop", {})
+        hard_cfg = rf_cfg.get("hard_stop", {"index_drop_threshold": 0.05, "limit_down_count": 200, "volume_shrink_percentile": 0.10})
         self.hard_stop_index_drop = hard_cfg.get("index_drop_threshold", 0.05)
         self.hard_stop_limit_down_count = hard_cfg.get("limit_down_count", 200)
         self.hard_stop_volume_shrink_pct = hard_cfg.get("volume_shrink_percentile", 0.10)
@@ -175,46 +178,27 @@ class RegimeFilter:
         period: int = 14
     ) -> float:
         """
-        计算简化版ADX（基于价格通道宽度）。
+        ADX 计算 — 委托给 indicators.py 的标准 Wilder 平滑实现。
 
-        注意：这是近似ADX，用于市场状态判断。
-        真正的ADX计算在indicators.py中。
+        与选股流程共用同一套 Numba JIT 加速的 ADX 算法，
+        消除 rolling.mean 近似带来的系统性偏差。
 
         Parameters:
             high, low, close: 价格数据
             period: 计算周期
 
         Returns:
-            ADX近似值 [0, 100]
+            ADX 值 [0, 100]
         """
-        # 计算真实波幅
-        tr1 = high - low
-        tr2 = abs(high - close.shift(1))
-        tr3 = abs(low - close.shift(1))
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        from trading_core.indicators import calculate_adx as _std_adx
 
-        # DM计算
-        plus_dm = high.diff()
-        minus_dm = -low.diff()
+        tmp = pd.DataFrame({'high': high, 'low': low, 'close': close})
+        result = _std_adx(tmp, period=period)
 
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm < 0] = 0
+        if result.empty or result['adx'].dropna().empty:
+            return 25.0
 
-        # 平滑
-        atr = tr.rolling(period).mean()
-        plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-        minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
-
-        # DX
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-
-        # ADX
-        adx = dx.rolling(period).mean()
-
-        if adx.empty or pd.isna(adx.iloc[-1]):
-            return 25.0  # 默认中间值
-
-        return adx.iloc[-1]
+        return float(result['adx'].dropna().iloc[-1])
 
     def check_hard_stop_conditions(
         self,
@@ -495,3 +479,113 @@ class RegimeFilter:
         self._confirmed_state = RegimeState.NORMAL
         self._consecutive_days = 0
         logger.info("RegimeFilter 已重置")
+
+    # ------------------------------------------------------------------
+    # 状态持久化
+    # ------------------------------------------------------------------
+    def to_dict(self) -> dict:
+        """将 RegimeFilter 内部状态序列化为字典，用于持久化存储。"""
+        return {
+            "confirmed_state": self._confirmed_state.value,
+            "consecutive_days": self._consecutive_days,
+            "adx_history": self._adx_history.copy(),
+            "vol_pct_history": self._vol_pct_history.copy(),
+            "saved_at": pd.Timestamp.now().isoformat(),
+        }
+
+    def from_dict(self, data: dict) -> None:
+        """从字典恢复 RegimeFilter 内部状态。"""
+        if not data:
+            return
+        try:
+            self._confirmed_state = RegimeState(data.get("confirmed_state", "normal"))
+        except ValueError:
+            self._confirmed_state = RegimeState.NORMAL
+        self._consecutive_days = data.get("consecutive_days", 0)
+        self._adx_history = data.get("adx_history", []).copy()
+        self._vol_pct_history = data.get("vol_pct_history", []).copy()
+        logger.info(
+            f"RegimeFilter 状态已恢复: {self._confirmed_state.value}, "
+            f"连续{self._consecutive_days}天, 历史记录{len(self._adx_history)}条"
+        )
+
+    # ------------------------------------------------------------------
+    # 历史市场状态查询（用于回测/优化）
+    # ------------------------------------------------------------------
+    def check_historical(
+        self,
+        benchmark_data: dict,
+        as_of_date: pd.Timestamp = None,
+    ) -> dict:
+        """
+        检查指定历史日期的市场状态（跳过平滑和确认机制）。
+
+        与 check() 的区别：
+        - check() 面向实时信号，应用平滑+确认，并更新内部状态
+        - check_historical() 面向回测/优化，直接返回该日期的原始状态，不修改内部状态
+
+        Parameters:
+            benchmark_data: 宽基指数完整历史数据字典
+            as_of_date: 评估日期（默认使用最后一天）
+
+        Returns:
+            与 check() 格式相同的字典，但 state 字段为原始状态（未经确认）
+        """
+        close = benchmark_data.get("close")
+        if close is None or len(close) < 100:
+            logger.warning("RegimeFilter: 历史数据不足，使用默认正常区参数")
+            return self._default_response(RegimeState.NORMAL)
+
+        if as_of_date is None:
+            as_of_date = close.index[-1]
+
+        # 截取到 as_of_date 的数据（避免未来数据泄露）
+        close_hist = close[close.index <= as_of_date]
+        high_hist = benchmark_data.get("high", close)[close.index <= as_of_date]
+        low_hist = benchmark_data.get("low", close)[close.index <= as_of_date]
+
+        if len(close_hist) < 100:
+            return self._default_response(RegimeState.NORMAL)
+
+        # 计算该日期的波动率和分位数
+        vol_current, vol_pct = self.calculate_market_volatility(close_hist)
+
+        # 计算该日期的 ADX
+        adx = self.calculate_adx_approx(high_hist, low_hist, close_hist)
+
+        # 直接判断状态（不应用平滑和确认）
+        raw_state = self.determine_regime(adx, vol_pct)
+
+        params = self.regime_params.get(raw_state, self.regime_params[RegimeState.NORMAL])
+
+        state_desc = {
+            RegimeState.NORMAL: "正常区",
+            RegimeState.WARNING: "预警区",
+            RegimeState.SOFT_CIRCUIT_BREAK: "熔断区(软)",
+            RegimeState.HARD_CIRCUIT_BREAK: "熔断区(硬)",
+        }
+        log_msg = (
+            f"{state_desc[raw_state]} | "
+            f"ADX={adx:.1f}, 波动率={vol_current:.1%}, "
+            f"波动率分位={vol_pct:.0%} | "
+            f"max_position={params.max_position_per_stock:.0%}, "
+            f"spacing={params.grid_spacing_multiplier:.1f}x "
+            f"(日期: {as_of_date.strftime('%Y-%m-%d')})"
+        )
+        logger.info(f"历史市场状态: {log_msg}")
+
+        return {
+            "state": raw_state.value,
+            "params": {
+                "max_position_per_stock": params.max_position_per_stock,
+                "initial_position": params.initial_position,
+                "grid_spacing_multiplier": params.grid_spacing_multiplier,
+                "max_grids": params.max_grids,
+            },
+            "can_open_new": raw_state in (RegimeState.NORMAL,),
+            "can_buy": raw_state in (RegimeState.NORMAL, RegimeState.WARNING),
+            "log_msg": log_msg,
+            "adx": adx,
+            "vol_percentile": vol_pct,
+            "vol_current": vol_current,
+        }

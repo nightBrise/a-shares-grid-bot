@@ -1,0 +1,26 @@
+version: "2.0.0"
+
+# === 必填 ===
+capital:
+  total: 1000000
+  cash_reserve_ratio: 0.4
+
+risk:
+  max_drawdown_threshold: 0.1
+  single_stock_loss_threshold: 0.15
+  max_positions: 5
+
+# === 可选覆盖（注释掉则用系统默认值） ===
+# stock_pool: auto                   # auto=系统选股, manual=用户指定
+# manual_stocks: []                  # stock_pool=manual 时填写
+# sectors:
+#   exclude: ["银行", "地产"]         # 排除行业
+# rebalance_days: 90                 # 重新优化周期（天）
+# backtest:
+#   n_trials: 300                    # 优化算力
+# selection:
+#   min_price: 5.0
+#   max_price: 500.0
+# fees:
+#   commission_rate: 0.00015
+#   stamp_tax: 0.0005

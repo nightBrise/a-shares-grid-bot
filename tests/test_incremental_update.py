@@ -17,7 +17,7 @@
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+# # from datetime import datetime, timedelta
 
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,13 +57,13 @@ def test_incremental_update():
     
     if test_code in metadata:
         stock_meta = metadata[test_code]
-        print(f"  ✓ 已存在元数据:")
+        print("  ✓ 已存在元数据:")
         print(f"    - 最后更新日期：{stock_meta.get('last_update_date', 'N/A')}")
         print(f"    - 记录数：{stock_meta.get('record_count', 'N/A')}")
         print(f"    - 更新模式：{stock_meta.get('update_mode', 'N/A')}")
         print(f"    - 更新时间：{stock_meta.get('update_time', 'N/A')}")
     else:
-        print(f"  ⚠ 未找到元数据，首次运行将执行全量更新")
+        print("  ⚠ 未找到元数据，首次运行将执行全量更新")
     
     # === 步骤 2: 第一次运行（强制全量更新）===
     print("\n[步骤 2] 第一次运行：强制全量更新...")
@@ -77,17 +77,17 @@ def test_incremental_update():
     )
     
     if df1.empty:
-        print(f"\n✗ 获取数据失败，无法继续测试")
+        print("\n✗ 获取数据失败，无法继续测试")
         return False
     
-    print(f"\n✓ 全量更新完成:")
+    print("\n✓ 全量更新完成:")
     print(f"  - 数据形状：{df1.shape}")
     print(f"  - 日期范围：{df1['date'].min().strftime('%Y-%m-%d')} 至 {df1['date'].max().strftime('%Y-%m-%d')}")
     
     # 检查元数据是否已更新
     metadata = load_metadata(data_dir)
     if test_code in metadata:
-        print(f"  - 元数据已更新 ✓")
+        print("  - 元数据已更新 ✓")
     
     # === 步骤 3: 第二次运行（增量更新）===
     print("\n[步骤 3] 第二次运行：增量更新（关键测试）...")
@@ -102,10 +102,10 @@ def test_incremental_update():
     )
     
     if df2.empty:
-        print(f"\n✗ 增量更新失败")
+        print("\n✗ 增量更新失败")
         return False
     
-    print(f"\n✓ 增量更新完成:")
+    print("\n✓ 增量更新完成:")
     print(f"  - 数据形状：{df2.shape}")
     print(f"  - 日期范围：{df2['date'].min().strftime('%Y-%m-%d')} 至 {df2['date'].max().strftime('%Y-%m-%d')}")
     
@@ -115,7 +115,7 @@ def test_incremental_update():
     is_complete, missing_dates = check_data_integrity(df2, test_code)
     
     if is_complete:
-        print(f"  ✓ 数据完整性检查通过")
+        print("  ✓ 数据完整性检查通过")
     else:
         print(f"  ⚠ 发现 {len(missing_dates)} 个缺失日期:")
         if len(missing_dates) <= 10:
@@ -132,7 +132,7 @@ def test_incremental_update():
     metadata = load_metadata(data_dir)
     if test_code in metadata:
         stock_meta = metadata[test_code]
-        print(f"  元数据信息:")
+        print("  元数据信息:")
         for key, value in stock_meta.items():
             print(f"    {key}: {value}")
     
@@ -157,7 +157,7 @@ def test_incremental_update():
 def test_backfill():
     """测试数据补全功能"""
     
-    from data import backfill_missing_data, check_data_integrity
+    from data_layer.fetcher import backfill_missing_data, check_data_integrity
     
     test_code = "000858.SZ"  # 五粮液
     data_dir = "./data"
@@ -170,34 +170,34 @@ def test_backfill():
     df = get_stock_data(test_code, data_dir=data_dir, force_full=True)
     
     if df.empty:
-        print(f"\n✗ 获取数据失败")
+        print("\n✗ 获取数据失败")
         return False
     
     # 检查完整性
     is_complete, missing = check_data_integrity(df, test_code)
     
-    print(f"\n数据完整性检查结果:")
+    print("\n数据完整性检查结果:")
     print(f"  - 数据条数：{len(df)}")
     print(f"  - 是否完整：{'是' if is_complete else '否'}")
     print(f"  - 缺失日期数：{len(missing)}")
     
     if not is_complete and missing:
-        print(f"\n开始自动补全缺失数据...")
+        print("\n开始自动补全缺失数据...")
         success = backfill_missing_data(test_code, missing, data_dir)
         
         if success:
-            print(f"✓ 数据补全成功")
+            print("✓ 数据补全成功")
             
             # 重新检查
             df_updated = get_stock_data(test_code, data_dir=data_dir)
             is_complete_new, missing_new = check_data_integrity(df_updated, test_code)
             
-            print(f"\n补全后检查结果:")
+            print("\n补全后检查结果:")
             print(f"  - 新数据条数：{len(df_updated)}")
             print(f"  - 是否完整：{'是' if is_complete_new else '否'}")
             print(f"  - 剩余缺失日期数：{len(missing_new)}")
         else:
-            print(f"✗ 数据补全失败")
+            print("✗ 数据补全失败")
     
     print("\n" + "="*70)
     print("数据补全功能测试完成")

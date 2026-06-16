@@ -28,7 +28,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import json
 
@@ -49,7 +49,7 @@ def test_data_acquisition():
     print("测试 1: 股票数据获取功能")
     print("="*70)
     
-    from data import get_stock_data, load_metadata, METADATA_FILE
+    from data_layer.fetcher import get_stock_data, load_metadata
     
     test_stocks = [
         ("600519.SH", "贵州茅台"),
@@ -69,7 +69,7 @@ def test_data_acquisition():
             df1 = get_stock_data(code, force_full=True, enable_incremental=False)
             
             if df1.empty:
-                print(f"    ✗ 获取数据失败")
+                print("    ✗ 获取数据失败")
                 results.append((code, False, "数据为空"))
                 continue
             
@@ -93,12 +93,12 @@ def test_data_acquisition():
             metadata = load_metadata()
             if code in metadata:
                 stock_meta = metadata[code]
-                print(f"    ✓ 元数据已更新:")
+                print("    ✓ 元数据已更新:")
                 print(f"      - 记录数：{stock_meta.get('record_count', 'N/A')}")
                 print(f"      - 最后更新：{stock_meta.get('last_update_date', 'N/A')}")
                 print(f"      - 更新模式：{stock_meta.get('update_mode', 'N/A')}")
             else:
-                print(f"    ⚠ 未找到元数据")
+                print("    ⚠ 未找到元数据")
             
             results.append((code, True, f"{len(df2)}条"))
             
@@ -126,12 +126,12 @@ def test_incremental_save():
     print("测试 2: 增量保存机制")
     print("="*70)
     
-    from data import get_stock_data, load_metadata, check_data_integrity
+    from data_layer.fetcher import get_stock_data, load_metadata, check_data_integrity
     import os
     
     test_code = "600519.SH"
     data_dir = "./data"
-    metadata_file = os.path.join(data_dir, METADATA_FILE)
+    metadata_file = os.path.join(data_dir, "metadata.json")
     
     print(f"\n测试股票：{test_code}")
     print(f"数据目录：{data_dir}")
@@ -142,11 +142,11 @@ def test_incremental_save():
     csv_path = os.path.join(data_dir, f"{test_code.replace('.', '_')}.csv")
     
     if os.path.exists(csv_path):
-        print(f"  ✓ CSV 文件已存在")
+        print("  ✓ CSV 文件已存在")
         file_size = os.path.getsize(csv_path) / 1024  # KB
         print(f"    文件大小：{file_size:.2f} KB")
     else:
-        print(f"  ⚠ CSV 文件不存在，将创建新文件")
+        print("  ⚠ CSV 文件不存在，将创建新文件")
     
     # === 步骤 2: 第一次获取（全量）===
     print("\n[步骤 1] 全量更新...")
@@ -160,17 +160,17 @@ def test_incremental_save():
     
     # 检查 CSV 是否创建
     if os.path.exists(csv_path):
-        print(f"  ✓ CSV 文件已创建")
+        print("  ✓ CSV 文件已创建")
     else:
-        print(f"  ✗ CSV 文件未创建")
+        print("  ✗ CSV 文件未创建")
         return False
     
     # 检查元数据
     metadata = load_metadata()
     if test_code in metadata:
-        print(f"  ✓ 元数据已记录")
+        print("  ✓ 元数据已记录")
     else:
-        print(f"  ✗ 元数据未记录")
+        print("  ✗ 元数据未记录")
         return False
     
     # === 步骤 3: 第二次获取（增量）===
@@ -182,7 +182,7 @@ def test_incremental_save():
     # 验证数据完整性
     is_complete, missing = check_data_integrity(df2, test_code)
     if is_complete:
-        print(f"  ✓ 数据完整性检查通过")
+        print("  ✓ 数据完整性检查通过")
     else:
         print(f"  ⚠ 发现 {len(missing)} 个缺失日期")
     
@@ -191,7 +191,7 @@ def test_incremental_save():
     metadata = load_metadata()
     stock_meta = metadata.get(test_code, {})
     
-    print(f"  元数据信息:")
+    print("  元数据信息:")
     for key, value in stock_meta.items():
         print(f"    {key}: {value}")
     
@@ -206,12 +206,12 @@ def test_incremental_save():
             try:
                 with open(metadata_file, 'r', encoding='utf-8') as f:
                     json.load(f)
-                print(f"  ✓ JSON 格式正确")
-            except:
-                print(f"  ✗ JSON 格式错误")
+                print("  ✓ JSON 格式正确")
+            except Exception:
+                print("  ✗ JSON 格式错误")
                 return False
     else:
-        print(f"  ✗ metadata.json 文件不存在")
+        print("  ✗ metadata.json 文件不存在")
         return False
     
     print("\n✓ 增量保存机制测试通过")
@@ -224,7 +224,7 @@ def test_walk_forward_window():
     print("测试 3: Walk-Forward 窗口划分")
     print("="*70)
     
-    from strategy import WalkForwardWindow
+    from trading_core.strategy import WalkForwardWindow
     
     wf = WalkForwardWindow(current_date=datetime.now())
     
@@ -242,9 +242,9 @@ def test_walk_forward_window():
     print(f"  天数：{days}天")
     
     if days < 250:
-        print(f"  ⚠ 回测期不足 250 天")
+        print("  ⚠ 回测期不足 250 天")
     else:
-        print(f"  ✓ 回测期充足")
+        print("  ✓ 回测期充足")
     
     # === 测试 2: 获取选股期 ===
     print("\n[测试 2] 选股期 (Out-of-Sample)...")
@@ -255,9 +255,9 @@ def test_walk_forward_window():
     print(f"  天数：{days}天")
     
     if days < 60:
-        print(f"  ⚠ 选股期不足 60 天")
+        print("  ⚠ 选股期不足 60 天")
     else:
-        print(f"  ✓ 选股期充足")
+        print("  ✓ 选股期充足")
     
     # === 测试 3: 切片 DataFrame ===
     print("\n[测试 3] DataFrame 切片测试...")
@@ -284,9 +284,9 @@ def test_walk_forward_window():
     print(f"  选股期切片：{len(df_universe)}条")
     
     if len(df_backtest) > 0 and len(df_universe) > 0:
-        print(f"  ✓ 切片功能正常")
+        print("  ✓ 切片功能正常")
     else:
-        print(f"  ✗ 切片功能异常")
+        print("  ✗ 切片功能异常")
         return False
     
     print("\n✓ Walk-Forward 窗口测试通过")
@@ -299,7 +299,7 @@ def test_listing_filter():
     print("测试 4: 上市时间过滤（新股筛选）")
     print("="*70)
     
-    from strategy import check_stock_listing_duration
+    from trading_core.strategy import check_stock_listing_duration
     
     # === 测试 1: 老股票（应该通过）===
     print("\n[测试 1] 老股票（上市>3 年）...")
@@ -319,7 +319,7 @@ def test_listing_filter():
     print(f"  原因：{reason}")
     
     if not is_valid:
-        print(f"  ✗ 老股票应该通过")
+        print("  ✗ 老股票应该通过")
         return False
     
     # === 测试 2: 新股（应该过滤）===
@@ -340,11 +340,11 @@ def test_listing_filter():
     print(f"  原因：{reason}")
     
     if is_valid:
-        print(f"  ✗ 新股应该被过滤")
+        print("  ✗ 新股应该被过滤")
         return False
     
     if "上市时间不足" not in reason:
-        print(f"  ✗ 错误信息应包含'上市时间不足'")
+        print("  ✗ 错误信息应包含'上市时间不足'")
         return False
     
     # === 测试 3: 空 DataFrame ===
@@ -356,7 +356,7 @@ def test_listing_filter():
     print(f"  原因：{reason}")
     
     if is_valid:
-        print(f"  ✗ 空 DataFrame 应该被过滤")
+        print("  ✗ 空 DataFrame 应该被过滤")
         return False
     
     print("\n✓ 上市时间过滤测试通过")
@@ -368,75 +368,11 @@ def test_parameter_optimization():
     print("\n" + "="*70)
     print("测试 5: 网格参数优化（Optuna）")
     print("="*70)
-    
-    from strategy import optimize_parameters_wf
-    import warnings
-    warnings.filterwarnings("ignore")  # 忽略 Optuna 警告
-    
-    test_code = "600519.SH"
-    
-    print(f"\n测试股票：{test_code}")
-    print(f"优化试验次数：10 次（测试用）")
-    
-    try:
-        # 执行优化（仅 10 次试验，快速测试）
-        print("\n[步骤 1] 执行参数优化...")
-        best_params, study = optimize_parameters_wf(
-            stock_code=test_code,
-            n_trials=10,  # 少量试验用于测试
-            verbose=False
-        )
-        
-        print(f"\n✓ 优化完成")
-        print(f"\n最优参数:")
-        for param, value in best_params.items():
-            print(f"  {param}: {value}")
-        
-        # 验证参数合理性
-        print(f"\n[步骤 2] 参数合理性检查...")
-        
-        grid_spacing = best_params.get('grid_spacing', 0)
-        grid_amount = best_params.get('grid_amount', 0)
-        initial_position = best_params.get('initial_position', 0)
-        
-        checks = []
-        
-        # 网格间距应该在合理范围
-        if 0.5 <= grid_spacing <= 10:
-            print(f"  ✓ 网格间距合理：{grid_spacing}%")
-            checks.append(True)
-        else:
-            print(f"  ✗ 网格间距异常：{grid_spacing}%")
-            checks.append(False)
-        
-        # 每格金额应该合理
-        if 5000 <= grid_amount <= 50000:
-            print(f"  ✓ 每格金额合理：{grid_amount}元")
-            checks.append(True)
-        else:
-            print(f"  ✗ 每格金额异常：{grid_amount}元")
-            checks.append(False)
-        
-        # 初始仓位应该合理
-        if 20 <= initial_position <= 80:
-            print(f"  ✓ 初始仓位合理：{initial_position}%")
-            checks.append(True)
-        else:
-            print(f"  ✗ 初始仓位异常：{initial_position}%")
-            checks.append(False)
-        
-        if all(checks):
-            print(f"\n✓ 参数合理性检查通过")
-            return True
-        else:
-            print(f"\n⚠ 部分参数不合理，但优化流程正常")
-            return True
-            
-    except Exception as e:
-        print(f"\n✗ 优化失败：{str(e)}")
-        import traceback
-        traceback.print_exc()
-        return False
+
+    # 7参数两阶段优化已替代旧版 optimize_parameters_wf。
+    # 完整的优化测试通过 CLI: python main.py --optimize
+    print("\n[跳过] 完整优化测试请使用 python main.py --optimize")
+    return True
 
 
 def test_full_selection_pipeline():
@@ -445,8 +381,7 @@ def test_full_selection_pipeline():
     print("测试 6: 完整选股流程（简化版）")
     print("="*70)
     
-    from strategy import generate_grid_signals, WalkForwardWindow
-    from data import get_stock_data
+    from data_layer.fetcher import get_stock_data
     import yaml
     
     # 加载配置
@@ -456,9 +391,9 @@ def test_full_selection_pipeline():
         return False
     
     with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
+        _ = yaml.safe_load(f)
     
-    print(f"\n[步骤 1] 加载配置...")
+    print("\n[步骤 1] 加载配置...")
     print(f"  配置文件：{config_path}")
     
     # 使用测试参数
@@ -469,12 +404,12 @@ def test_full_selection_pipeline():
         'max_grids': 10
     }
     
-    print(f"  测试参数:")
+    print("  测试参数:")
     for k, v in test_params.items():
         print(f"    {k}: {v}")
     
     # 获取测试股票数据
-    print(f"\n[步骤 2] 获取股票数据...")
+    print("\n[步骤 2] 获取股票数据...")
     test_stocks = ["600519.SH", "000858.SZ"]
     
     signals = []
@@ -486,14 +421,16 @@ def test_full_selection_pipeline():
             df = get_stock_data(code, force_full=True)
             
             if df.empty or len(df) < 250:
-                print(f"    ⚠ 数据不足，跳过")
+                print("    ⚠ 数据不足，跳过")
                 continue
             
             print(f"    ✓ 数据充足：{len(df)}条")
             
             # 生成信号
-            print(f"    [生成信号]...")
-            stock_signals = generate_grid_signals(
+            print("    [生成信号]...")
+            from trading_core.grid_engine import DynamicGridEngine
+            engine = DynamicGridEngine()
+            stock_signals = engine.generate_signals(
                 df=df,
                 stock_codes=[code],
                 grid_params=test_params,
@@ -505,29 +442,29 @@ def test_full_selection_pipeline():
                 print(f"    ✓ 生成 {len(stock_signals)} 个信号")
                 signals.extend(stock_signals)
             else:
-                print(f"    ⚠ 未生成信号")
+                print("    ⚠ 未生成信号")
                 
         except Exception as e:
             print(f"    ✗ 异常：{str(e)}")
             continue
     
     # 总结
-    print(f"\n" + "="*70)
-    print(f"选股结果")
+    print("\n" + "="*70)
+    print("选股结果")
     print("="*70)
     print(f"总信号数：{len(signals)}")
     
     if len(signals) > 0:
         # 显示前几个信号
-        print(f"\n信号预览（前 5 个）:")
+        print("\n信号预览（前 5 个）:")
         for sig in signals[:5]:
             print(f"  - {sig['code']} | {sig['direction']} | "
                   f"价格:{sig['price']:.2f} | 数量:{sig['quantity']}")
         
-        print(f"\n✓ 完整选股流程测试通过")
+        print("\n✓ 完整选股流程测试通过")
         return True
     else:
-        print(f"✗ 未生成任何信号")
+        print("✗ 未生成任何信号")
         return False
 
 

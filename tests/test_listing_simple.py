@@ -25,7 +25,7 @@ def check_stock_listing_duration(code: str, df: pd.DataFrame,
     
     # 获取最早和最晚日期
     earliest_date = df['date'].min()
-    latest_date = df['date'].max()
+#     latest_date = df['date'].max()
     
     # 计算上市至今的天数
     days_since_listing = (datetime.now() - earliest_date).days

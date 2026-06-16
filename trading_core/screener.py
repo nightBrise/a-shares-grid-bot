@@ -10,475 +10,16 @@ screener.py - 多因子横截面打分选股器
 - 波动率适配 (15%): 中等波动最好
 """
 
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 import logging
 
 import numpy as np
 import pandas as pd
 
+from trading_core.defaults import get_defaults
+
 logger = logging.getLogger("grid_trading")
 
-
-# ==================== Default Configuration ====================
-
-DEFAULT_FACTOR_WEIGHTS = {
-    "ou_half_life": -0.35,  # 负: 偏好低值 (快速回归)
-    "hurst": -0.30,  # 负: 偏好低值 (均值回归)
-    "adx": -0.20,  # 负: 偏好低值 (趋势弱)
-    "volatility_fit": 0.15,  # 正: 偏好中等值
-}
-
-# 因子边界用于归一化 (横截面百分位)
-FACTOR_BOUNDS = {
-    "ou_half_life": (10, 60),  # 10-60 天范围
-    "hurst": (0.35, 0.55),  # 0.35-0.55 范围
-    "adx": (15, 30),  # 15-30 范围
-    "volatility": (0.15, 0.35),  # 15%-35% 年化波动率
-}
-
-
-# ==================== Data Classes ====================
-
-
-@dataclass
-class FactorScores:
-    """单个股票的因子得分容器。"""
-
-    ou_half_life_score: float
-    hurst_score: float
-    adx_score: float
-    volatility_fit_score: float
-    total_score: float
-    percentile_rank: float
-
-
-@dataclass
-class StockFactors:
-    """单只股票原始因子值容器。"""
-
-    code: str
-    hurst_60d: float
-    ou_half_life: float
-    adx: float
-    volatility_60d: float
-    avg_turnover: float  # 万元
-    price: float
-    is_st: bool = False
-
-
-# ==================== Multi-Factor Screener ====================
-
-
-class MultiFactorScreener:
-    """
-    多因子横截面选股器，用于网格交易标的筛选。
-
-    Scoring Model:
-    1. 初筛: 流动性、价格、ST 检查
-    2. 因子计算: 计算原始因子值
-    3. 横截面归一化: 在全市场中的百分位排名
-    4. 加权打分: 按配置权重组合因子
-
-    Weights (可配置):
-        - OU 半衰期: -35% (负 = 偏好低值)
-        - Hurst: -30% (负 = 偏好低值)
-        - ADX: -20% (负 = 偏好低值)
-        - 波动率适配: +15% (正 = 偏好中等值)
-
-    Output: 按排名排序的 Top N 股票列表，含因子分解
-    """
-
-    def __init__(self, config: Optional[dict] = None):
-        """
-        初始化选股器。
-
-        Parameters:
-            config: 配置字典，包含 factor_weights 和 initial_filters
-        """
-        self.config = config or {}
-
-        # 打分权重
-        self.weights = self.config.get("factor_weights", DEFAULT_FACTOR_WEIGHTS)
-
-        # 初筛阈值
-        self.min_turnover = self.config.get("min_turnover", 10000)  # 万元 (1亿)
-        self.min_price = self.config.get("min_price", 5.0)
-        self.max_price = self.config.get("max_price", 500.0)
-        self.max_stocks = self.config.get("max_stocks", 50)
-
-        # 验证权重和
-        total_weight = sum(abs(v) for v in self.weights.values())
-        if abs(total_weight - 1.0) > 0.01:
-            raise ValueError(f"因子权重必须绝对值和为 1.0，当前为 {total_weight}")
-
-        logger.info(
-            f"MultiFactorScreener 初始化: weights={self.weights}, "
-            f"min_turnover={self.min_turnover}万"
-        )
-
-    def initial_filter(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        应用初筛条件：流动性、价格、ST 过滤。
-
-        Filters:
-        1. 成交额 >= 1亿 (avg_turnover 单位: 万元)
-        2. 价格 [5, 500]
-        3. 非 ST (is_st == False 或 is_st 列不存在)
-
-        Parameters:
-            df: 包含 code, price, avg_turnover, is_st 列的 DataFrame
-
-        Returns:
-            过滤后的 DataFrame
-        """
-        if df.empty:
-            return df
-
-        n_before = len(df)
-
-        # 成交额过滤: >= 1亿 (10000万)
-        if "avg_turnover" in df.columns:
-            df = df[df["avg_turnover"] >= self.min_turnover].copy()
-        else:
-            logger.warning("avg_turnover 列不存在，跳过流动性过滤")
-
-        # 价格过滤
-        if "price" in df.columns:
-            df = df[
-                (df["price"] >= self.min_price) & (df["price"] <= self.max_price)
-            ].copy()
-
-        # ST 过滤 (如果 is_st 列存在)
-        if "is_st" in df.columns:
-            df = df[df["is_st"] == False].copy()
-
-        n_after = len(df)
-        logger.info(
-            f"初筛: {n_before} -> {n_after} 股票 "
-            f"(移除 {n_before - n_after} 只)"
-        )
-
-        return df
-
-    def _rescale(
-        self, series: pd.Series, low: float, high: float
-    ) -> pd.Series:
-        """
-        将 series 归一化到 [0, 1] 基于 low-high 边界。
-
-        边界外的值被限制到 0 或 1。
-        """
-        return ((series - low) / (high - low)).clip(0, 1)
-
-    def calculate_factor_scores(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        计算横截面归一化因子得分。
-
-        Process:
-        1. 对每个因子，计算在全市场的百分位排名
-        2. 基于配置边界重新缩放到 [0, 1]
-        3. 应用权重并求和得到总分
-
-        Parameters:
-            df: 包含因子列的 DataFrame: hurst_60d, ou_half_life, adx, volatility_60d
-
-        Returns:
-            添加了得分列的 DataFrame
-        """
-        if df.empty:
-            return df
-
-        result = df.copy()
-
-        # 处理 ou_half_life 中的无穷大 (替换为最大值的两倍)
-        if "ou_half_life" in result.columns:
-            finite_vals = result["ou_half_life"][np.isfinite(result["ou_half_life"])]
-            if len(finite_vals) > 0:
-                max_hl = finite_vals.max()
-                result["ou_half_life"] = result["ou_half_life"].replace(np.inf, max_hl * 2)
-            else:
-                result["ou_half_life"] = 100.0  # 默认值
-
-        # 百分位排名 (越高对负向因子越有利)
-        if "ou_half_life" in result.columns:
-            result["ou_hl_pct"] = result["ou_half_life"].rank(pct=True)
-        if "hurst_60d" in result.columns:
-            result["hurst_pct"] = result["hurst_60d"].rank(pct=True)
-        if "adx" in result.columns:
-            result["adx_pct"] = result["adx"].rank(pct=True)
-
-        # 波动率: 偏好中等 (离中位数越近越好)
-        if "volatility_60d" in result.columns:
-            vol_median = result["volatility_60d"].median()
-            result["vol_distance"] = abs(result["volatility_60d"] - vol_median)
-            result["vol_fit_pct"] = 1 - result["vol_distance"].rank(pct=True)
-
-        # 基于边界的归一化得分
-        # 对于负向因子: 低值 = 高分
-
-        # OU 半衰期得分
-        if "ou_half_life" in result.columns:
-            result["ou_score"] = 1 - self._rescale(
-                result["ou_half_life"],
-                FACTOR_BOUNDS["ou_half_life"][0],
-                FACTOR_BOUNDS["ou_half_life"][1],
-            )
-
-        # Hurst 得分
-        if "hurst_60d" in result.columns:
-            result["hurst_score"] = 1 - self._rescale(
-                result["hurst_60d"],
-                FACTOR_BOUNDS["hurst"][0],
-                FACTOR_BOUNDS["hurst"][1],
-            )
-
-        # ADX 得分
-        if "adx" in result.columns:
-            result["adx_score"] = 1 - self._rescale(
-                result["adx"],
-                FACTOR_BOUNDS["adx"][0],
-                FACTOR_BOUNDS["adx"][1],
-            )
-
-        # 波动率适配得分 (中等最好)
-        if "volatility_60d" in result.columns:
-            result["vol_score"] = self._rescale(
-                result["volatility_60d"],
-                FACTOR_BOUNDS["volatility"][0],
-                FACTOR_BOUNDS["volatility"][1],
-            )
-
-        # 加权总分
-        score_components = []
-        weight_components = []
-
-        if "ou_score" in result.columns and "ou_half_life" in self.weights:
-            score_components.append(self.weights["ou_half_life"] * result["ou_score"])
-            weight_components.append(abs(self.weights["ou_half_life"]))
-
-        if "hurst_score" in result.columns and "hurst" in self.weights:
-            score_components.append(self.weights["hurst"] * result["hurst_score"])
-            weight_components.append(abs(self.weights["hurst"]))
-
-        if "adx_score" in result.columns and "adx" in self.weights:
-            score_components.append(self.weights["adx"] * result["adx_score"])
-            weight_components.append(abs(self.weights["adx"]))
-
-        if "vol_score" in result.columns and "volatility_fit" in self.weights:
-            score_components.append(
-                self.weights["volatility_fit"] * result["vol_score"]
-            )
-            weight_components.append(abs(self.weights["volatility_fit"]))
-
-        if score_components:
-            total_weight_used = sum(weight_components)
-            if total_weight_used > 0:
-                result["total_score"] = sum(score_components) / total_weight_used
-            else:
-                result["total_score"] = 0.5
-        else:
-            result["total_score"] = 0.5
-
-        # 总体百分位排名
-        result["score_percentile"] = result["total_score"].rank(pct=True) * 100
-
-        return result
-
-    def rank_stocks(self, df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
-        """
-        按总分排名并返回 Top N。
-
-        Parameters:
-            df: 包含 total_score 列的 DataFrame
-            top_n: 返回的 Top N 股票数
-
-        Returns:
-            按 total_score 降序排列、限制为 top_n 的 DataFrame
-        """
-        if df.empty:
-            return df
-
-        df = df.sort_values("total_score", ascending=False)
-        df["rank"] = range(1, len(df) + 1)
-
-        # 添加得分分解列
-        score_cols = ["ou_score", "hurst_score", "adx_score", "vol_score"]
-        for col in score_cols:
-            if col not in df.columns:
-                df[col] = np.nan
-
-        # 返回 Top N
-        return df.head(top_n)
-
-    def screen(self, stocks_data: List[Dict], top_n: int = 20) -> pd.DataFrame:
-        """
-        主筛选函数：应用过滤器、打分、排名。
-
-        Parameters:
-            stocks_data: 股票因子字典列表，来自 indicators 模块
-            top_n: 返回的 Top N 股票数
-
-        Returns:
-            包含得分和排名的 Top N DataFrame，按 rank 排序
-
-        Example Input:
-            stocks_data = [
-                {
-                    'code': '600519.SH',
-                    'hurst_60d': 0.42,
-                    'ou_half_life': 12.5,
-                    'adx': 18.3,
-                    'volatility_60d': 0.22,
-                    'avg_turnover': 50000,
-                    'price': 1800.0,
-                    'is_st': False
-                },
-                ...
-            ]
-        """
-        # 转换为 DataFrame
-        df = pd.DataFrame(stocks_data)
-
-        if df.empty:
-            logger.warning("筛选数据为空")
-            return pd.DataFrame()
-
-        # Stage 1: 初筛
-        df = self.initial_filter(df)
-
-        if df.empty:
-            logger.warning("初筛后无股票")
-            return pd.DataFrame()
-
-        # Stage 2: 因子打分
-        df = self.calculate_factor_scores(df)
-
-        # Stage 3: 排名并选择 Top N
-        df = self.rank_stocks(df, top_n=top_n)
-
-        logger.info(
-            f"筛选完成: {len(df)}/{top_n} 只股票被选中"
-        )
-
-        return df
-
-    def get_factor_contributions(
-        self, df: pd.DataFrame, code: str
-    ) -> Optional[Dict]:
-        """
-        获取单只股票的因子贡献分解。
-
-        Parameters:
-            df: 包含得分列的 DataFrame
-            code: 股票代码
-
-        Returns:
-            因子贡献字典，如果股票不在结果中返回 None
-        """
-        stock_row = df[df["code"] == code]
-        if stock_row.empty:
-            return None
-
-        row = stock_row.iloc[0]
-
-        return {
-            "code": code,
-            "ou_half_life_contrib": row.get("ou_score", np.nan) * self.weights.get("ou_half_life", 0),
-            "hurst_contrib": row.get("hurst_score", np.nan) * self.weights.get("hurst", 0),
-            "adx_contrib": row.get("adx_score", np.nan) * self.weights.get("adx", 0),
-            "volatility_contrib": row.get("vol_score", np.nan) * self.weights.get("volatility_fit", 0),
-            "total_score": row.get("total_score", np.nan),
-            "rank": row.get("rank", np.nan),
-        }
-
-
-# ==================== Batch Screening for Universe ====================
-
-
-def screen_universe(
-    df_universe: pd.DataFrame,
-    config: dict,
-    top_n: int = 20,
-) -> pd.DataFrame:
-    """
-    使用多因子模型对全市场股票进行筛选。
-
-    此函数设计为从 strategy.py 的选股逻辑调用。
-
-    Parameters:
-        df_universe: 包含所有股票因子数据的 DataFrame
-        config: 配置字典
-        top_n: 返回的 Top N 股票数
-
-    Returns:
-        包含得分和排名的 Top N DataFrame
-    """
-    logger.info(f"使用多因子模型筛选 {len(df_universe)} 只股票...")
-
-    # 初始化选股器
-    screening_config = config.get("screening", {})
-    screener = MultiFactorScreener(screening_config)
-
-    # 准备股票数据
-    stocks_data = []
-    for _, row in df_universe.iterrows():
-        stock_dict = {
-            "code": row.get("code", ""),
-            "hurst_60d": row.get("hurst_60d", 0.5),
-            "ou_half_life": row.get("ou_half_life", np.inf),
-            "adx": row.get("adx", 50.0),
-            "volatility_60d": row.get("volatility_60d", 0.3),
-            "avg_turnover": row.get("avg_turnover", 0),
-            "price": row.get("price", 0),
-            "is_st": row.get("is_st", False),
-        }
-        stocks_data.append(stock_dict)
-
-    # 筛选
-    result = screener.screen(stocks_data, top_n=top_n)
-
-    logger.info(f"筛选完成: {len(result)} 只股票被选中")
-
-    return result
-
-
-def create_screening_report(df_result: pd.DataFrame) -> str:
-    """
-    创建筛选报告摘要。
-
-    Parameters:
-        df_result: screen() 输出的 DataFrame
-
-    Returns:
-        格式化的报告字符串
-    """
-    if df_result.empty:
-        return "无股票符合筛选条件"
-
-    lines = []
-    lines.append("=" * 60)
-    lines.append("多因子筛选报告")
-    lines.append("=" * 60)
-    lines.append(f"选中股票数: {len(df_result)}")
-    lines.append("")
-
-    for _, row in df_result.head(10).iterrows():
-        lines.append(
-            f"#{int(row['rank']):2d} {row['code']:<12s} "
-            f"总分: {row['total_score']:.4f} "
-            f"(Hurst:{row.get('hurst_score', 0):.2f} "
-            f"OU:{row.get('ou_score', 0):.2f} "
-            f"ADX:{row.get('adx_score', 0):.2f} "
-            f"Vol:{row.get('vol_score', 0):.2f})"
-        )
-
-    if len(df_result) > 10:
-        lines.append(f"... 还有 {len(df_result) - 10} 只股票")
-
-    lines.append("=" * 60)
-
-    return "\n".join(lines)
 
 
 # ==================== Advanced Multi-Factor Screener (v2) ====================
@@ -524,12 +65,14 @@ class AdvancedMultiFactorScreener:
             config: 配置字典，包含 advanced_screening 配置
         """
         self.config = config or {}
-        adv_cfg = self.config.get("advanced_screening", {})
+
+        defaults = get_defaults()
+        adv_cfg = {**defaults.get("advanced_screening", {}), **self.config.get("advanced_screening", {})}
 
         # 权重配置
         weights_cfg = adv_cfg.get("weights", {})
-        self.etf_weights = weights_cfg.get("etf", self.DEFAULT_ETF_WEIGHTS)
-        self.stock_weights = weights_cfg.get("stock", self.DEFAULT_STOCK_WEIGHTS)
+        self.etf_weights = weights_cfg.get("etf", {"F1": 0.35, "F2": 0.15, "F3": 0.30, "F4": 0.20})
+        self.stock_weights = weights_cfg.get("stock", {"F1": 0.25, "F2": 0.35, "F3": 0.20, "F4": 0.20})
 
         # 阈值配置
         self.quality_threshold = adv_cfg.get("quality_threshold", 0.65)
@@ -538,13 +81,12 @@ class AdvancedMultiFactorScreener:
         self.cash_buffer_ratio = adv_cfg.get("cash_buffer_ratio", 0.50)
 
         # 波动质量参数
-        vol_cfg = adv_cfg.get("vol_quality", {})
+        vol_cfg = adv_cfg.get("vol_quality", {"optimal_vol": 0.25, "tolerance": 0.15})
         self.vol_optimal = vol_cfg.get("optimal_vol", 0.25)
         self.vol_tolerance = vol_cfg.get("tolerance", 0.15)
 
         # Path Memory 参数
-        pm_cfg = adv_cfg.get("path_memory", {})
-        # q=5 对齐网格触发频率(3-10日)，捕捉短期反转特性
+        pm_cfg = adv_cfg.get("path_memory", {"variance_ratio_q": 5, "min_periods": 120})
         self.vr_q = pm_cfg.get("variance_ratio_q", 5)
         self.vr_min_periods = pm_cfg.get("min_periods", 120)
 
@@ -589,7 +131,7 @@ class AdvancedMultiFactorScreener:
             return pd.Series(0.5, index=series.index)
 
         # 保存原始索引
-        original_index = series.index
+#         original_index = series.index
 
         # 处理 NaN：先填充为中位数（保持排名结构）
         nan_mask = series.isna()
@@ -696,9 +238,11 @@ class AdvancedMultiFactorScreener:
 
         n_before = len(df)
 
-        # 成交额过滤: >= 1亿 (10000万)
+        # 成交额过滤 (从 config 读取阈值)
+        min_turnover = self.config.get('screening', {}).get(
+            'initial_filters', {}).get('min_turnover', 5000)
         if "avg_turnover" in df.columns:
-            df = df[df["avg_turnover"] >= 10000].copy()
+            df = df[df["avg_turnover"] >= min_turnover].copy()
         else:
             logger.warning("avg_turnover 列不存在，跳过流动性过滤")
 
@@ -710,7 +254,7 @@ class AdvancedMultiFactorScreener:
 
         # ST 过滤
         if "is_st" in df.columns:
-            df = df[df["is_st"] == False].copy()
+            df = df[~df["is_st"]].copy()
 
         logger.info(f"初筛: {n_before} -> {len(df)} 股票 (移除 {n_before - len(df)} 只)")
 
@@ -749,9 +293,12 @@ class AdvancedMultiFactorScreener:
         if "volatility_60d" in result.columns:
             result["F3_norm"] = result["volatility_60d"].apply(self._vol_quality)
 
-            # 辅过滤：剔除横截面波动率排名后20%尾部的标的（极端高低）
+            # 辅过滤：剔除横截面波动率排名尾部的标的（阈值从 config 读取）
+            adv_cfg = self.config.get('advanced_screening', {})
+            vol_tail_low = adv_cfg.get('vol_tail_low', 0.05)
+            vol_tail_high = adv_cfg.get('vol_tail_high', 0.95)
             vol_rank = result["volatility_60d"].rank(pct=True)
-            result = result[(vol_rank >= 0.20) & (vol_rank <= 0.80)]
+            result = result[(vol_rank >= vol_tail_low) & (vol_rank <= vol_tail_high)]
 
         # Step 3: F4 Path_Memory（负向，越小越好）
         if "path_memory" in result.columns:
@@ -799,6 +346,67 @@ class AdvancedMultiFactorScreener:
 
         return result
 
+    def apply_capital_fitness(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        应用资金适配度评分。
+
+        根据当前资金量、每格金额和股价，计算每只股票的资金适配度。
+        采用效率因子平滑处理高价股，避免阶梯式跳变。
+        """
+        if df.empty:
+            return df
+
+        result = df.copy()
+
+        capital_cfg = self.config.get("capital", {})
+        grid_cfg = self.config.get("grid", {})
+
+        total = capital_cfg.get("total", 100000)
+        max_position = capital_cfg.get("max_position_per_stock", 0.3)
+        initial_position = grid_cfg.get("initial_position", 0.45)
+        grid_amount = grid_cfg.get("grid_amount", 3000)
+        max_grids = grid_cfg.get("max_grids", 5)
+
+        per_stock = total * max_position
+        initial_needed = per_stock * initial_position
+
+        def _fitness(row):
+            price = row.get("price", 0)
+            if price <= 0:
+                return 0.0, 0.0
+
+            lot_value = price * 100
+            actual_grid = max(grid_amount, lot_value)
+            grid_needed = actual_grid * max_grids
+
+            # 基础资金充足度
+            if initial_needed > per_stock:
+                base = 0.0
+            elif initial_needed + grid_needed <= per_stock:
+                base = 1.0
+            else:
+                base = (per_stock - initial_needed) / grid_needed if grid_needed > 0 else 0.0
+
+            # 效率因子：股价越接近 grid_amount/100 效率越高
+            if lot_value <= grid_amount:
+                efficiency = 1.0
+            else:
+                ratio = grid_amount / lot_value
+                efficiency = ratio ** 0.5
+
+            return base * (0.5 + 0.5 * efficiency), efficiency
+
+        fitness_vals = result.apply(_fitness, axis=1, result_type="expand")
+        result["capital_fitness"] = fitness_vals[0]
+        result["efficiency"] = fitness_vals[1]
+
+        # 综合评分：因子评分占 70%，资金适配占 30%
+        result["final_score"] = result["total_score"] * (
+            0.7 + 0.3 * result["capital_fitness"]
+        )
+
+        return result
+
     def _apply_concentration_limits(self, df: pd.DataFrame, max_per_industry: int = 3) -> pd.DataFrame:
         """
         行业分散约束（ETF/股票隔离）。
@@ -835,30 +443,35 @@ class AdvancedMultiFactorScreener:
 
         return pd.concat([df_stock, df_etf], ignore_index=True)
 
-    def rank_stocks(self, df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
-        """
-        按总分排名并返回 Top N。
-        """
+    def rank_stocks(self, df: pd.DataFrame, top_n: Optional[int] = None,
+                    sort_by: str = "total_score") -> pd.DataFrame:
+        """按指定得分排名，可选截取 Top N（None = 返回全部）。"""
         if df.empty:
             return df
 
-        df = df.sort_values("total_score", ascending=False)
+        if sort_by not in df.columns:
+            sort_by = "total_score"
+
+        df = df.sort_values(sort_by, ascending=False)
         df["rank"] = range(1, len(df) + 1)
 
         # 应用行业分散约束（仅当 industry 列存在时）
         if 'industry' in df.columns:
             max_per_industry = self.config.get("max_per_industry", 3)
             df = self._apply_concentration_limits(df, max_per_industry=max_per_industry)
-            df = df.head(top_n)  # 约束后再次截取 top_n
+            if top_n is not None:
+                df = df.head(top_n)
             df["rank"] = range(1, len(df) + 1)
 
-        return df.head(top_n)
+        if top_n is not None:
+            df = df.head(top_n)
+        return df
 
     def screen(
         self,
         stocks_data: List[Dict],
         asset_type: str = "stock",
-        top_n: int = 20,
+        top_n: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         主筛选函数。
@@ -866,10 +479,10 @@ class AdvancedMultiFactorScreener:
         Parameters:
             stocks_data: 股票因子字典列表
             asset_type: 'etf' 或 'stock'
-            top_n: 返回的 Top N 股票数
+            top_n: 返回的 Top N 股票数（None = 返回全部）
 
         Returns:
-            包含得分和排名的 Top N DataFrame
+            包含得分和排名的 DataFrame
         """
         # 转换为 DataFrame
         df = pd.DataFrame(stocks_data)
@@ -888,13 +501,19 @@ class AdvancedMultiFactorScreener:
         # Stage 2: 因子打分
         df = self.calculate_scores(df, asset_type=asset_type)
 
-        # Stage 3: 排名并选择 Top N
-        df = self.rank_stocks(df, top_n=top_n)
+        # Stage 2.5: 资金适配度评分
+        df = self.apply_capital_fitness(df)
+
+        # 保存完整评分结果（供外部写入 SQLite）
+        self.last_full_results = df.copy()
+
+        # Stage 3: 排名并选择 Top N（按 final_score）
+        df = self.rank_stocks(df, top_n=top_n, sort_by="final_score")
 
         # 统计
         n_passed = df["passes_threshold"].sum() if "passes_threshold" in df.columns else len(df)
         logger.info(
-            f"筛选完成: {len(df)}/{top_n} 只股票被选中, "
+            f"筛选完成: {len(df)} 只股票被选中, "
             f"{n_passed} 只通过质量阈值"
         )
 
@@ -972,45 +591,3 @@ def screen_universe_advanced(
 
     return result
 
-
-def create_advanced_screening_report(df_result: pd.DataFrame) -> str:
-    """
-    创建高级筛选报告摘要。
-    """
-    if df_result.empty:
-        return "无股票符合筛选条件"
-
-    lines = []
-    lines.append("=" * 70)
-    lines.append("高级多因子筛选报告 (v2)")
-    lines.append("=" * 70)
-    lines.append(f"选中股票数: {len(df_result)}")
-
-    n_passed = df_result["passes_threshold"].sum() if "passes_threshold" in df_result.columns else len(df_result)
-    lines.append(f"通过质量阈值: {n_passed}/{len(df_result)}")
-
-    if "cash_buffer" in df_result.columns:
-        n_cash = df_result["cash_buffer"].sum()
-        lines.append(f"现金缓冲: {n_cash}/{len(df_result)}")
-
-    lines.append("")
-
-    for _, row in df_result.head(10).iterrows():
-        params = row.get("grid_params", {})
-        threshold_mark = "✓" if row.get("passes_threshold", True) else "⚠"
-        lines.append(
-            f"{threshold_mark} #{int(row['rank']):2d} {row['code']:<12s} "
-            f"总分: {row['total_score']:.4f} "
-            f"(F1:{row.get('F1_norm', 0):.2f} "
-            f"F2:{row.get('F2_norm', 0):.2f} "
-            f"F3:{row.get('F3_norm', 0):.2f} "
-            f"F4:{row.get('F4_ortho', 0):.2f}) "
-            f"网格:{params.get('spacing_coef', 'N/A')}×ATR"
-        )
-
-    if len(df_result) > 10:
-        lines.append(f"... 还有 {len(df_result) - 10} 只股票")
-
-    lines.append("=" * 70)
-
-    return "\n".join(lines)

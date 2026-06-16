@@ -11,12 +11,20 @@ indicators.py - 向量化技术指标计算模块
 - ATR (20日)
 """
 
-from typing import Tuple, Optional
+from typing import Tuple
 import logging
 
 import numpy as np
 import pandas as pd
-from numba import jit, prange
+try:
+    from numba import jit, prange
+except ImportError:
+    # Fallback: create a no-op decorator if numba is not available
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
 logger = logging.getLogger("grid_trading")
 
@@ -86,7 +94,7 @@ def _rs_analysis_vectorized(prices: np.ndarray, max_lag: int = 20) -> float:
     log_rs = np.log(valid_rs + 1e-10)
 
     # OLS 斜率
-    n_pts = len(log_lags)
+#     n_pts = len(log_lags)
     mean_x = np.mean(log_lags)
     mean_y = np.mean(log_rs)
 
@@ -97,6 +105,18 @@ def _rs_analysis_vectorized(prices: np.ndarray, max_lag: int = 20) -> float:
     hurst = max(0.0, min(1.0, hurst))  # 限制在 [0, 1]
 
     return hurst
+
+
+def calculate_hurst_exponent(price_series: pd.Series, max_lag: int = 20) -> float:
+    """
+    单次 Hurst 指数计算 — 委托给 Numba JIT 加速的 R/S 分析。
+
+    与 calculate_hurst_60d 的区别：只计算最后一次的 Hurst 值，不滚动。
+    """
+    prices = price_series.dropna().values.astype(np.float64)
+    if len(prices) < max_lag * 2:
+        return 0.5
+    return _rs_analysis_vectorized(prices, max_lag)
 
 
 def calculate_hurst_60d(
@@ -162,7 +182,7 @@ def _ou_half_life_vectorized(log_prices: np.ndarray) -> float:
     y = log_prices[1:]  # t
     x = log_prices[:-1]  # t-1
 
-    n_pts = len(y)
+#     n_pts = len(y)
     mean_x = np.mean(x)
     mean_y = np.mean(y)
 
@@ -273,7 +293,7 @@ def _adx_calculation_vectorized(
             minus_dm[i - 1] = low_diff
 
     # Wilder 平滑 (EMA with alpha = 1/period)
-    alpha = 1.0 / period
+#     alpha = 1.0 / period
 
     # ATR (Wilder 平滑)
     atr = np.zeros(n - 1)

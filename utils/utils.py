@@ -1,5 +1,5 @@
 """
-工具模块 - A 股网格交易系统 v1.6.0
+工具模块 - A 股网格交易系统 v2.0.0
 功能：A 股风控、费用计算、日志、通知预留
 """
 
@@ -7,17 +7,39 @@ import os
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, time
-from typing import Optional, Tuple, Dict
+from typing import Optional
 import yaml
 
 
 # ==================== 配置加载 ====================
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归合并两个字典，override 值覆盖 base 值"""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def load_config(config_path: str = "configuration/config.yaml") -> dict:
-    """加载 YAML 静态配置文件"""
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    """
+    加载配置：defaults.py（系统默认值） + config.yaml（用户覆盖） → 合并后的完整配置
+
+    用户只需填写想覆盖的参数，其余用系统默认值。
+    """
+    from trading_core.defaults import get_defaults
+
+    config = get_defaults()
+
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            user_config = yaml.safe_load(f) or {}
+        config = _deep_merge(config, user_config)
+
+    return config
 
 
 def load_state(state_path: str = "configuration/config_state.json") -> dict:
@@ -25,13 +47,13 @@ def load_state(state_path: str = "configuration/config_state.json") -> dict:
     if not os.path.exists(state_path):
         # 如果状态文件不存在，返回默认状态
         return {
-            "version": "1.6.0",
+            "version": "2.0.0",
             "selection_status": {
                 "completed": False,
                 "last_selection_date": "",
                 "last_data_update_date": "",
                 "selection_count": 0,
-                "strategy_version": "v1.6.0"
+                "strategy_version": "v2.0.0"
             },
             "runtime_state": {
                 "last_run_date": "",
@@ -43,7 +65,7 @@ def load_state(state_path: str = "configuration/config_state.json") -> dict:
         return json.load(f)
 
 
-def save_state(state: dict, state_path: str = "config_state.json") -> None:
+def save_state(state: dict, state_path: str = "configuration/config_state.json") -> None:
     """保存状态到 JSON 文件"""
     with open(state_path, 'w', encoding='utf-8') as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
@@ -121,81 +143,20 @@ def setup_logging(output_dir: str = "./output", level: str = "INFO",
 
 # ==================== A 股风控规则 ====================
 
-def check_trading_time() -> bool:
-    """
-    检查当前时间是否为 A 股交易时段
-    - 交易日：周一至周五
-    - 交易时段：9:30-11:30, 13:00-15:00
-    """
-    now = datetime.now()
-    
-    # 检查周末
-    if now.weekday() >= 5:
-        return False
-    
-    # 检查交易时段
-    morning_start = time(9, 30)
-    morning_end = time(11, 30)
-    afternoon_start = time(13, 0)
-    afternoon_end = time(15, 0)
-    
-    current_time = now.time()
-    
-    is_trading = (morning_start <= current_time <= morning_end or 
-                  afternoon_start <= current_time <= afternoon_end)
-    
-    return is_trading
-
-
-def check_limit_status(current_price: float, pre_close: float, 
-                       threshold: float = 9.8) -> Tuple[bool, bool]:
-    """
-    检查涨跌停状态
-    
-    参数:
-        current_price: 当前价格
-        pre_close: 昨日收盘价
-        threshold: 涨跌停阈值 (默认 9.8%)
-    
-    返回:
-        (is_limit_up, is_limit_down): 涨停标志，跌停标志
-    """
-    if pre_close <= 0:
-        return False, False
-    
-    change_pct = abs(current_price - pre_close) / pre_close * 100
-    
-    is_limit_up = change_pct >= threshold and current_price > pre_close
-    is_limit_down = change_pct >= threshold and current_price < pre_close
-    
-    return is_limit_up, is_limit_down
-
-
-def check_t1_rule(sell_quantity: int, available_position: int) -> bool:
-    """
-    T+1 规则检查：卖出数量不能超过可用持仓
-    
-    参数:
-        sell_quantity: 计划卖出数量
-        available_position: 可用持仓 (昨日持仓)
-    
-    返回:
-        是否符合 T+1 规则
-    """
-    return sell_quantity <= available_position
-
 
 def validate_buy_quantity(quantity: int) -> int:
     """
-    验证买入数量：必须是 100 的整数倍 (A 股最小交易单位)
-    
+    验证买入数量：至少 100 股，向上取整到 100 的整数倍 (A 股最小交易单位)
+
     参数:
         quantity: 计划买入数量
-    
+
     返回:
-        调整后的合法数量 (向下取整到 100 的倍数)
+        调整后的合法数量 (至少 1 手，向上取整)
     """
-    return (quantity // 100) * 100
+    if quantity <= 0:
+        return 0
+    return max(100, ((quantity + 99) // 100) * 100)
 
 
 # ==================== A 股费用计算 ====================
@@ -266,13 +227,24 @@ def send_notification(message: str, config: Optional[dict] = None) -> bool:
 
 # ==================== 辅助函数 ====================
 
-def format_number(num: float, decimals: int = 2) -> str:
-    """格式化数字显示 (千分位分隔符)"""
-    return f"{num:,.{decimals}f}"
-
 
 def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
     """安全除法 (避免除零错误)"""
     if denominator == 0:
         return default
     return numerator / denominator
+
+
+def fmt_date(d: str) -> str:
+    """
+    转换日期格式：YYYYMMDD -> YYYY-MM-DD
+
+    参数:
+        d: 日期字符串
+
+    返回:
+        YYYY-MM-DD 格式日期，或原字符串（如果格式不符）
+    """
+    if d and len(d) == 8 and d.isdigit():
+        return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+    return d

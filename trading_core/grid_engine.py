@@ -10,28 +10,31 @@ grid_engine.py - 动态网格参数引擎
 4. 强制平仓触发: 价格跌破下轨 3 格 → 平仓 50%
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 import logging
 
 import numpy as np
-import pandas as pd
+
+from trading_core.defaults import get_defaults
 
 logger = logging.getLogger("grid_trading")
 
-
-# ==================== Volatility Regime Configuration ====================
-
-VOLATILITY_REGIME_K = {
-    "low": 2.5,  # 低波动: k=2.5，间距宽松
-    "medium": 2.0,  # 中波动: k=2.0
-    "high": 1.5,  # 高波动: k=1.5，间距紧密
-}
-
-VOLATILITY_THRESHOLDS = {
-    "low": 0.20,  # 年化波动率 < 20% = 低波动区间
-    "high": 0.35,  # 年化波动率 > 35% = 高波动区间
-}
+def compute_adaptive_spacing(
+    base_spacing_pct: float,
+    current_price: float,
+    current_atr: float,
+    atr_coef: float = 1.5,
+    daily_volatility: float = 0.0,
+    clamp_low: float = 0.003,
+    clamp_high: float = 0.15,
+) -> float:
+    """ATR scaling + T+1 floor for consistent backtest/live spacing."""
+    atr_ratio = current_atr / max(current_price, 1.0)
+    adjusted = base_spacing_pct * (atr_ratio / 0.02) * atr_coef
+    if daily_volatility > 0:
+        adjusted = max(adjusted, 1.5 * daily_volatility)
+    return max(clamp_low, min(adjusted, clamp_high))
 
 
 # ==================== Data Classes ====================
@@ -95,27 +98,28 @@ class DynamicGridEngine:
         """
         self.config = config or {}
 
-        grid_cfg = self.config.get("grid", {})
-        dyn_grid_cfg = self.config.get("dynamic_grid", {})
+        defaults = get_defaults()
+        grid_cfg = {**defaults.get("grid", {}), **self.config.get("grid", {})}
+        dyn_grid_cfg = {**defaults.get("dynamic_grid", {}), **self.config.get("dynamic_grid", {})}
 
         # 基础参数
-        self.base_spacing = grid_cfg.get("base_spacing", 0.02)  # 小数格式 (2.0%)
+        self.base_spacing = grid_cfg.get("base_spacing", 0.02)
         self.atr_period = grid_cfg.get("atr_period", 20)
         self.base_atr_coef = grid_cfg.get("atr_coef", 1.5)
         self.max_grids = grid_cfg.get("max_grids", 5)
         # 间距硬约束（防止参数漂移）
-        self.min_spacing = grid_cfg.get("min_spacing", 0.015)  # 1.5%
-        self.max_spacing = grid_cfg.get("max_spacing", 0.035)  # 3.5%
+        self.min_spacing = grid_cfg.get("min_spacing", 0.003)
+        self.max_spacing = grid_cfg.get("max_spacing", 0.15)
 
         # 波动率区间配置
-        regime_k = dyn_grid_cfg.get("volatility_regime_k", VOLATILITY_REGIME_K)
+        regime_k = dyn_grid_cfg.get("volatility_regime_k", {"low": 2.5, "medium": 2.0, "high": 1.5})
         self.vol_regime_k = {
             "low": regime_k.get("low", 2.5),
             "medium": regime_k.get("medium", 2.0),
             "high": regime_k.get("high", 1.5),
         }
 
-        vol_thresh = dyn_grid_cfg.get("volatility_thresholds", VOLATILITY_THRESHOLDS)
+        vol_thresh = dyn_grid_cfg.get("volatility_thresholds", {"low": 0.20, "high": 0.35})
         self.vol_low_threshold = vol_thresh.get("low", 0.20)
         self.vol_high_threshold = vol_thresh.get("high", 0.35)
 
@@ -127,7 +131,7 @@ class DynamicGridEngine:
         self.daily_vol_period = 20
 
         # 强制平仓参数
-        force_cfg = dyn_grid_cfg.get("force_close", {})
+        force_cfg = dyn_grid_cfg.get("force_close", {"grids_below": 3, "close_pct": 0.50})
         self.force_close_grids_below = force_cfg.get("grids_below", 3)
         self.force_close_pct = force_cfg.get("close_pct", 0.50)
 
@@ -279,8 +283,8 @@ class DynamicGridEngine:
 
         # Step 5: 使用 ATR 通道计算上下轨
         # 上轨 = P_ref + z × ATR，下轨 = P_ref - z × ATR
-        upper_rail_price = ref_price + self.rail_z_coef * atr_20
-        lower_rail_price = ref_price - self.rail_z_coef * atr_20
+#         upper_rail_price = ref_price + self.rail_z_coef * atr_20
+#         lower_rail_price = ref_price - self.rail_z_coef * atr_20
         upper_rail_pct = self.rail_z_coef * atr_20 / ref_price  # 偏离比例
         lower_rail_pct = self.rail_z_coef * atr_20 / ref_price  # 偏离比例
 
@@ -442,8 +446,15 @@ class DynamicGridEngine:
         """
         signals = []
 
-        # 计算日波动率 (年化转日)
-        daily_vol = volatility_60d / np.sqrt(252) if volatility_60d > 0 else 0.02
+        # 计算日波动率 (ATR ratio，与回测统一)
+        if ref_price > 0 and atr_20 > 0:
+            daily_vol = atr_20 / ref_price
+        elif volatility_60d > 0:
+            daily_vol = volatility_60d / np.sqrt(252)
+            logger.warning("ATR 无效，使用年化波动率转日波动作为回退")
+        else:
+            daily_vol = 0.02
+            logger.warning("ATR 和波动率均无效，使用默认日波动率 0.02")
         params = self.calculate_grid_parameters(ref_price, atr_20, volatility_60d, daily_vol)
 
         # 涨跌停检查
@@ -571,90 +582,4 @@ class DynamicGridEngine:
             return True
         return (stock_position_value / total_capital) <= self.max_position_pct
 
-    def calculate_grid_profit_potential(
-        self,
-        ref_price: float,
-        params: GridParameters,
-        n_complete_cycles: int = 1,
-    ) -> Dict[str, float]:
-        """
-        计算网格策略的潜在利润。
 
-        假设价格从下轨运动到上轨，完成完整网格循环。
-
-        Parameters:
-            ref_price: 参考价格
-            params: 网格参数
-            n_complete_cycles: 完整循环次数
-
-        Returns:
-            包含利润指标的字典
-        """
-        buy_prices, sell_prices = self.generate_grid_prices(ref_price, params)
-
-        if not buy_prices or not sell_prices:
-            return {
-                "total_profit_pct": 0.0,
-                "profit_per_grid": 0.0,
-                "n_grids": 0,
-            }
-
-        # 每格理论利润 = (卖出价 - 买入价) / 买入价
-        profits = []
-        for buy_p, sell_p in zip(buy_prices[: len(sell_prices)], sell_prices):
-            profit_pct = (sell_p - buy_p) / buy_p * 100
-            profits.append(profit_pct)
-
-        total_profit_pct = sum(profits) * n_complete_cycles
-        profit_per_grid = np.mean(profits) if profits else 0.0
-
-        return {
-            "total_profit_pct": total_profit_pct,
-            "profit_per_grid": profit_per_grid,
-            "n_grids": params.n_grids,
-            "spacing_pct": params.spacing_pct,
-            "regime": params.regime,
-        }
-
-
-def create_grid_report(
-    code: str,
-    ref_price: float,
-    params: GridParameters,
-    signals: List[GridSignal],
-) -> str:
-    """
-    创建网格策略报告。
-
-    Parameters:
-        code: 股票代码
-        ref_price: 参考价格
-        params: 网格参数
-        signals: 信号列表
-
-    Returns:
-        格式化的报告字符串
-    """
-    lines = []
-    lines.append("=" * 60)
-    lines.append(f"网格策略报告 - {code}")
-    lines.append("=" * 60)
-    lines.append(f"参考价格: {ref_price:.2f}")
-    lines.append(f"波动率区间: {params.regime}")
-    lines.append(f"网格间距: {params.spacing_pct:.2f}% (k={params.k_coef})")
-    lines.append(f"上轨偏离: {params.upper_rail_pct*100:.2f}%")
-    lines.append(f"下轨偏离: {params.lower_rail_pct*100:.2f}%")
-    lines.append(f"网格层数: {params.n_grids}")
-    lines.append(f"ATR(20): {params.atr_value:.2f}")
-    lines.append("")
-    lines.append("信号列表:")
-
-    for sig in signals:
-        lines.append(
-            f"  [{sig.direction.upper():4s}] L{sig.grid_level:2d} @ {sig.price:.2f} "
-            f"x {sig.quantity} ({sig.signal_type})"
-        )
-
-    lines.append("=" * 60)
-
-    return "\n".join(lines)

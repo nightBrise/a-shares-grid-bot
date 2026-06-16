@@ -1,4 +1,4 @@
-# 配置文件详解 - A 股网格交易系统 v1.6.0
+# 配置文件详解 - A 股网格交易系统 v2.0.0
 
 ## 配置文件概览
 
@@ -38,7 +38,7 @@ backtest:                     # 回测参数
   commission_rate: 0.00015
 
 paths:                        # 路径配置
-  data_dir: "./cache"
+  data_dir: "./data"
   output_dir: "./output"
 
 selection:                    # 选股阈值
@@ -229,11 +229,8 @@ configuration/config.yaml
 configuration/config_state.json
 
 # 数据和输出
-cache/*.parquet
-cache/metadata.json
+data/market_data.db
 output/*.csv
-output/*.json
-output/log.txt
 
 # 环境变量
 .env
@@ -249,10 +246,9 @@ output/log.txt
 2. **`configuration/config_state.json`** - 动态状态
 
 ### 废弃文件
-
-1. **`configuration/config_base.yaml`** - 已废弃，与 config.yaml 相同，仅为兼容性保留
+# 1. `configuration/config_base.yaml` - 已废弃，与 config.yaml 相同，仅为兼容性保留
 
 ---
 
 **Last Updated**: 2026-04-22
-**Version**: v1.6.0
+**Version**: v2.0.0

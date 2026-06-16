@@ -175,4 +175,4 @@ score = Calmar
 ---
 
 **Last Updated**: 2026-04-22
-**Version**: v1.6.0
+**Version**: v2.0.0

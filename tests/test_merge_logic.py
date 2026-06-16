@@ -15,7 +15,7 @@
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+# # from datetime import datetime, timedelta
 import sys
 import os
 
@@ -88,7 +88,7 @@ def test_scenario_1_perfect_handover():
     df_combined = append_new_data(df_existing, df_new, code="TEST.SH")
     
     # 验证结果
-    print(f"\n合并后数据:")
+    print("\n合并后数据:")
     print(f"  总条数：{len(df_combined)}")
     print(f"  日期范围：{df_combined['date'].iloc[0]} 至 {df_combined['date'].iloc[-1]}")
     
@@ -106,11 +106,11 @@ def test_scenario_1_perfect_handover():
         for gap_date, gap in gaps.items():
             print(f"     - {gap.days} 天间隔 at index {gap_date}")
     else:
-        print(f"  ✓ 日期连续，无间隔")
+        print("  ✓ 日期连续，无间隔")
     
     # 显示连接处数据
     mid_idx = len(df_existing) - 1
-    print(f"\n连接处数据预览 (前后各 3 条):")
+    print("\n连接处数据预览 (前后各 3 条):")
     print(df_combined.loc[mid_idx-2:mid_idx+3, ['date', 'close']].to_string(index=False))
     
     assert duplicate_count == 0, "发现重复数据！"
@@ -149,7 +149,7 @@ def test_scenario_2_overlap():
     df_combined = append_new_data(df_existing, df_new, code="TEST.SH")
     
     # 验证结果
-    print(f"\n合并后数据:")
+    print("\n合并后数据:")
     print(f"  总条数：{len(df_combined)}")
     print(f"  预期条数：{len(df_existing) + len(df_new) - len(overlap_dates)}")
     
@@ -202,7 +202,7 @@ def test_scenario_3_gap():
     df_combined = append_new_data(df_existing, df_new, code="TEST.SH")
     
     # 验证结果
-    print(f"\n合并后数据:")
+    print("\n合并后数据:")
     print(f"  总条数：{len(df_combined)}")
     
     # 检查间隔
@@ -217,10 +217,10 @@ def test_scenario_3_gap():
             curr_date = dates.iloc[idx].strftime('%Y-%m-%d')
             print(f"     - {prev_date} 至 {curr_date}: 间隔 {gap.days} 天")
     else:
-        print(f"  ✓ 日期连续，无间隔")
+        print("  ✓ 日期连续，无间隔")
     
     # 显示间隔处数据
-    print(f"\n间隔处数据预览:")
+    print("\n间隔处数据预览:")
     for idx in gaps.index:
         prev_idx = idx - 1
         print(f"  间隔前最后一条：{df_combined.iloc[prev_idx]['date']}")

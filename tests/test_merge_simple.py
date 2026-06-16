@@ -7,7 +7,7 @@
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+# # from datetime import datetime, timedelta
 import logging
 
 # 配置日志
@@ -87,7 +87,7 @@ def test_perfect_handover():
     df_combined = append_new_data(df_existing, df_new, "TEST.SH")
     
     # 验证
-    print(f"\n合并结果:")
+    print("\n合并结果:")
     print(f"  总条数：{len(df_combined)}")
     print(f"  日期范围：{df_combined['date'].iloc[0]} 至 {df_combined['date'].iloc[-1]}")
     
@@ -101,13 +101,13 @@ def test_perfect_handover():
     large_gaps = gaps[gaps > 3]
     
     if len(large_gaps) == 0:
-        print(f"  日期间隔：✓ 连续无间隔")
+        print("  日期间隔：✓ 连续无间隔")
     else:
         print(f"  日期间隔：⚠️ 发现 {len(large_gaps)} 个间隔>3 天")
     
     # 显示连接处
     mid_idx = len(df_existing) - 1
-    print(f"\n连接处详情:")
+    print("\n连接处详情:")
     print(df_combined.loc[mid_idx-2:mid_idx+2, ['date', 'close']].to_string(index=False))
     
     # 断言
@@ -142,7 +142,7 @@ def test_overlap():
     # 合并
     df_combined = append_new_data(df_existing, df_new, "TEST.SH")
     
-    print(f"\n合并结果:")
+    print("\n合并结果:")
     print(f"  理论条数：{len(df_existing) + len(df_new) - len(overlap)}")
     print(f"  实际条数：{len(df_combined)}")
     
@@ -150,7 +150,7 @@ def test_overlap():
     print(f"  重复记录：{duplicates}")
     
     # 验证重叠日期使用新数据
-    print(f"\n重叠日期数据验证:")
+    print("\n重叠日期数据验证:")
     for date in sorted(overlap):
         old_close = df_existing[df_existing['date'] == date]['close'].values[0]
         new_close = df_new[df_new['date'] == date]['close'].values[0]
@@ -186,7 +186,7 @@ def test_gap():
     # 合并
     df_combined = append_new_data(df_existing, df_new, "TEST.SH")
     
-    print(f"\n合并结果:")
+    print("\n合并结果:")
     print(f"  总条数：{len(df_combined)}")
     
     # 检测间隔
@@ -201,9 +201,9 @@ def test_gap():
             curr_date = dates.iloc[idx].strftime('%Y-%m-%d')
             gap_days = large_gaps.iloc[idx]
             print(f"     - {prev_date} → {curr_date}: 间隔 {gap_days} 天")
-        print(f"  → 需调用 check_data_integrity() 检测并补全缺失日期")
+        print("  → 需调用 check_data_integrity() 检测并补全缺失日期")
     else:
-        print(f"  ✓ 日期连续")
+        print("  ✓ 日期连续")
     
     assert len(df_combined) == len(df_existing) + len(df_new), "条数不匹配！"
     

@@ -14,5 +14,11 @@ dependencies:
   - requests>=2.28.0
   - pip:
     - akshare>=1.10.0
+    - baostock>=0.8.8
     - optuna>=3.0.0
+    - numba>=0.59.0
+    - gradio>=4.0.0
+    - plotly>=5.0.0
+    - tushare>=1.4.0
+    - fake-useragent>=1.5.0
     - scipy>=1.10.0

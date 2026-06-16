@@ -273,7 +273,7 @@ def with_session_refresh(func):
             result = func(*args, **kwargs)
             get_session_manager().record_success()
             return result
-        except Exception as e:
+        except Exception:
             should_refresh = get_session_manager().record_failure()
             if should_refresh:
                 get_session_manager().refresh_session()

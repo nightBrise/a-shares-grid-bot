@@ -1,5 +1,5 @@
 """
-策略模块 - A 股网格交易系统 v1.6.0
+策略模块 - A 股网格交易系统 v2.0.0
 功能：选股、参数优化、信号生成 (核心大脑)
 """
 
@@ -7,9 +7,10 @@ import os
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 import pandas as pd
 import numpy as np
+import yaml
 
 try:
     import optuna
@@ -17,56 +18,31 @@ except ImportError:
     raise ImportError("请安装 optuna: pip install optuna>=3.0.0")
 
 from data_layer.fetcher import (
-    get_stock_data, clean_data, calculate_atr, calculate_hurst_exponent,
-    align_to_trading_day, get_next_trading_day, get_trade_calendar,
-    pre_filter_stocks_fast, get_thread_rate_limiter,
-    load_candidate_stocks, save_candidate_stocks
+    get_stock_data, clean_data,
+    align_to_trading_day, get_next_trading_day,
 )
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import threading
 from utils import (
     load_config, calculate_transaction_fee, validate_buy_quantity,
-    check_limit_status, check_t1_rule, format_number, safe_divide
+    safe_divide
 )
 
-# 新模块：多因子选股 (可选)
-try:
-    from trading_core.indicators import calculate_all_indicators, get_latest_indicators
-    from trading_core.screener import (
-        AdvancedMultiFactorScreener,
-        screen_universe_advanced,
-    )
-    NEW_SCREENER_AVAILABLE = True
-except ImportError:
-    NEW_SCREENER_AVAILABLE = False
-    logger.warning("新多因子选股模块不可用，请检查 indicators.py 和 screener.py 是否存在")
-
-# 新模块：动态网格引擎 (可选)
-try:
-    import trading_core.grid_engine as grid_engine
-    GRID_ENGINE_AVAILABLE = True
-except ImportError:
-    GRID_ENGINE_AVAILABLE = False
-    logger.warning("动态网格引擎不可用，请检查 grid_engine.py 是否存在")
-
-# 新模块：增强风控 (可选)
-try:
-    from risk_management.enhanced_risk import EnhancedRiskControl
-    ENHANCED_RISK_AVAILABLE = True
-except ImportError:
-    ENHANCED_RISK_AVAILABLE = False
-    logger.warning("增强风控模块不可用，请检查 risk.py 是否存在")
-
+from trading_core.indicators import calculate_all_indicators, get_latest_indicators, calculate_atr
+from trading_core.screener import AdvancedMultiFactorScreener
+from trading_core.grid_engine import DynamicGridEngine, compute_adaptive_spacing
+from risk_management.circuit_breaker import create_risk_control_manager
 
 logger = logging.getLogger("grid_trading")
 
-
-import sys
+# 默认常量
+DEFAULT_INITIAL_CASH = 1000000.0
 
 
 # ==================== 选股逻辑 ====================
 
-def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
+def run_selection(config: dict, auto_update_config: bool = True,
+                  force_select: bool = False) -> pd.DataFrame:
     """
     选股模式：使用多因子横截面打分筛选适合网格交易的标的
 
@@ -86,15 +62,10 @@ def run_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame
     返回:
         多因子得分 Top N 股票列表 DataFrame
     """
-    # 默认使用多因子横截面打分选股器
-    if NEW_SCREENER_AVAILABLE:
-        logger.info("=" * 60)
-        logger.info("使用多因子横截面打分选股器")
-        logger.info("=" * 60)
-        return run_multi_factor_selection(config, auto_update_config)
-
-    logger.error("多因子选股模块不可用，请检查 indicators.py 和 screener.py")
-    return pd.DataFrame()
+    logger.info("=" * 60)
+    logger.info("使用多因子横截面打分选股器")
+    logger.info("=" * 60)
+    return run_multi_factor_selection(config, auto_update_config, force_select)
 
 
 # ==================== 并行化选股辅助函数 ====================
@@ -112,20 +83,9 @@ def _fetch_single_stock_data(args: Tuple) -> Tuple[str, pd.DataFrame, str]:
     """
     code, data_dir, force_full, cfg = args
     try:
-        # 使用线程独立的限流器
-        rate_limiter = get_thread_rate_limiter(cfg)
-        rate_limiter.wait()
-
         # 网络不稳定时优先使用缓存，避免重试等待
         df = get_stock_data(code, data_dir=data_dir, force_full=force_full,
                            enable_incremental=False, use_cache=True, fallback_to_cache=True)
-
-        # 即使缓存命中，也写入季度文件（本地IO，不触发限流）
-        if len(df) > 0:
-            from data_layer.fetcher import save_quarter_history
-            df_with_code = df.copy()
-            df_with_code['code'] = code
-            save_quarter_history(df_with_code, data_dir)
 
         return (code, df, "success")
     except Exception as e:
@@ -133,144 +93,64 @@ def _fetch_single_stock_data(args: Tuple) -> Tuple[str, pd.DataFrame, str]:
         return (code, pd.DataFrame(), f"error: {e}")
 
 
-def run_multi_factor_selection(config: dict, auto_update_config: bool = True) -> pd.DataFrame:
+def run_multi_factor_selection(config: dict, auto_update_config: bool = True,
+                               force_select: bool = False) -> pd.DataFrame:
     """
-    多因子横截面打分选股模式 (高级版)
+    选股模式入口
 
-    使用四因子正交化模型：
-    - F1: Reversion_Speed (OU半衰期) - 均值回归速度
-    - F2: Trend_Strength (ADX) - 趋势持续性
-    - F3: Vol_Quality (波动率倒U型) - 波动质量
-    - F4: Path_Memory (Variance Ratio) - 残差分形结构
-
-    特性：
-    - 横截面多元正交化（F4 对 F1、F2 回归取残差）
-    - 双轨权重（ETF vs 股票）
-    - 动态阈值（adaptive_quantile 模式）
-    - 现金缓冲机制
+    两种路径：
+    1. 自定义股票模式：config.stocks 有股票且无 --force-select
+       → 直接调用 run_two_phase_optimization() 进行优化和回测
+    2. 全市场选股模式：config.stocks 为空或使用 --force-select
+       → 扫描全市场股票，多因子打分，筛选 top N
 
     参数:
         config: 配置字典
         auto_update_config: 是否自动更新配置文件
+        force_select: 是否强制全市场选股
 
     返回:
-        符合条件的多因子得分 Top N 股票列表 DataFrame
+        自定义模式: 优化结果字典
+        全市场模式: 多因子得分 Top N 股票列表 DataFrame
     """
-    if not NEW_SCREENER_AVAILABLE:
-        logger.error("多因子选股模块不可用，请检查 indicators.py 和 screener.py")
-        return pd.DataFrame()
+    existing_stocks = config.get('stocks', [])
+
+    # 检查股票池是否过期（仅提示，不阻断执行）
+    if existing_stocks:
+        try:
+            from utils import load_state
+            state = load_state()
+            selection_status = state.get('selection_status', {})
+            last_date = selection_status.get('last_selection_date', '')
+            if last_date:
+                days_since = (datetime.now() - datetime.strptime(last_date, '%Y-%m-%d')).days
+                if days_since > 90:
+                    logger.warning(
+                        f"⚠ 股票池已 {days_since} 天未更新（上次选股：{last_date}），"
+                        f"建议重新选股"
+                    )
+        except Exception:
+            pass
+
+    # 自定义股票模式：有股票且未强制全市场选股
+    if existing_stocks and not force_select:
+        logger.info("=" * 60)
+        logger.info(f"检测到已有股票池：{len(existing_stocks)} 只股票")
+        logger.info("跳过全市场选股，直接进入网格参数优化和回测")
+        logger.info("如需重新选股，请使用 --force-select 或清空 config.stocks")
+        logger.info("=" * 60)
+
+        # 调用优化和回测
+        return run_two_phase_optimization(config)
 
     logger.info("=" * 60)
     logger.info("开始执行高级多因子横截面打分选股 (v2)...")
     logger.info("=" * 60)
 
     paths_cfg = config.get('paths', {})
-    selection_cfg = config.get('selection', {})
+#     selection_cfg = config.get('selection', {})
     adv_cfg = config.get('advanced_screening', {})
-
-    # 获取全市场股票列表
-    from data_layer.fetcher import get_all_a_stocks, get_stock_data, get_stocks_basic_info_batch
-
-    df_all_stocks = get_all_a_stocks()
-
-    if df_all_stocks.empty:
-        logger.error("无法获取全市场股票列表")
-        return pd.DataFrame()
-
-    # 初步过滤 (仅保留代码格式正确的)
-    initial_count = len(df_all_stocks)
-    df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
-    logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票")
-
-    # === 动态调整预过滤参数 ===
-    pre_filter_cfg = config.get('pre_filter', {})
-    auto_adjust = pre_filter_cfg.get('auto_adjust', False)
-
-    if auto_adjust:
-        capital = config.get('capital', {}).get('total', 1000000)
-        grid_amount = config.get('grid_amount', 10000)
-        selection_cfg = config.get('selection', {})
-
-        # 新公式：每格金额 × 3层 × 50%预留 = 单股最小占用
-        # scoring_pool_size = clamp(资金量 × 0.5 / (每格金额 × 3), 3, 20)
-        per_stock_min = grid_amount * 3 * 0.5  # 单股最小占用（预留50%资金）
-        scoring_pool_size = max(3, min(20, int(capital * 0.5 / per_stock_min)))
-
-        # 预过滤上限 = 多因子候选数 × 3，最多 30 只
-        max_candidates = min(30, scoring_pool_size * 3)
-
-        # 最低成交额联动：每格金额 × 50（确保日成交额能容纳每格交易量50倍）
-        dynamic_min_turnover = max(grid_amount * 50, 5000)  # 万元
-
-        # 更新配置（临时生效，不影响原文件）
-        pre_filter_cfg = pre_filter_cfg.copy()
-        pre_filter_cfg['max_candidates'] = max_candidates
-        pre_filter_cfg['min_turnover'] = dynamic_min_turnover
-        selection_cfg = selection_cfg.copy()
-        selection_cfg['scoring_pool_size'] = scoring_pool_size
-
-        config['selection'] = selection_cfg
-        logger.info(f"预过滤参数已动态调整: 资金量={capital/10000:.0f}万, 每格={grid_amount}元, "
-                   f"单股最小占用={per_stock_min:.0f}元, 最低成交额={dynamic_min_turnover/10000:.1f}亿, "
-                   f"预过滤上限={max_candidates}只, 多因子候选={scoring_pool_size}只")
-
-    # 先检查候选股票缓存是否存在且未过期
-    cached = load_candidate_stocks()
-    if cached is not None:
-        stock_list = cached['stocks']
-        logger.info(f"使用候选股票缓存: {len(stock_list)} 只 (缓存日期: {cached['date']})")
-
-        # 直接进入并行获取数据阶段
-        if not stock_list:
-            logger.error("候选股票列表为空")
-            return pd.DataFrame()
-
-        # 应用候选数量上限
-        max_candidates = pre_filter_cfg.get('max_candidates', 30)
-        if len(stock_list) > max_candidates:
-            stock_list = stock_list[:max_candidates]
-            logger.info(f"候选股票数量已限制为 {max_candidates} 只")
-
-        logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
-    else:
-        # 无缓存，执行全市场获取流程
-        top_n_by_turnover = pre_filter_cfg.get('top_n_by_turnover', 200)
-        df_spot = get_stocks_basic_info_batch()
-
-        if not df_spot.empty:
-            # 合并全市场列表和行情数据
-            df_merged = df_all_stocks.merge(df_spot[['code', 'price', 'turnover', 'is_st']], on='code', how='left')
-
-            # 按成交额降序排序，取 top N
-            df_merged = df_merged.sort_values('turnover', ascending=False)
-            top_n_list = df_merged['code'].head(top_n_by_turnover).tolist()
-            logger.info(f"按成交额排序后取 Top {top_n_by_turnover} 只候选")
-
-            # 预过滤：按用户配置的成交额/价格/ST 条件过滤
-            if pre_filter_cfg.get('enabled', True):
-                logger.info("执行预过滤阶段...")
-                stock_list = pre_filter_stocks_fast(top_n_list, config)
-            else:
-                stock_list = top_n_list
-        else:
-            # Fallback：无法获取行情时，按代码顺序
-            stock_list = df_all_stocks['code'].head(top_n_by_turnover).tolist()
-            logger.warning(f"无法获取批量行情，使用代码顺序候选 {len(stock_list)} 只")
-
-        if not stock_list:
-            logger.error("预过滤后无候选股票，请检查过滤条件是否过严")
-            return pd.DataFrame()
-
-        logger.info(f"预过滤后候选 {len(stock_list)} 只股票")
-
-        # 应用候选数量上限
-        max_candidates = pre_filter_cfg.get('max_candidates', 30)
-        if len(stock_list) > max_candidates:
-            stock_list = stock_list[:max_candidates]
-            logger.info(f"候选股票数量已限制为 {max_candidates} 只")
-
-        # 保存候选股票列表缓存
-        save_candidate_stocks(stock_list)
+    data_dir = paths_cfg.get('data_dir', './data')
 
     # 计算每只股票的因子指标
     stocks_factors = []
@@ -282,23 +162,11 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     vr_min_periods = pm_cfg.get('min_periods', 120)
     min_periods_required = max(60, vr_min_periods)
 
-    # === 并行获取数据阶段 ===
-    max_workers = pre_filter_cfg.get('parallel_workers',
-                                      config.get('small_capital', {}).get('parallel_workers', 3))
-    logger.info(f"并行获取 {len(stock_list)} 只股票数据 (workers={max_workers})...")
-
     results_lock = threading.Lock()
-    processed_count = [0]  # 使用列表以便在闭包中修改
 
-    def process_result(code: str, df: pd.DataFrame, status: str):
+    def process_result(code: str, df: pd.DataFrame, status: str, is_st: bool = False):
         """处理单个股票的获取结果"""
         nonlocal success_count, fail_count
-
-        with results_lock:
-            processed_count[0] += 1
-            pct = 100 * processed_count[0] // len(stock_list)
-            if processed_count[0] % max(1, len(stock_list) // 10) == 0:
-                logger.info(f"进度: {processed_count[0]}/{len(stock_list)} ({pct}%)")
 
         if status != "success" or df.empty:
             with results_lock:
@@ -334,9 +202,6 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             latest_price = df['close'].iloc[-1]
             avg_turnover = df['amount'].tail(20).mean() / 10000  # 万元
 
-            # ST 检查 (简化: 通过名称判断)
-            is_st = False
-
             factor_data = {
                 'code': code,
                 'price': latest_price,
@@ -354,25 +219,54 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             with results_lock:
                 fail_count += 1
 
-    # 使用 ThreadPoolExecutor 并行获取数据
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_fetch_single_stock_data,
-                          (code, paths_cfg['data_dir'], False, config)): code
-            for code in stock_list
-        }
+    # ============================================================
+    # 严格本地模式：只读取 SQLite 数据，不足时报错
+    # ============================================================
+    from data_layer.market_db import get_all_codes_from_kline, load_st_flags, get_multi_stock_data
 
-        for future in as_completed(futures):
-            code = futures[future]
-            try:
-                _, df, status = future.result()
-                process_result(code, df, status)
-            except Exception as e:
-                logger.debug(f"{code} 处理异常: {e}")
-                with results_lock:
-                    fail_count += 1
+    local_codes = get_all_codes_from_kline(data_dir)
+
+    if len(local_codes) < 500:
+        raise RuntimeError(
+            f"本地 SQLite 仅有 {len(local_codes)} 只股票，"
+            f"请先运行: python main.py --download-db"
+        )
+
+    logger.info(f"本地 SQLite 有 {len(local_codes)} 只股票数据，使用本地优先模式")
+    st_flags = load_st_flags(data_dir)
+
+    # 计算需要的历史数据起始日期（Path Memory 需要至少 120 天，留足余量取 2 年）
+    start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+
+    # 批量读取所有历史数据
+    df_all = get_multi_stock_data(local_codes, start_date=start_date, data_dir=data_dir)
+
+    if df_all is None or df_all.empty:
+        raise RuntimeError("本地数据读取为空，请检查数据库或重新运行 --download-db")
+
+    logger.info(f"SQLite 批量读取: {df_all['code'].nunique()} 只股票, {len(df_all)} 条记录")
+
+    total = len(local_codes)
+    for i, code in enumerate(local_codes):
+        df_code = df_all[df_all['code'] == code].copy()
+        if not df_code.empty:
+            df_code = df_code.drop(columns=['code'], errors='ignore')
+            is_st = st_flags.get(code, False)
+            process_result(code, df_code, "success", is_st)
+
+        # 进度日志
+        if (i + 1) % max(1, total // 10) == 0:
+            pct = 100 * (i + 1) // total
+            logger.info(f"进度: {i + 1}/{total} ({pct}%)")
 
     logger.info(f"指标计算完成: 成功 {success_count}, 失败 {fail_count}")
+
+    # 打印数据源健康报告（验证限流效果）
+    try:
+        from data_layer.fetcher import get_source_manager
+        get_source_manager().print_health_report()
+    except Exception:
+        pass
 
     if not stocks_factors:
         logger.error("没有获取到任何股票数据")
@@ -381,8 +275,7 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
     # 使用高级多因子打分器筛选
     screener = AdvancedMultiFactorScreener(config)
 
-    scoring_pool_size = selection_cfg.get('scoring_pool_size', 20)
-    df_result = screener.screen(stocks_factors, asset_type="stock", top_n=scoring_pool_size)
+    df_result = screener.screen(stocks_factors, asset_type="stock")
 
     if df_result.empty:
         logger.warning("高级多因子筛选后无股票，尝试放宽阈值...")
@@ -392,7 +285,7 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
         alt_adv['quality_threshold'] = 0.55  # 降低阈值
         alt_config['advanced_screening'] = alt_adv
         screener = AdvancedMultiFactorScreener(alt_config)
-        df_result = screener.screen(stocks_factors, asset_type="stock", top_n=scoring_pool_size)
+        df_result = screener.screen(stocks_factors, asset_type="stock")
 
     if df_result.empty:
         logger.error("高级多因子筛选无结果")
@@ -400,7 +293,9 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
 
     # 添加更多信息列
     df_result['reason'] = df_result.apply(
-        lambda row: f"总分:{row['total_score']:.4f} "
+        lambda row: f"综合:{row.get('final_score', row['total_score']):.4f} "
+                    f"因子:{row['total_score']:.4f} "
+                    f"资金适配:{row.get('capital_fitness', 1.0):.2f} "
                     f"(F1:{row.get('F1_norm', 0):.2f} "
                     f"F2:{row.get('F2_norm', 0):.2f} "
                     f"F3:{row.get('F3_norm', 0):.2f} "
@@ -420,485 +315,299 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True) ->
             f"{row['reason']} | 网格:{params.get('spacing_coef', 'N/A')}×ATR"
         )
 
-    # 生成 Markdown 选股结果报告
-    output_dir = paths_cfg['output_dir']
-    report_date = datetime.now().strftime('%Y%m%d')
-    report_file = os.path.join(output_dir, f"选股结果报告_{report_date}.md")
-
-    _generate_markdown_report(stocks_factors, df_result, report_file)
-
     # 自动更新配置文件
     if auto_update_config and len(df_result) > 0:
-        update_config_with_selected_stocks(df_result, config)
+        df_full = getattr(screener, 'last_full_results', df_result)
+        update_config_with_selected_stocks(df_result, df_full, config)
 
     return df_result
 
 
-def calculate_optimal_stock_count(config: dict) -> int:
+def update_config_with_selected_stocks(df_selection: pd.DataFrame,
+                                       df_full: pd.DataFrame,
+                                       config: dict):
     """
-    根据资金量动态计算最优股票数量
-
-    公式: 可用资金 / 单股最小占用 → 向下取整
-
-    约束条件:
-    - 可用资金 = 总资金 × (1 - 现金保留比例)
-    - 单股最小占用 = 每格金额 × 2层 (至少2层才能有效运行网格)
-    - 最大不超过 20 只，最少 1 只
-
-    返回: 1-20 只
-    """
-    capital_cfg = config.get('capital', {})
-    grid_cfg = config.get('grid', {})
-
-    total = capital_cfg.get('total', 100000)
-    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.4)
-    grid_amount = grid_cfg.get('grid_amount', 3000)
-    max_grids = grid_cfg.get('max_grids', 5)
-
-    available_capital = total * (1 - cash_reserve_ratio)
-    min_per_stock = grid_amount * 2
-
-    count = int(available_capital / min_per_stock)
-    return max(1, min(count, 20))
-
-
-def _generate_markdown_report(pre_filter_stocks: List[Dict], df_result: pd.DataFrame, output_path: str):
-    """
-    生成 Markdown 格式的选股结果报告
+    将选股结果写入配置文件，并将选股状态写入状态文件
 
     参数:
-        pre_filter_stocks: 预过滤后的股票列表（含因子数据）
-        df_result: 多因子筛选后的结果 DataFrame
-        output_path: 输出文件路径
-    """
-    from data_layer.fetcher import get_stocks_basic_info_batch
-
-    today = datetime.now().strftime('%Y-%m-%d')
-    lines = []
-
-    # 获取股票中文名称
-    codes = [s['code'] for s in pre_filter_stocks]
-    stock_names = {}
-    # 已知股票名称映射（候选股列表）
-    KNOWN_NAMES = {
-        '000001.SZ': '平安银行',
-        '000063.SZ': '中兴通讯',
-        '000066.SZ': '中国长城',
-        '000100.SZ': 'TCL科技',
-        '000333.SZ': '美的集团',
-        '000338.SZ': '潍柴动力',
-        '000425.SZ': '徐工机械',
-        '000651.SZ': '格力电器',
-        '002001.SZ': '新和成',
-        '002714.SZ': '牧原股份',
-        '300015.SZ': '爱尔眼科',
-    }
-    stock_names = {c: KNOWN_NAMES.get(c, c) for c in codes}
-
-    # 标题
-    lines.append("# A股网格交易系统 - 选股结果报告\n")
-    lines.append(f"**生成日期**: {today}\n")
-    lines.append(f"**选股模式**: 高级多因子横截面打分\n")
-    lines.append("")
-
-    # 一、预过滤结果
-    lines.append("## 一、预过滤结果\n")
-    lines.append("")
-    lines.append("| 股票代码 | 股票名称 | 最新价 | 日均成交额(万) | 是否ST |\n")
-    lines.append("|---------|---------|--------|----------------|--------|\n")
-    for s in pre_filter_stocks:
-        code = s['code']
-        name = stock_names.get(code, code)
-        price = s.get('price', 0)
-        turnover = s.get('avg_turnover', 0)
-        is_st = "是" if s.get('is_st', False) else "否"
-        lines.append(f"| {code} | {name} | {price:.2f} | {turnover:,.0f} | {is_st} |\n")
-    lines.append("")
-    lines.append(f"共 **{len(pre_filter_stocks)}** 只股票通过预过滤门槛\n")
-    lines.append("")
-
-    # 二、多因子评分结果
-    lines.append("## 二、多因子评分结果\n")
-    lines.append("")
-    lines.append("### 2.1 评分因子说明\n")
-    lines.append("")
-    lines.append("| 因子 | 名称 | 计算方法 | 含义 |\n")
-    lines.append("|------|------|----------|------|\n")
-    lines.append("| F1 | Reversion_Speed | OU半衰期 | 均值回归速度，τ越短越好（τ<7天为噪声） |\n")
-    lines.append("| F2 | Trend_Strength | ADX | 趋势强度，ADX<25表示弱趋势，适合网格交易 |\n")
-    lines.append("| F3 | Vol_Quality | 波动质量 | 倒U型函数，σ=0.25最优 |\n")
-    lines.append("| F4 | Path_Memory | Variance Ratio | 路径记忆，越小越稳定（残差分形结构） |\n")
-    lines.append("")
-
-    # 质量阈值
-    threshold = df_result.iloc[0]['score_percentile'] if len(df_result) > 0 else 0
-    threshold_val = df_result.iloc[0].get('passes_threshold', True)
-    lines.append(f"**动态质量阈值**: {threshold:.1f}%百分位  |  **通过阈值股票数**: {df_result['passes_threshold'].sum() if 'passes_threshold' in df_result.columns else 'N/A'}\n")
-    lines.append("")
-
-    lines.append("### 2.2 评分结果\n")
-    lines.append("")
-    lines.append("| 排名 | 代码 | 股票名称 | 总分 | F1 | F2 | F3 | F4 | 通过阈值 |\n")
-    lines.append("|------|------|---------|------|----|----|----|----|----------|\n")
-
-    for _, row in df_result.iterrows():
-        code = row['code']
-        name = stock_names.get(code, code)
-        total = row.get('total_score', 0)
-        f1 = row.get('F1_norm', 0)
-        f2 = row.get('F2_norm', 0)
-        f3 = row.get('F3_norm', 0)
-        f4 = row.get('F4_ortho', 0)
-        passes = "✓" if row.get('passes_threshold', False) else "✗"
-        lines.append(f"| {int(row['rank'])} | {code} | {name} | {total:.4f} | {f1:.2f} | {f2:.2f} | {f3:.2f} | {f4:.2f} | {passes} |\n")
-    lines.append("")
-
-    # 三、Top 3 股票详情
-    lines.append("## 三、Top 3 股票详情\n")
-    lines.append("")
-    for _, row in df_result.head(3).iterrows():
-        code = row['code']
-        name = stock_names.get(code, code)
-        total = row.get('total_score', 0)
-        f1 = row.get('F1_norm', 0)
-        f2 = row.get('F2_norm', 0)
-        f3 = row.get('F3_norm', 0)
-        f4 = row.get('F4_ortho', 0)
-        params = row.get('grid_params', {})
-        passes = "通过" if row.get('passes_threshold', False) else "未通过"
-
-        lines.append(f"### {int(row['rank'])}. {code}（{name}）\n")
-        lines.append("")
-        lines.append(f"- **总分**: {total:.4f}\n")
-        lines.append(f"- **因子得分**: F1={f1:.2f}, F2={f2:.2f}, F3={f3:.2f}, F4={f4:.2f}\n")
-        lines.append(f"- **网格参数**: spacing_coef={params.get('spacing_coef', 'N/A')}, position_pct={params.get('position_pct', 0)*100 if params.get('position_pct') else 0:.1f}%\n")
-        lines.append(f"- **阈值判定**: {passes}\n")
-
-        # 核心优势说明
-        adx_val = row.get('adx', 0)
-        vol = row.get('volatility_60d', 0)
-        ou_hl = row.get('ou_half_life', 0)
-        adv = []
-        if adx_val < 20:
-            adv.append(f"ADX={adx_val:.1f}（极弱趋势）")
-        if vol and 0.15 <= vol <= 0.35:
-            adv.append(f"波动率适配极佳({vol:.1%})")
-        if ou_hl and ou_hl < 30:
-            adv.append(f"OU半衰期={ou_hl:.0f}天（快速回归）")
-        if adv:
-            lines.append(f"- **核心优势**: {', '.join(adv)}\n")
-        lines.append("")
-
-    # 四、下一阶段
-    lines.append("## 四、下一阶段\n")
-    lines.append("")
-    lines.append("可运行优化模式进行两阶段参数优化：\n")
-    lines.append("```bash\n")
-    lines.append("python main.py --mode optimize\n")
-    lines.append("```\n")
-    lines.append("")
-    lines.append("或直接生成交易信号：\n")
-    lines.append("```bash\n")
-    lines.append("python main.py --mode signal\n")
-    lines.append("```\n")
-
-    # 写入文件
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
-
-    logger.info(f"选股结果报告已保存到：{output_path}")
-
-
-def update_config_with_selected_stocks(df_selection: pd.DataFrame, config: dict):
-    """
-    将选股结果写入配置文件，并设置选股完成标记
-
-    参数:
-        df_selection: 选股结果 DataFrame
+        df_selection: 选股结果 DataFrame（Top N）
+        df_full: 完整评分结果 DataFrame（所有评分过的股票）
         config: 当前配置字典
     """
-    import yaml
+    selected_stocks = df_selection['code'].tolist()
 
-    # 动态计算最优股票数量
-    save_top_n = calculate_optimal_stock_count(config)
-    selected_stocks = df_selection.head(save_top_n)['code'].tolist()
+    logger.info(f"\n选股结果: {len(selected_stocks)} 只股票")
 
-    logger.info(f"\n根据资金 {config.get('capital', {}).get('total', 0)/10000:.1f}万 " +
-                f"动态计算最优股票数量: {save_top_n} 只")
-    
-    # 读取原始配置文件
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
+    # 1. 保存完整评分数据到 SQLite
+    data_dir = config.get('paths', {}).get('data_dir', './data')
+    try:
+        from data_layer.market_db import save_screening_results
+        # 用 df_selection 中的 rank 更新完整 df
+        df_save = df_full.copy()
+        df_save = df_save.drop(columns=['rank'], errors='ignore')
+        if 'rank' in df_selection.columns:
+            rank_map = df_selection.set_index('code')['rank'].to_dict()
+            df_save['rank'] = df_save['code'].map(rank_map).fillna(0).astype(int)
+        save_screening_results(df_save, data_dir, selected_codes=selected_stocks)
+        logger.info(f"✓ 选股评分数据已保存到 SQLite（{len(df_save)} 条记录，"
+                    f"选中 {len(selected_stocks)} 只）")
+    except Exception as e:
+        logger.warning(f"保存选股结果到 SQLite 失败: {e}")
+
+    # 2. 更新 config.yaml 中的 stocks 列表（完整 YAML 读写）
     config_path = os.path.join(os.path.dirname(__file__), '..', 'configuration', 'config.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
-        config_lines = f.readlines()
-    
-    # 找到 stocks 部分并替换
-    new_stocks_yaml = '\n'.join([f'  - "{code}"' for code in selected_stocks])
-    
-    # 同时更新 selection_status 标记
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    status_yaml = (
-        f"\n# === 选股状态标记 (自动生成，勿手动修改) ===\n"
-        f"selection_status:\n"
-        f"  completed: true\n"
-        f"  last_selection_date: \"{today_str}\"\n"
-        f"  selection_count: {len(selected_stocks)}\n"
-        f"  version: \"v1.6.0\"\n"
-    )
-    
-    # 定位 stocks 段落和 selection_status 段落
-    new_lines = []
-    i = 0
-    stocks_updated = False
-    status_updated = False
-    
-    while i < len(config_lines):
-        line = config_lines[i]
-        
-        # 检测 stocks: 行
-        if line.strip().startswith('stocks:') and not stocks_updated:
-            new_lines.append(line)  # 保留 stocks: 行
-            stocks_updated = True
-            
-            # 跳过原有的股票列表 (直到下一个顶级配置项)
-            i += 1
-            while i < len(config_lines):
-                next_line = config_lines[i]
-                # 如果是缩进的列表项，跳过
-                if next_line.strip().startswith('- ') or (next_line.startswith('  ') and ':' not in next_line):
-                    i += 1
-                    continue
-                # 如果是空行，跳过
-                elif next_line.strip() == '':
-                    i += 1
-                    continue
-                else:
-                    # 遇到新的配置项，停止
-                    break
-            
-            # 插入新的股票列表
-            new_lines.append(new_stocks_yaml)
-            new_lines.append('\n')
-            continue
-        
-        # 检测 selection_status: 部分并更新
-        elif line.strip().startswith('selection_status:') and not status_updated:
-            # 跳过整个 selection_status 部分
-            i += 1
-            while i < len(config_lines):
-                next_line = config_lines[i]
-                # 如果是缩进的子项，跳过
-                if next_line.startswith('  ') and ':' in next_line:
-                    i += 1
-                    continue
-                # 如果是空行或顶级配置项，停止
-                else:
-                    break
-            
-            # 插入新的 status
-            new_lines.append(status_yaml)
-            new_lines.append('\n')
-            status_updated = True
-            continue
-        
-        new_lines.append(line)
-        i += 1
-    
-    # 如果没有找到 selection_status，在文件末尾添加
-    if not status_updated:
-        new_lines.append(status_yaml)
-        new_lines.append('\n')
-    
-    # 写回配置文件
+        full_config = yaml.safe_load(f)
+
+    full_config['stocks'] = selected_stocks
+    full_config.pop('selection_status', None)
+
     with open(config_path, 'w', encoding='utf-8') as f:
-        f.write(''.join(new_lines))
-    
+        yaml.safe_dump(full_config, f, allow_unicode=True,
+                       default_flow_style=False, sort_keys=False)
+
+    # 3. 写入选股状态到 config_state.json
+    from utils import load_state, save_state
+    state_path = 'configuration/config_state.json'
+    state = load_state(state_path)
+    state['selection_status'] = {
+        'completed': True,
+        'last_selection_date': today_str,
+        'last_data_update_date': today_str,
+        'selection_count': len(selected_stocks),
+        'version': 'v2.0.0',
+    }
+    save_state(state, state_path)
+
     logger.info(f"✓ 配置文件已更新：{config_path}")
+    logger.info(f"✓ 选股状态已写入：{state_path}")
     logger.info(f"  新股票池：{', '.join(selected_stocks[:5])}{'...' if len(selected_stocks) > 5 else ''}")
     logger.info(f"  选股日期：{today_str}")
-    logger.info(f"  下次运行将直接使用这些股票，无需重新选股")
-    logger.info(f"  如需重新选股，请使用 --force-select 参数")
+    logger.info("  下次运行将直接使用这些股票，无需重新选股")
+    logger.info("  如需重新选股，请使用 --force-select 参数")
 
 
 # ==================== 网格回测引擎 ====================
 
-def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
-                           grid_amount: float, initial_position: float,
-                           max_grids: int, commission_rate: float,
-                           stamp_tax: float, slippage_rate: float = 0.001,
-                           initial_cash: float = 1000000.0) -> Dict:
+def backtest_grid_strategy(df: pd.DataFrame,
+                           buy_spacing_pct: float,
+                           sell_spacing_pct: float,
+                           grid_amount: float,
+                           amount_multiplier: float,
+                           initial_position: float,
+                           max_grids: int,
+                           spacing_decay: float,
+                           commission_rate: float,
+                           stamp_tax: float,
+                           slippage_rate: float = 0.001,
+                            initial_cash: float = DEFAULT_INITIAL_CASH,
+                           atr_coef: float = 1.5) -> Dict:
     """
-    网格交易回测引擎（增强版 - 包含滑点）
-
-    原理:
-    - 将资金分成多份，在价格下跌时买入，上涨时卖出
-    - 记录每次交易，计算最终收益
-    - 考虑滑点成本（买入价上浮，卖出价下浮）
+    网格交易回测引擎（7参数版 — 含滑点、金字塔加仓、间距衰减）
 
     参数:
         df: 历史行情数据 (包含 close 列)
-        grid_spacing: 网格间距 (小数格式，如 0.02 表示 2%)
-        grid_amount: 每格买入金额 (元)
-        initial_position: 初始仓位 (小数格式，如 0.45 表示 45%)
+        buy_spacing_pct: 买入网格基础间距百分比 (如 0.02 = 2%)
+        sell_spacing_pct: 卖出网格基础间距百分比
+        grid_amount: 基础每格金额 (元)
+        amount_multiplier: 加仓倍数 (第k层金额 = amount × multiplier^k)
+        initial_position: 初始仓位 (小数，如 0.45 = 45%)
         max_grids: 最大网格层数
+        spacing_decay: 间距衰减 (第k层间距 = base × decay^(k-1))
         commission_rate: 佣金费率
         stamp_tax: 印花税率
-        slippage_rate: 滑点比率（默认 0.1%，即千 1）
-        initial_cash: 初始资金（默认 100 万，支持小资金优化）
-
-    返回:
-        回测结果字典 (包含收益率、最大回撤、卡尔玛比率等)
+        slippage_rate: 滑点比率
+        initial_cash: 初始资金
     """
     if df.empty or len(df) < 10:
         return {'calmar_ratio': 0, 'total_return': 0, 'max_drawdown': 1}
 
-    # === 流动性硬约束检查 ===
+    # === 流动性硬约束检查（级数求和）===
     grid_pool = initial_cash * (1 - initial_position)
-    max_grid_investment = grid_amount * max_grids
-    if max_grid_investment > grid_pool * 0.95:
+    k_vals = np.arange(max_grids)
+    total_investment = float(np.sum(grid_amount * (amount_multiplier ** k_vals)))
+    if total_investment > grid_pool * 0.95:
         return {
             'calmar_ratio': -999,
             'total_return': -1,
             'max_drawdown': 1,
             'reason': 'GRID_POOL_EXCEEDED',
             'grid_pool': grid_pool,
-            'required': max_grid_investment,
+            'required': total_investment,
         }
 
     prices = df['close'].values
 
-    # 初始化状态
-    cash = initial_cash  # 使用传入的初始资金
-    position = 0  # 持仓股数
-    avg_cost = 0  # 平均成本
-    total_slippage_cost = 0.0  # 累计滑点成本
+    # 预计算 ATR 序列（用于动态间距）
+    atr_series = None
+    if 'high' in df.columns and 'low' in df.columns:
+        try:
+            from trading_core.indicators import calculate_atr as _calc_atr
+            atr_series = _calc_atr(df, period=20).values
+        except Exception:
+            pass
+    # ATR 回退：若无 high/low 列或计算失败，使用价格的 2% 作为默认
+    if atr_series is None:
+        atr_series = np.full(len(prices), prices[0] * 0.02)
 
-    # 初始建仓
+    # 初始化状态
+    cash = initial_cash
+    position = 0  # 持仓股数（全部，含今日买入）
+    avg_cost = 0
+    total_slippage_cost = 0.0
+
+    # 初始建仓（T 日买入，T+1 才可卖）
     first_price = prices[0]
-    initial_investment = cash * initial_position  # 小数格式（0.45 = 45%）
-    position = int(initial_investment / first_price / 100) * 100  # 100 的整数倍
-    
-    # 应用滑点：买入成交价 = 理论价 × (1 + 滑点率)
+    initial_investment = cash * initial_position
+    position = int(initial_investment / first_price / 100) * 100
     actual_buy_price = first_price * (1 + slippage_rate)
     cost = position * actual_buy_price
-    fee = calculate_transaction_fee(
-        cost, 'buy', commission_rate, stamp_tax
-    )
+    fee = calculate_transaction_fee(cost, 'buy', commission_rate, stamp_tax)
     cash -= cost + fee
-    avg_cost = actual_buy_price  # 使用实际成交价作为成本
-    
-    # 网格中心价
-    center_price = first_price
-    
+    avg_cost = actual_buy_price
+
     # 交易记录
     trades = []
     portfolio_values = []
-    
-    # 网格价格计算
-    def get_grid_prices(center: float, spacing: float, n_grids: int) -> Tuple[List, List]:
-        """计算网格的买入价和卖出价"""
-        buy_prices = []
-        sell_prices = []
-        
-        for i in range(1, n_grids + 1):
-            buy_price = center * (1 - spacing / 100 * i)
-            sell_price = center * (1 + spacing / 100 * i)
-            buy_prices.append(buy_price)
-            sell_prices.append(sell_price)
-        
+
+    # 网格价格计算（7参数：不对称间距 + 累积衰减）
+    # buy_spacing/sell_spacing 已是 ratio 形式（0.02 = 2%）
+    def get_grid_prices(center: float, buy_spacing: float, sell_spacing: float,
+                        decay: float, n_grids: int) -> Tuple[List, List]:
+        decay_exps = np.array([decay ** j for j in range(n_grids)])
+        buy_cum_full = buy_spacing * np.cumsum(decay_exps)
+        sell_cum_full = sell_spacing * np.cumsum(decay_exps)
+        # 截断负价格层（高 decay + 多层时 cum > 1.0）
+        valid_mask = buy_cum_full < 1.0
+        buy_prices = (center * (1 - buy_cum_full[valid_mask])).tolist()
+        sell_prices = (center * (1 + sell_cum_full[:len(buy_prices)])).tolist()
         return buy_prices, sell_prices
-    
+
     # 逐日回测
     for i, price in enumerate(prices[1:], start=1):
         prev_price = prices[i - 1]
-        
-        # 检查是否突破网格范围，重新设定中心价
-        if price > center_price * (1 + grid_spacing / 100 * max_grids):
-            center_price = price
-        elif price < center_price * (1 - grid_spacing / 100 * max_grids):
-            center_price = price
-        
-        buy_prices, sell_prices = get_grid_prices(
-            center_price, grid_spacing, max_grids
+
+        # === 涨跌停检查 ===
+        change_pct = abs(price - prev_price) / prev_price if prev_price > 0 else 0
+        is_limit_up = change_pct >= 0.098 and price > prev_price
+        is_limit_down = change_pct >= 0.098 and price < prev_price
+
+        # === 滚动网格中心 = T-1 收盘价（与实盘一致）===
+        center_price = prev_price
+
+        # === 动态间距（ATR 自适应，买卖分离，与实盘统一公式）===
+        current_atr = atr_series[i] if i < len(atr_series) else atr_series[-1]
+        if current_atr <= 0:
+            current_atr = center_price * 0.02
+        daily_vol = current_atr / max(center_price, 0.01)  # ATR ratio ≈ 日波动率
+        dynamic_buy_spacing = compute_adaptive_spacing(
+            buy_spacing_pct, center_price, current_atr, atr_coef,
+            daily_volatility=daily_vol,
+            clamp_low=0.003, clamp_high=0.15,
         )
-        
-        # 尝试买入 (价格下跌触发)
-        for j, buy_price in enumerate(buy_prices):
-            if price <= buy_price and cash > grid_amount * 1.1:
-                # 可以买入
-                buy_qty = validate_buy_quantity(int(grid_amount / buy_price))
-                
-                if buy_qty > 0 and cash >= buy_qty * buy_price * 1.01:
-                    # 应用滑点：买入成交价 = 理论价 × (1 + 滑点率)
-                    actual_buy_price = buy_price * (1 + slippage_rate)
-                    cost = buy_qty * actual_buy_price
-                    fee = calculate_transaction_fee(
-                        cost, 'buy', commission_rate, stamp_tax
-                    )
-                    
-                    if cash >= cost + fee:
-                        # 更新持仓
-                        total_cost = position * avg_cost + buy_qty * actual_buy_price
-                        position += buy_qty
-                        avg_cost = total_cost / position if position > 0 else 0
-                        cash -= cost + fee
-                        
-                        # 记录滑点成本
-                        slippage_cost = buy_qty * (actual_buy_price - buy_price)
+        dynamic_sell_spacing = compute_adaptive_spacing(
+            sell_spacing_pct, center_price, current_atr, atr_coef,
+            daily_volatility=daily_vol,
+            clamp_low=0.003, clamp_high=0.15,
+        )
+
+        # === T+1: 开盘时可卖持仓 = 昨日收盘时的全部持仓 ===
+        available_position = position  # 今日买入的还没发生，所以全部可卖
+        today_bought = 0
+
+        # === 强制平仓检查 ===
+        lower_rail = center_price - 2 * current_atr
+        force_close_trigger = lower_rail * (1 - dynamic_buy_spacing * 3)
+        if price <= force_close_trigger and available_position > 100:
+            fc_qty = max(100, int(available_position * 0.5 / 100) * 100)
+            fc_qty = min(fc_qty, available_position)
+            actual_sell_price = price * (1 - slippage_rate)
+            revenue = fc_qty * actual_sell_price
+            sell_fee = calculate_transaction_fee(revenue, 'sell', commission_rate, stamp_tax)
+            position -= fc_qty
+            available_position -= fc_qty
+            cash += revenue - sell_fee
+            slippage_cost = fc_qty * (price - actual_sell_price)
+            total_slippage_cost += slippage_cost
+            trades.append({
+                'day': i, 'type': 'sell', 'price': actual_sell_price,
+                'qty': fc_qty, 'revenue': revenue - sell_fee,
+                'slippage': slippage_cost, 'reason': 'force_close'
+            })
+
+        buy_prices, sell_prices = get_grid_prices(
+            center_price, dynamic_buy_spacing, dynamic_sell_spacing,
+            spacing_decay, max_grids)
+
+        # === 买入（跌停不买，金字塔加仓）===
+        if not is_limit_down:
+            for buy_layer, buy_price in enumerate(buy_prices):
+                buy_amount = grid_amount * (amount_multiplier ** buy_layer)
+                if price <= buy_price and cash > buy_amount * 1.1:
+                    buy_qty = validate_buy_quantity(int(buy_amount / buy_price))
+                    if buy_qty > 0 and cash >= buy_qty * buy_price * 1.01:
+                        actual_buy_price = buy_price * (1 + slippage_rate)
+                        cost = buy_qty * actual_buy_price
+                        buy_fee = calculate_transaction_fee(cost, 'buy', commission_rate, stamp_tax)
+                        if cash >= cost + buy_fee:
+                            total_cost = position * avg_cost + buy_qty * actual_buy_price
+                            position += buy_qty
+                            today_bought += buy_qty
+                            avg_cost = total_cost / position if position > 0 else 0
+                            cash -= cost + buy_fee
+                            slippage_cost = buy_qty * (actual_buy_price - buy_price)
+                            total_slippage_cost += slippage_cost
+                            trades.append({
+                                'day': i, 'type': 'buy', 'price': actual_buy_price,
+                                'qty': buy_qty, 'cost': cost + buy_fee,
+                                'slippage': slippage_cost, 'layer': buy_layer + 1
+                            })
+
+        # === 卖出（涨停不卖，T+1约束，倒金字塔）===
+        if not is_limit_up:
+            for sell_layer, sell_price in enumerate(sell_prices):
+                if price >= sell_price and available_position > 0:
+                    inv_multiplier = 1.0 / max(amount_multiplier, 0.1)
+                    sell_amount = grid_amount * (inv_multiplier ** sell_layer)
+                    sell_qty = min(available_position, validate_buy_quantity(
+                        int(sell_amount / sell_price)
+                    ))
+                    if sell_qty > 0:
+                        actual_sell_price = sell_price * (1 - slippage_rate)
+                        revenue = sell_qty * actual_sell_price
+                        sell_fee = calculate_transaction_fee(revenue, 'sell', commission_rate, stamp_tax)
+                        position -= sell_qty
+                        available_position -= sell_qty
+                        cash += revenue - sell_fee
+                        slippage_cost = sell_qty * (sell_price - actual_sell_price)
                         total_slippage_cost += slippage_cost
-                        
                         trades.append({
-                            'day': i,
-                            'type': 'buy',
-                            'price': actual_buy_price,
-                            'qty': buy_qty,
-                            'cost': cost + fee,
-                            'slippage': slippage_cost
+                            'day': i, 'type': 'sell', 'price': actual_sell_price,
+                            'qty': sell_qty, 'revenue': revenue - sell_fee,
+                            'slippage': slippage_cost, 'layer': sell_layer + 1
                         })
-                        break
-        
-        # 尝试卖出 (价格上涨触发)
-        for j, sell_price in enumerate(sell_prices):
-            if price >= sell_price and position > 0:
-                # 可以卖出
-                sell_qty = min(position, validate_buy_quantity(
-                    int(grid_amount / sell_price)
-                ))
-                
-                if sell_qty > 0:
-                    # 应用滑点：卖出成交价 = 理论价 × (1 - 滑点率)
-                    actual_sell_price = sell_price * (1 - slippage_rate)
-                    revenue = sell_qty * actual_sell_price
-                    fee = calculate_transaction_fee(
-                        revenue, 'sell', commission_rate, stamp_tax
-                    )
-                    
-                    # 更新持仓
-                    position -= sell_qty
-                    cash += revenue - fee
-                    
-                    # 记录滑点成本
-                    slippage_cost = sell_qty * (sell_price - actual_sell_price)
-                    total_slippage_cost += slippage_cost
-                    
-                    trades.append({
-                        'day': i,
-                        'type': 'sell',
-                        'price': actual_sell_price,
-                        'qty': sell_qty,
-                        'revenue': revenue - fee,
-                        'slippage': slippage_cost
-                    })
-                    break
-        
+
         # 计算组合市值
         portfolio_value = cash + position * price
         portfolio_values.append(portfolio_value)
     
+    # === 买入持有基准 ===
+    bh_initial_investment = initial_cash * initial_position
+    bh_position = int(bh_initial_investment / first_price / 100) * 100
+    bh_actual_buy_price = first_price * (1 + slippage_rate)
+    bh_cost = bh_position * bh_actual_buy_price
+    bh_fee = calculate_transaction_fee(bh_cost, 'buy', commission_rate, stamp_tax)
+    bh_cash = initial_cash - bh_cost - bh_fee
+    benchmark_values = [bh_cash + bh_position * p for p in prices[1:]]
+    benchmark_return = (benchmark_values[-1] - initial_cash) / initial_cash if benchmark_values else 0
+
     # === 计算绩效指标 ===
-    
+
     # 总收益率
     final_value = portfolio_values[-1] if portfolio_values else 0
-    initial_value = 1000000.0
+    initial_value = initial_cash
     total_return = (final_value - initial_value) / initial_value
     
     # 最大回撤
@@ -951,7 +660,11 @@ def backtest_grid_strategy(df: pd.DataFrame, grid_spacing: float,
         'final_value': final_value,
         'trades': trades,
         'total_slippage_cost': total_slippage_cost,
-        'slippage_ratio': slippage_ratio
+        'slippage_ratio': slippage_ratio,
+        'portfolio_values': portfolio_values,
+        'initial_value': initial_cash,
+        'benchmark_values': benchmark_values,
+        'benchmark_return': benchmark_return,
     }
 
 
@@ -969,7 +682,9 @@ def _optimize_single_stock_worker(
     oos_start: str,
     oos_end: str,
     regime_state: str = 'normal',
-    regime_params: dict = None
+    regime_params: dict = None,
+    regime_state_phase1: str = None,
+    regime_state_phase2: str = None
 ) -> dict:
     """
     Worker 线程主函数：对单只股票执行完整两阶段优化（Phase1 贝叶斯 + Phase2 WF微调）
@@ -982,20 +697,29 @@ def _optimize_single_stock_worker(
         ins_bytes: 样本内数据（df_ins）的 pickle bytes
         oos_bytes: 样本外数据（df_oos）的 pickle bytes
         ins_start/ins_end/oos_start/oos_end: 日期范围字符串
+        regime_state: 兼容旧接口的市场状态（当 phase1/phase2 未指定时使用）
+        regime_state_phase1: Phase1 回测期结束时的市场状态
+        regime_state_phase2: Phase2 回测期结束时的市场状态
 
     返回:
         优化结果字典（含 phase1_params, final_params, final_calmar 等）
     """
-    import pickle
-    from io import BytesIO
+    # ProcessPoolExecutor 子进程不继承 logging 配置，需独立初始化
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # 反序列化数据（避免线程间共享 DataFrame 引用）
+    # 兼容旧接口：如果未指定分阶段状态，使用统一状态
+    rs_p1 = regime_state_phase1 if regime_state_phase1 is not None else regime_state
+    rs_p2 = regime_state_phase2 if regime_state_phase2 is not None else regime_state
+    import pickle
+
+    # 反序列化数据（避免进程间共享 DataFrame 引用）
     df_ins = pickle.loads(ins_bytes)
     df_oos = pickle.loads(oos_bytes)
 
     backtest_cfg = config.get('backtest', {})
-    n_trials = backtest_cfg.get('n_trials', 150)
-    n_startup = backtest_cfg.get('n_startup_trials', 20)
+    n_startup = backtest_cfg.get('n_startup_trials', 30)
     phase2_trials = 30
 
     try:
@@ -1005,39 +729,57 @@ def _optimize_single_stock_worker(
         if len(df_ins) < 60:
             return {'code': code, 'error': f'Phase1 数据不足: {len(df_ins)}天'}
 
-        # ========== Phase 1: 贝叶斯优化 ==========
-        logger.info(f"[{code}] >>> Phase 1: 贝叶斯优化 (n_trials={n_trials})")
+        # ========== Phase 1: 贝叶斯优化（7参数）==========
+        n_trials_actual = backtest_cfg.get('n_trials', 300)
+        logger.info(f"[{code}] >>> Phase 1: 贝叶斯优化 (n_trials={n_trials_actual}, 7参数)")
 
         def objective_phase1(trial):
-            # 根据市场状态动态调整搜索空间
-            if regime_state == 'soft_circuit_break':
-                spacing_range = [max(0.02, search_space['grid_spacing_range'][0]), min(0.04, search_space['grid_spacing_range'][1])]
+            # 根据 Phase1 对应的市场状态动态调整搜索空间
+            if rs_p1 == 'soft_circuit_break':
+                buy_spacing_range = [max(0.02, search_space['buy_spacing_range'][0]),
+                                     min(0.04, search_space['buy_spacing_range'][1])]
+                sell_spacing_range = [max(0.015, search_space['sell_spacing_range'][0]),
+                                      min(0.04, search_space['sell_spacing_range'][1])]
                 max_grids_range = [3, 5]
                 ip_range = [0.20, 0.35]
-            elif regime_state == 'warning':
-                spacing_range = search_space['grid_spacing_range']
-                max_grids_range = [4, 7]
-                ip_range = [0.30, 0.40]
+                multiplier_range = [0.5, 1.5]
+            elif rs_p1 == 'warning':
+                buy_spacing_range = search_space['buy_spacing_range']
+                sell_spacing_range = search_space['sell_spacing_range']
+                max_grids_range = [4, 8]
+                ip_range = [0.25, 0.45]
+                multiplier_range = [0.3, 2.5]
             else:  # normal
-                spacing_range = search_space['grid_spacing_range']
+                buy_spacing_range = search_space['buy_spacing_range']
+                sell_spacing_range = search_space['sell_spacing_range']
                 max_grids_range = search_space['max_grids_range']
                 ip_range = search_space['initial_position_range']
+                multiplier_range = search_space['multiplier_range']
 
-            grid_spacing = trial.suggest_float(
-                'grid_spacing', spacing_range[0], spacing_range[1], step=0.001)
-            grid_amount = trial.suggest_categorical(
-                'grid_amount', search_space['grid_amount_choices'])
-            ip = trial.suggest_float(
-                'initial_position', ip_range[0], ip_range[1], step=0.01)
-            max_g = trial.suggest_int(
-                'max_grids', max_grids_range[0], max_grids_range[1])
+            buy_spacing = trial.suggest_float('buy_spacing_pct',
+                buy_spacing_range[0], buy_spacing_range[1], step=0.001)
+            sell_spacing = trial.suggest_float('sell_spacing_pct',
+                sell_spacing_range[0], sell_spacing_range[1], step=0.001)
+            grid_amount = trial.suggest_int('grid_amount',
+                search_space['grid_amount_range'][0], search_space['grid_amount_range'][1], step=100)
+            multiplier = trial.suggest_float('amount_multiplier',
+                multiplier_range[0], multiplier_range[1], step=0.05)
+            ip = trial.suggest_float('initial_position',
+                ip_range[0], ip_range[1], step=0.01)
+            max_g = trial.suggest_int('max_grids',
+                max_grids_range[0], max_grids_range[1])
+            decay = trial.suggest_float('spacing_decay',
+                search_space['decay_range'][0], search_space['decay_range'][1], step=0.05)
 
             result = backtest_grid_strategy(
                 df_ins,
-                grid_spacing=grid_spacing,
+                buy_spacing_pct=buy_spacing,
+                sell_spacing_pct=sell_spacing,
                 grid_amount=grid_amount,
+                amount_multiplier=multiplier,
                 initial_position=ip,
                 max_grids=max_g,
+                spacing_decay=decay,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
                 stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
                 slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
@@ -1046,8 +788,10 @@ def _optimize_single_stock_worker(
 
             return calculate_composite_score(
                 result=result,
-                grid_spacing=grid_spacing,
+                buy_spacing_pct=buy_spacing,
+                sell_spacing_pct=sell_spacing,
                 max_grids=max_g,
+                amount_multiplier=multiplier,
                 n_days=len(df_ins)
             )
 
@@ -1060,22 +804,27 @@ def _optimize_single_stock_worker(
             pruner=optuna.pruners.MedianPruner()
         )
 
-        study.optimize(objective_phase1, n_trials=n_trials, show_progress_bar=False)
+        study.optimize(objective_phase1, n_trials=n_trials_actual, show_progress_bar=False)
 
         phase1_params = study.best_params
         phase1_score = study.best_value
 
-        logger.info(f"[{code}] Phase 1 最佳: spacing={phase1_params['grid_spacing']:.3f}, "
-                    f"amount={phase1_params['grid_amount']}, ip={phase1_params['initial_position']*100:.0f}%, "
-                    f"grids={phase1_params['max_grids']}, score={phase1_score:.4f}")
+        logger.info(f"[{code}] Phase 1 最佳: buy_sp={phase1_params['buy_spacing_pct']:.3f}, "
+                    f"sell_sp={phase1_params['sell_spacing_pct']:.3f}, "
+                    f"amount={phase1_params['grid_amount']}, mult={phase1_params['amount_multiplier']:.2f}, "
+                    f"ip={phase1_params['initial_position']*100:.0f}%, grids={phase1_params['max_grids']}, "
+                    f"decay={phase1_params['spacing_decay']:.2f}, score={phase1_score:.4f}")
 
-        # Phase 1 OOS 验证
+        # Phase 1 OOS 验证（用7参数）
         result_oos_phase1 = backtest_grid_strategy(
             df_oos,
-            grid_spacing=phase1_params['grid_spacing'],
+            buy_spacing_pct=phase1_params['buy_spacing_pct'],
+            sell_spacing_pct=phase1_params['sell_spacing_pct'],
             grid_amount=phase1_params['grid_amount'],
+            amount_multiplier=phase1_params['amount_multiplier'],
             initial_position=phase1_params['initial_position'],
             max_grids=phase1_params['max_grids'],
+            spacing_decay=phase1_params['spacing_decay'],
             commission_rate=backtest_cfg.get('commission_rate', 0.00015),
             stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
             slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
@@ -1084,46 +833,62 @@ def _optimize_single_stock_worker(
 
         oos_score_phase1 = calculate_composite_score(
             result=result_oos_phase1,
-            grid_spacing=phase1_params['grid_spacing'],
+            buy_spacing_pct=phase1_params['buy_spacing_pct'],
+            sell_spacing_pct=phase1_params['sell_spacing_pct'],
             max_grids=phase1_params['max_grids'],
+            amount_multiplier=phase1_params['amount_multiplier'],
             n_days=len(df_oos)
         )
 
         logger.info(f"[{code}] Phase 1 OOS: score={oos_score_phase1:.4f}, "
-                    f"Calmar={result_oos_phase1['calmar_ratio']:.4f}, "
-                    f"DD={result_oos_phase1['max_drawdown']*100:.2f}%")
+                    f"Calmar={result_oos_phase1.get('calmar_ratio', -999):.4f}, "
+                    f"DD={result_oos_phase1.get('max_drawdown', 1.0)*100:.2f}%")
 
-        # ========== Phase 2: WF微调 ==========
-        logger.info(f"[{code}] >>> Phase 2: WF微调 (n_trials={phase2_trials})")
+        # ========== Phase 2: WF微调（仅4参数：买卖间距、倍数、衰减）==========
+        logger.info(f"[{code}] >>> Phase 2: WF微调 (n_trials={phase2_trials}, 4参数)")
 
-        # 根据市场状态调整微调范围
-        if regime_state == 'soft_circuit_break':
-            fine_tune_range = 0.05  # 更窄的搜索范围
-            max_grids_phase2 = min(phase1_params['max_grids'], 5)
-        elif regime_state == 'warning':
+        # 根据 Phase2 对应的市场状态调整微调范围
+        if rs_p2 == 'soft_circuit_break':
+            fine_tune_range = 0.05
+        elif rs_p2 == 'warning':
             fine_tune_range = 0.08
-            max_grids_phase2 = min(phase1_params['max_grids'], 7)
         else:  # normal
             fine_tune_range = 0.10
-            max_grids_phase2 = phase1_params['max_grids']
 
-        phase2_spacing_min = max(0.001, phase1_params['grid_spacing'] * (1 - fine_tune_range))
-        phase2_spacing_max = phase1_params['grid_spacing'] * (1 + fine_tune_range)
-        phase2_ip_min = max(0.20, phase1_params['initial_position'] * (1 - fine_tune_range))
-        phase2_ip_max = min(0.80, phase1_params['initial_position'] * (1 + fine_tune_range))
+        # Phase2 微调范围：围绕 Phase1 最优值 ±fine_tune_range
+        p2_bs_min = max(0.005, phase1_params['buy_spacing_pct'] * (1 - fine_tune_range))
+        p2_bs_max = min(0.08, phase1_params['buy_spacing_pct'] * (1 + fine_tune_range))
+        p2_ss_min = max(0.005, phase1_params['sell_spacing_pct'] * (1 - fine_tune_range))
+        p2_ss_max = min(0.08, phase1_params['sell_spacing_pct'] * (1 + fine_tune_range))
+        p2_mult_min = max(0.25, phase1_params['amount_multiplier'] * (1 - fine_tune_range))
+        p2_mult_max = min(3.5, phase1_params['amount_multiplier'] * (1 + fine_tune_range))
+        p2_decay_min = max(0.4, phase1_params['spacing_decay'] * (1 - fine_tune_range))
+        p2_decay_max = min(2.5, phase1_params['spacing_decay'] * (1 + fine_tune_range))
+
+        # Phase2 固定参数
+        p2_grid_amount = phase1_params['grid_amount']
+        p2_initial_position = phase1_params['initial_position']
+        p2_max_grids = phase1_params['max_grids']
 
         def objective_phase2(trial):
-            grid_spacing = trial.suggest_float(
-                'grid_spacing', phase2_spacing_min, phase2_spacing_max, step=0.0005)
-            ip = trial.suggest_float(
-                'initial_position', phase2_ip_min, phase2_ip_max, step=0.005)
+            buy_spacing = trial.suggest_float(
+                'buy_spacing_pct', p2_bs_min, p2_bs_max, step=0.0005)
+            sell_spacing = trial.suggest_float(
+                'sell_spacing_pct', p2_ss_min, p2_ss_max, step=0.0005)
+            multiplier = trial.suggest_float(
+                'amount_multiplier', p2_mult_min, p2_mult_max, step=0.02)
+            decay = trial.suggest_float(
+                'spacing_decay', p2_decay_min, p2_decay_max, step=0.02)
 
             result = backtest_grid_strategy(
                 df_oos,
-                grid_spacing=grid_spacing,
-                grid_amount=phase1_params['grid_amount'],
-                initial_position=ip,
-                max_grids=max_grids_phase2,
+                buy_spacing_pct=buy_spacing,
+                sell_spacing_pct=sell_spacing,
+                grid_amount=p2_grid_amount,
+                amount_multiplier=multiplier,
+                initial_position=p2_initial_position,
+                max_grids=p2_max_grids,
+                spacing_decay=decay,
                 commission_rate=backtest_cfg.get('commission_rate', 0.00015),
                 stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
                 slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
@@ -1132,8 +897,10 @@ def _optimize_single_stock_worker(
 
             return calculate_composite_score(
                 result=result,
-                grid_spacing=grid_spacing,
-                max_grids=max_grids_phase2,
+                buy_spacing_pct=buy_spacing,
+                sell_spacing_pct=sell_spacing,
+                max_grids=p2_max_grids,
+                amount_multiplier=multiplier,
                 n_days=len(df_oos)
             )
 
@@ -1148,32 +915,41 @@ def _optimize_single_stock_worker(
         study_phase2.optimize(objective_phase2, n_trials=phase2_trials, show_progress_bar=False)
 
         final_params = {
-            'grid_spacing': study_phase2.best_params['grid_spacing'],
-            'grid_amount': phase1_params['grid_amount'],
-            'initial_position': study_phase2.best_params['initial_position'],
-            'max_grids': max_grids_phase2
+            'buy_spacing_pct': study_phase2.best_params['buy_spacing_pct'],
+            'sell_spacing_pct': study_phase2.best_params['sell_spacing_pct'],
+            'grid_amount': p2_grid_amount,
+            'amount_multiplier': study_phase2.best_params['amount_multiplier'],
+            'initial_position': p2_initial_position,
+            'max_grids': p2_max_grids,
+            'spacing_decay': study_phase2.best_params['spacing_decay'],
         }
         final_score = study_phase2.best_value
 
-        logger.info(f"[{code}] Phase 2 完成: spacing={final_params['grid_spacing']:.4f}, "
-                    f"ip={final_params['initial_position']*100:.1f}%, score={final_score:.4f}")
+        logger.info(f"[{code}] Phase 2 完成: buy_sp={final_params['buy_spacing_pct']:.4f}, "
+                    f"sell_sp={final_params['sell_spacing_pct']:.4f}, "
+                    f"mult={final_params['amount_multiplier']:.2f}, decay={final_params['spacing_decay']:.2f}, "
+                    f"score={final_score:.4f}")
 
-        # 最终 OOS 验证
+        # 最终 OOS 验证（7参数）
         result_final = backtest_grid_strategy(
             df_oos,
-            grid_spacing=final_params['grid_spacing'],
+            buy_spacing_pct=final_params['buy_spacing_pct'],
+            sell_spacing_pct=final_params['sell_spacing_pct'],
             grid_amount=final_params['grid_amount'],
+            amount_multiplier=final_params['amount_multiplier'],
             initial_position=final_params['initial_position'],
             max_grids=final_params['max_grids'],
+            spacing_decay=final_params['spacing_decay'],
             commission_rate=backtest_cfg.get('commission_rate', 0.00015),
             stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
             slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
             initial_cash=allocated_cash
         )
 
-        logger.info(f"[{code}] 最终 OOS: Calmar={result_final['calmar_ratio']:.4f}, "
-                    f"DD={result_final['max_drawdown']*100:.2f}%, "
-                    f"trades={result_final['n_trades']}, ret={result_final['total_return']*100:.2f}%")
+        logger.info(f"[{code}] 最终 OOS: Calmar={result_final.get('calmar_ratio', -999):.4f}, "
+                    f"DD={result_final.get('max_drawdown', 1.0)*100:.2f}%, "
+                    f"trades={result_final.get('n_trades', 0)}, "
+                    f"ret={result_final.get('total_return', -1)*100:.2f}%")
 
         return {
             'code': code,
@@ -1182,10 +958,10 @@ def _optimize_single_stock_worker(
             'phase1_oos_score': oos_score_phase1,
             'final_params': final_params,
             'final_score': final_score,
-            'final_calmar': result_final['calmar_ratio'],
-            'final_drawdown': result_final['max_drawdown'],
-            'final_trades': result_final['n_trades'],
-            'final_return': result_final['total_return'],
+            'final_calmar': result_final.get('calmar_ratio', -999),
+            'final_drawdown': result_final.get('max_drawdown', 1.0),
+            'final_trades': result_final.get('n_trades', 0),
+            'final_return': result_final.get('total_return', -1),
             'error': None
         }
 
@@ -1205,244 +981,6 @@ def _optimize_single_stock_worker(
             'error': str(e)
         }
 
-
-def _generate_optimization_markdown_report(
-    all_results: List[dict],
-    config: dict,
-    output_path: str,
-    elapsed_time: float,
-    ins_start: str,
-    ins_end: str,
-    oos_start: str,
-    oos_end: str,
-    search_space: dict
-):
-    """
-    生成 Markdown 格式的优化参数解释报告
-
-    参数:
-        all_results: 所有股票的优化结果
-        config: 配置字典
-        output_path: 输出文件路径
-        elapsed_time: 优化耗时（秒）
-        ins_start/ins_end/oos_start/oos_end: 优化周期
-    """
-    import pickle
-    from io import BytesIO
-
-    today = datetime.now().strftime('%Y-%m-%d')
-    lines = []
-
-    # 已知股票名称映射
-    KNOWN_NAMES = {
-        '000001.SZ': '平安银行', '000063.SZ': '中兴通讯', '000066.SZ': '中国长城',
-        '000100.SZ': 'TCL科技', '000333.SZ': '美的集团', '000338.SZ': '潍柴动力',
-        '000425.SZ': '徐工机械', '000651.SZ': '格力电器', '002001.SZ': '新和成',
-        '002714.SZ': '牧原股份', '300015.SZ': '爱尔眼科',
-    }
-
-    capital_cfg = config.get('capital', {})
-    backtest_cfg = config.get('backtest', {})
-    total_cash = capital_cfg.get('total', 100000)
-    allocated_cash = total_cash * (1 - capital_cfg.get('cash_reserve_ratio', 0.40)) / max(1, len(all_results))
-    grid_pool = allocated_cash * (1 - capital_cfg.get('initial_position', 0.45))
-
-    n_stocks = len(all_results)
-    n_workers = n_stocks
-    n_trials = backtest_cfg.get('n_trials', 150)
-
-    # 标题
-    lines.append("# A股网格交易系统 - 参数优化报告\n")
-    lines.append(f"**生成日期**: {today}\n")
-    lines.append(f"**优化类型**: 两阶段贝叶斯优化 + WF微调\n")
-    lines.append(f"**并行化**: {n_stocks} 只股票 × {n_workers} workers\n")
-    lines.append("")
-
-    # 一、优化概述
-    lines.append("## 一、优化概述\n")
-    lines.append("")
-    lines.append("| 指标 | 值 |\n")
-    lines.append("|------|-----|\n")
-    lines.append(f"| 总股票数 | {n_stocks} |\n")
-    lines.append(f"| 优化耗时 | {elapsed_time:.1f} 秒 |\n")
-    lines.append(f"| Phase 1 试验次数 | {n_trials} trial/股 |\n")
-    lines.append(f"| Phase 2 试验次数 | 30 trial/股 |\n")
-    lines.append(f"| 样本内周期 | {ins_start} 至 {ins_end} |\n")
-    lines.append(f"| 样本外周期 | {oos_start} 至 {oos_end} |\n")
-    lines.append("")
-
-    # 二、股票优化结果汇总
-    lines.append("## 二、股票优化结果汇总\n")
-    lines.append("")
-    lines.append("| 股票代码 | 股票名称 | Phase1间距 | Phase1每格 | Phase1初仓 | Phase1分数 | "
-                "最终间距 | 最终每格 | 最终初仓 | 最终Calmar | 最终回撤 | 交易次数 | 最终收益 |\n")
-    lines.append("|---------|---------|-----------|-----------|-----------|-----------|"
-                "---------|---------|---------|-----------|---------|---------|---------|\n")
-
-    for r in all_results:
-        code = r['code']
-        name = KNOWN_NAMES.get(code, code)
-        p1 = r.get('phase1_params', {})
-        fp = r.get('final_params', {})
-
-        lines.append(f"| {code} | {name} | "
-                     f"{p1.get('grid_spacing', 0)*100:.2f}% | "
-                     f"{p1.get('grid_amount', 'N/A')} | "
-                     f"{p1.get('initial_position', 0)*100:.0f}% | "
-                     f"{r.get('phase1_score', 0):.4f} | "
-                     f"{fp.get('grid_spacing', 0)*100:.2f}% | "
-                     f"{fp.get('grid_amount', 'N/A')} | "
-                     f"{fp.get('initial_position', 0)*100:.1f}% | "
-                     f"{r.get('final_calmar', 0):.4f} | "
-                     f"{r.get('final_drawdown', 0)*100:.2f}% | "
-                     f"{r.get('final_trades', 0)} | "
-                     f"{r.get('final_return', 0)*100:.2f}% |\n")
-    lines.append("")
-
-    # 三、最终参数解释
-    lines.append("## 三、最终参数解释\n")
-    lines.append("")
-
-    for r in all_results:
-        if r.get('error'):
-            continue
-
-        code = r['code']
-        name = KNOWN_NAMES.get(code, code)
-        fp = r.get('final_params', {})
-        p1 = r.get('phase1_params', {})
-
-        spacing = fp.get('grid_spacing', 0)
-        amount = fp.get('grid_amount', 0)
-        ip = fp.get('initial_position', 0)
-        max_grids = fp.get('max_grids', 0)
-        calmar = r.get('final_calmar', 0)
-        dd = r.get('final_drawdown', 0)
-        ret = r.get('final_return', 0)
-
-        # 约束检查
-        constraint_ok = (amount * max_grids <= grid_pool * 0.95)
-
-        lines.append(f"### {code}（{name}）\n")
-        lines.append("")
-        lines.append(f"**评分**: Calmar={calmar:.4f}, 收益={ret*100:.2f}%, 回撤={dd*100:.2f}%\n")
-        lines.append("")
-
-        lines.append(f"#### 网格间距 (grid_spacing = {spacing*100:.2f}%)\n")
-        lines.append(f"- **Phase1最优**: {p1.get('grid_spacing', 0)*100:.2f}%, **Phase2微调**: {spacing*100:.2f}%\n")
-        spacing_change = (spacing - p1.get('grid_spacing', 0)) / p1.get('grid_spacing', 1) * 100
-        lines.append(f"- **微调幅度**: {spacing_change:+.1f}%\n")
-        lines.append(f"- **搜索范围**: {search_space['grid_spacing_range'][0]*100:.1f}% ~ {search_space['grid_spacing_range'][1]*100:.1f}%\n")
-        lines.append(f"- **解释**: ")
-        if spacing < 0.02:
-            lines.append("间距偏小，可在低波动环境下增加交易密度\n")
-        elif spacing > 0.03:
-            lines.append("间距偏大，适合高波动品种，减少摩擦成本\n")
-        else:
-            lines.append("间距适中，平衡交易频率与资金效率\n")
-        lines.append("")
-
-        lines.append(f"#### 每格买入金额 (grid_amount = {amount}元)\n")
-        lines.append(f"- **约束检查**: {amount} × {max_grids} = {amount * max_grids} <= {grid_pool*0.95:.0f} (网格池×95%) {'(✓)' if constraint_ok else '(✗)'}\n")
-        lines.append(f"- **解释**: 每格金额受网格池({grid_pool:.0f}元)约束，确保最多{max_grids}格买入不超限\n")
-        lines.append("")
-
-        lines.append(f"#### 初始仓位 (initial_position = {ip*100:.1f}%)\n")
-        lines.append(f"- **Phase1最优**: {p1.get('initial_position', 0)*100:.1f}%, **Phase2微调**: {ip*100:.1f}%\n")
-        ip_change = (ip - p1.get('initial_position', 0)) / p1.get('initial_position', 1) * 100
-        lines.append(f"- **微调幅度**: {ip_change:+.1f}%\n")
-        lines.append(f"- **解释**: ")
-        if ip < 0.40:
-            lines.append("初始仓位偏低，保留更多现金用于网格买入和风控\n")
-        elif ip > 0.50:
-            lines.append("初始仓位偏高，当前市场环境下偏激进\n")
-        else:
-            lines.append("初始仓位符合系统推荐的 40%~50% 区间\n")
-        lines.append("")
-
-        lines.append(f"#### 最大网格层数 (max_grids = {max_grids}层)\n")
-        coverage = max_grids * spacing * 100
-        lines.append(f"- **覆盖范围**: ±{coverage:.1f}% 价格波动 ({max_grids} × {spacing*100:.2f}%)\n")
-        lines.append(f"- **搜索范围**: {search_space['max_grids_range'][0]} ~ {search_space['max_grids_range'][1]} 层\n")
-        lines.append(f"- **解释**: ")
-        if coverage < 8:
-            lines.append(f"{max_grids}层覆盖约±{coverage:.1f}%波动，适合低波动环境\n")
-        elif coverage > 15:
-            lines.append(f"{max_grids}层覆盖约±{coverage:.1f}%波动，适合高波动环境\n")
-        else:
-            lines.append(f"{max_grids}层覆盖约±{coverage:.1f}%波动，适合震荡市\n")
-        lines.append("")
-        lines.append("")
-
-    # 四、参数稳定性分析
-    lines.append("## 四、参数稳定性分析\n")
-    lines.append("")
-    lines.append("### Phase1 vs Phase2 对比\n")
-    lines.append("")
-    lines.append("| 股票 | Phase1间距 | Phase2间距 | 间距变化 | Phase1初仓 | Phase2初仓 | 初仓变化 | 稳定性 |\n")
-    lines.append("|------|-----------|-----------|---------|-----------|-----------|---------|--------|\n")
-
-    for r in all_results:
-        if r.get('error'):
-            continue
-        code = r['code']
-        name = KNOWN_NAMES.get(code, code)[:4]
-        p1 = r.get('phase1_params', {})
-        fp = r.get('final_params', {})
-
-        p1_sp = p1.get('grid_spacing', 0)
-        p2_sp = fp.get('grid_spacing', 0)
-        sp_chg = (p2_sp - p1_sp) / p1_sp * 100 if p1_sp else 0
-
-        p1_ip = p1.get('initial_position', 0)
-        p2_ip = fp.get('initial_position', 0)
-        ip_chg = (p2_ip - p1_ip) / p1_ip * 100 if p1_ip else 0
-
-        stability = "稳定" if abs(sp_chg) < 5 and abs(ip_chg) < 5 else "一般" if abs(sp_chg) < 10 else "敏感"
-
-        lines.append(f"| {code}({name}) | {p1_sp*100:.2f}% | {p2_sp*100:.2f}% | {sp_chg:+.1f}% | "
-                     f"{p1_ip*100:.1f}% | {p2_ip*100:.1f}% | {ip_chg:+.1f}% | {stability} |\n")
-    lines.append("")
-
-    # 五、风险提示
-    lines.append("## 五、风险提示\n")
-    lines.append("")
-    lines.append("1. **样本外衰减**: Phase1 IS 分数普遍高于 Phase2 OOS 分数 10-20%，属正常现象\n")
-    lines.append("2. **流动性约束**: grid_amount × max_grids 不能超过网格池的 95%，否则触发 GRID_POOL_EXCEEDED\n")
-    lines.append("3. **T+1 规则**: 最小间距需 >= 1.5 × 日均振幅，避免次日无法纠错\n")
-    lines.append("4. **市场环境**: 参数基于近一年历史数据，外推需谨慎\n")
-    lines.append("")
-
-    # 六、配置建议
-    lines.append("## 六、配置建议\n")
-    lines.append("")
-    lines.append("根据上述优化结果，建议在 `config.yaml` 中设置：\n")
-    lines.append("")
-    lines.append("```yaml\n")
-    lines.append("# 优化后的默认参数（由系统自动计算，可手动覆盖）\n")
-    lines.append("grid:\n")
-
-    # 取加权平均作为推荐值
-    avg_spacing = np.mean([r.get('final_params', {}).get('grid_spacing', 0) for r in all_results if not r.get('error')]) * 100
-    avg_ip = np.mean([r.get('final_params', {}).get('initial_position', 0) for r in all_results if not r.get('error')]) * 100
-    avg_amount = int(np.mean([r.get('final_params', {}).get('grid_amount', 0) for r in all_results if not r.get('error')]))
-    avg_grids = int(np.mean([r.get('final_params', {}).get('max_grids', 0) for r in all_results if not r.get('error')]))
-
-    lines.append(f"  base_spacing: {avg_spacing:.2f}    # 系统推荐值（加权平均）\n")
-    lines.append(f"  initial_position: {avg_ip:.2f} # 系统推荐值\n")
-    lines.append(f"  grid_amount: {avg_amount}       # 系统推荐值\n")
-    lines.append(f"  max_grids: {avg_grids}           # 系统推荐值\n")
-    lines.append("```\n")
-    lines.append("")
-
-    lines.append("---\n")
-    lines.append("*本报告由 grid_trading_system v4.0 自动生成*\n")
-
-    # 写入文件
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
-
-    logger.info(f"优化参数报告已保存到：{output_path}")
 
 
 def run_two_phase_optimization(config: dict) -> Dict:
@@ -1480,30 +1018,55 @@ def run_two_phase_optimization(config: dict) -> Dict:
     logger.info(f"Phase 2 (WF微调): {oos_start} 至 {oos_end}")
 
     stocks = config.get('stocks', [])
-    grid_cfg = config.get('grid', {})
+#     grid_cfg = config.get('grid', {})
     backtest_cfg = config.get('backtest', {})
     paths_cfg = config.get('paths', {})
     capital_cfg = config.get('capital', {})
 
     # === 获取市场状态（RegimeFilter）===
     from risk_management.market_regime import RegimeFilter
+    from utils.utils import load_state, save_state
     benchmark_code = config.get('regime_filter', {}).get('benchmark_index', '000300.SH')
-    benchmark_df = get_stock_data(benchmark_code, data_dir=paths_cfg.get('data_dir', './data'))
+    benchmark_df = get_stock_data(benchmark_code, data_dir=paths_cfg.get('data_dir', './data'),
+                                  enable_incremental=False, use_cache=True, fallback_to_cache=True)
+
+    regime_filter = RegimeFilter(config)
+
+    # 加载持久化的 RegimeFilter 状态
+    app_state = load_state()
+    regime_saved = app_state.get('regime_filter_state', {})
+    regime_filter.from_dict(regime_saved)
 
     if not benchmark_df.empty:
+        if 'date' in benchmark_df.columns and not isinstance(benchmark_df.index, pd.DatetimeIndex):
+            benchmark_df = benchmark_df.set_index('date')
         benchmark_data = {
             'close': benchmark_df['close'],
             'high': benchmark_df.get('high', benchmark_df['close']),
             'low': benchmark_df.get('low', benchmark_df['close']),
             'volume': benchmark_df.get('volume', pd.Series())
         }
-        regime_filter = RegimeFilter(config)
-        regime_result = regime_filter.check(benchmark_data)
-        regime_state = regime_result['state']
-        regime_params = regime_result['params']
-        logger.info(f"市场状态: {regime_state}, spacing={regime_params['grid_spacing_multiplier']:.1f}x, max_grids={regime_params['max_grids']}")
+
+        # Phase1 使用 ins_end 日期的历史状态（回测期结束时的市场状态）
+        ins_end_dt = pd.to_datetime(ins_end)
+        regime_result_p1 = regime_filter.check_historical(benchmark_data, as_of_date=ins_end_dt)
+        regime_state_phase1 = regime_result_p1['state']
+
+        # Phase2 使用当前日期的市场状态（实时 check，更新内部状态）
+        regime_result_p2 = regime_filter.check(benchmark_data)
+        regime_state_phase2 = regime_result_p2['state']
+        regime_params = regime_result_p2['params']
+
+        logger.info(f"Phase1 市场状态({ins_end}): {regime_state_phase1}")
+        logger.info(f"Phase2 市场状态({oos_end}): {regime_state_phase2}, "
+                    f"spacing={regime_params['grid_spacing_multiplier']:.1f}x, max_grids={regime_params['max_grids']}")
+
+        # 保存更新后的 RegimeFilter 状态
+        app_state['regime_filter_state'] = regime_filter.to_dict()
+        save_state(app_state)
     else:
-        regime_state = 'normal'
+        regime_state_phase1 = 'normal'
+        regime_state_phase2 = 'normal'
         regime_params = {'grid_spacing_multiplier': 1.0, 'max_grids': 9, 'initial_position': 0.45}
         logger.warning("无法获取基准指数数据，使用默认市场状态")
 
@@ -1534,21 +1097,21 @@ def run_two_phase_optimization(config: dict) -> Dict:
                 f"网格池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
 
     # 搜索空间
-    search_space = build_adaptive_search_space(allocated_cash, initial_position)
-    logger.info(f"Phase 1 搜索空间: grid_amount={search_space['grid_amount_choices']}, "
-                f"max_grids={search_space['max_grids_range']}")
+    search_space = build_adaptive_search_space(allocated_cash, initial_position, config=config)
+    logger.info(f"Phase 1 搜索空间: grid_amount={search_space['grid_amount_range']}, "
+                f"max_grids={search_space['max_grids_range']}, "
+                f"buy_spacing={search_space['buy_spacing_range']}, "
+                f"sell_spacing={search_space['sell_spacing_range']}")
 
     # 并行优化配置
     import time
     import pickle
-    from io import BytesIO
 
     parallel_cfg = config.get('parallel_optimization', {})
     parallel_enabled = parallel_cfg.get('enabled', True)
     max_workers = parallel_cfg.get('max_workers', stocks_to_optimize) or stocks_to_optimize
 
     all_results = []
-    _result_lock = threading.Lock()
 
     # 获取并行化前的起始时间
     optimization_start_time = time.time()
@@ -1563,7 +1126,8 @@ def run_two_phase_optimization(config: dict) -> Dict:
         stock_data_map = {}
         valid_stocks = []
         for code in stocks:
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'], selected_stocks=stocks)
+            df = get_stock_data(code, data_dir=paths_cfg['data_dir'], selected_stocks=stocks,
+                               enable_incremental=False, use_cache=True, fallback_to_cache=True)
             if df.empty or len(df) < 250:
                 logger.warning(f"{code} 数据不足，跳过")
                 continue
@@ -1576,7 +1140,8 @@ def run_two_phase_optimization(config: dict) -> Dict:
 
             stock_data_map[code] = {
                 'ins_bytes': pickle.dumps(df_ins),
-                'oos_bytes': pickle.dumps(df_oos)
+                'oos_bytes': pickle.dumps(df_oos),
+                'full_df_bytes': pickle.dumps(df),
             }
             valid_stocks.append(code)
 
@@ -1588,8 +1153,8 @@ def run_two_phase_optimization(config: dict) -> Dict:
         actual_workers = min(max_workers, n_valid)
         logger.info(f"有效股票 {n_valid} 只，启动 {actual_workers} 个 worker")
 
-        # 提交所有任务
-        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        # 提交所有任务（ProcessPoolExecutor 真正多核并行）
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
             futures = {}
             for code in valid_stocks:
                 data = stock_data_map[code]
@@ -1605,267 +1170,143 @@ def run_two_phase_optimization(config: dict) -> Dict:
                     ins_end,
                     oos_start,
                     oos_end,
-                    regime_state,
-                    regime_params
+                    'normal',
+                    regime_params,
+                    regime_state_phase1,
+                    regime_state_phase2
                 )
                 futures[future] = code
 
-            # 收集结果（按完成顺序）+ tqdm 进度条
-            from tqdm import tqdm
-            with tqdm(total=n_valid, desc="优化进度", unit="只",
-                      bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
-                for future in as_completed(futures):
-                    code = futures[future]
-                    try:
-                        result = future.result()
-                    except Exception as e:
-                        logger.error(f"Worker {code} 异常: {e}")
-                        result = {'code': code, 'error': str(e)}
+            # 收集结果（按完成顺序）
+            n_completed = 0
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.error(f"Worker {code} 异常: {e}")
+                    result = {'code': code, 'error': str(e)}
 
-                    with _result_lock:
-                        all_results.append(result)
-
-                    pbar.update(1)
-                    pbar.set_postfix_str(f"当前: {code}")
+                all_results.append(result)
+                n_completed += 1
+                logger.info(f"优化进度: {n_completed}/{n_valid} ({code})")
 
         optimization_elapsed = time.time() - optimization_start_time
         logger.info(f"\n并行优化完成，耗时: {optimization_elapsed:.1f} 秒")
         logger.info(f"平均每只股票: {optimization_elapsed/n_valid:.1f} 秒")
 
+        # 全量历史回测：用最终参数在完整数据上回测，生成完整净值曲线
+        logger.info("生成全量历史净值曲线...")
+        for r in all_results:
+            code = r.get('code', '')
+            if r.get('error') or code not in stock_data_map:
+                continue
+            full_df = pickle.loads(stock_data_map[code]['full_df_bytes'])
+            final_params = r.get('final_params', {})
+            if not final_params:
+                continue
+            result_full = backtest_grid_strategy(
+                full_df,
+                buy_spacing_pct=final_params['buy_spacing_pct'],
+                sell_spacing_pct=final_params['sell_spacing_pct'],
+                grid_amount=final_params['grid_amount'],
+                amount_multiplier=final_params['amount_multiplier'],
+                initial_position=final_params['initial_position'],
+                max_grids=final_params['max_grids'],
+                spacing_decay=final_params['spacing_decay'],
+                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+                initial_cash=allocated_cash
+            )
+            r['full_portfolio_values'] = result_full.get('portfolio_values', [])
+            r['full_initial_value'] = allocated_cash
+            r['full_trades_detail'] = result_full.get('trades', [])
+            r['full_benchmark_values'] = result_full.get('benchmark_values', [])
+            r['full_benchmark_return'] = result_full.get('benchmark_return', 0)
+            r['full_data_start'] = str(full_df['date'].iloc[0])[:10]
+            r['full_data_end'] = str(full_df['date'].iloc[-1])[:10]
+            logger.info(f"  {code}: 全量回测 {len(full_df)}天, 净值点数={len(result_full.get('portfolio_values', []))}")
+
     else:
-        # ===== 串行执行路径 (回退) =====
+        # ===== 串行执行路径 (回退) — 复用 worker 函数 =====
         logger.info(f"\n{'='*70}")
         logger.info(f"串行优化模式: {stocks_to_optimize} 只股票")
         logger.info(f"{'='*70}")
 
+        full_data_map = {}
         for code in stocks:
             logger.info(f"\n{'='*70}")
             logger.info(f"处理股票：{code}")
             logger.info(f"{'='*70}")
 
-            # 获取历史数据
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
-                               selected_stocks=stocks)
-
+            df = get_stock_data(code, data_dir=paths_cfg['data_dir'], selected_stocks=stocks,
+                               enable_incremental=False, use_cache=True, fallback_to_cache=True)
             if df.empty or len(df) < 250:
                 logger.warning(f"{code} 数据不足，跳过")
                 continue
-
-            # 清洗数据
             df = clean_data(df)
-
-            # 按 WF 窗口切割数据
             df_ins = wf_window.slice_dataframe_by_period(df, period='ins')
             df_oos = wf_window.slice_dataframe_by_period(df, period='oos')
-
-            logger.info(f"Phase 1 数据：{len(df_ins)}天 ({ins_start} 至 {ins_end})")
-            logger.info(f"Phase 2 数据：{len(df_oos)}天 ({oos_start} 至 {oos_end})")
-
             if len(df_ins) < 60:
-                logger.warning(f"{code} Phase 1 数据不足，跳过")
+                logger.warning(f"{code} Phase1 数据不足 ({len(df_ins)}天)，跳过")
                 continue
+            full_data_map[code] = df
 
-            # ========== Phase 1: 贝叶斯优化 ==========
-            logger.info("\n>>> Phase 1: 贝叶斯优化")
+            ins_bytes = pickle.dumps(df_ins)
+            oos_bytes = pickle.dumps(df_oos)
 
-            def objective_phase1(trial):
-                # 根据市场状态动态调整搜索空间
-                if regime_state == 'soft_circuit_break':
-                    spacing_range = [max(0.02, search_space['grid_spacing_range'][0]), min(0.04, search_space['grid_spacing_range'][1])]
-                    max_grids_range = [3, 5]
-                    ip_range = [0.20, 0.35]
-                elif regime_state == 'warning':
-                    spacing_range = search_space['grid_spacing_range']
-                    max_grids_range = [4, 7]
-                    ip_range = [0.30, 0.40]
-                else:  # normal
-                    spacing_range = search_space['grid_spacing_range']
-                    max_grids_range = search_space['max_grids_range']
-                    ip_range = search_space['initial_position_range']
-
-                grid_spacing = trial.suggest_float('grid_spacing',
-                    spacing_range[0], spacing_range[1], step=0.001)
-                grid_amount = trial.suggest_categorical('grid_amount',
-                    search_space['grid_amount_choices'])
-                ip = trial.suggest_float('initial_position',
-                    ip_range[0], ip_range[1], step=0.01)
-                max_g = trial.suggest_int('max_grids',
-                    max_grids_range[0], max_grids_range[1])
-
-                result = backtest_grid_strategy(
-                    df_ins,
-                    grid_spacing=grid_spacing,
-                    grid_amount=grid_amount,
-                    initial_position=ip,
-                    max_grids=max_g,
-                    commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                    stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                    slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                    initial_cash=allocated_cash
-                )
-
-                return calculate_composite_score(
-                    result=result,
-                    grid_spacing=grid_spacing,
-                    max_grids=max_g,
-                    n_days=len(df_ins)
-                )
-
-            n_trials = backtest_cfg.get('n_trials', 150)
-            n_startup = backtest_cfg.get('n_startup_trials', 20)
-
-            sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
-            pruner = optuna.pruners.MedianPruner()
-
-            study = optuna.create_study(
-                direction='maximize',
-                study_name=f'{code}_phase1',
-                load_if_exists=False,
-                sampler=sampler,
-                pruner=pruner
+            result = _optimize_single_stock_worker(
+                code, config, allocated_cash, search_space,
+                ins_bytes, oos_bytes,
+                ins_start, ins_end, oos_start, oos_end,
+                'normal', regime_params,
+                regime_state_phase1, regime_state_phase2
             )
-
-            study.optimize(objective_phase1, n_trials=n_trials, show_progress_bar=False)
-
-            phase1_params = study.best_params
-            phase1_score = study.best_value
-
-            logger.info(f"Phase 1 最佳参数:")
-            logger.info(f"  网格间距：{phase1_params['grid_spacing']:.3f}%")
-            logger.info(f"  每格金额：{phase1_params['grid_amount']}元")
-            logger.info(f"  初始仓位：{phase1_params['initial_position']*100:.0f}%")
-            logger.info(f"  最大网格：{phase1_params['max_grids']}层")
-            logger.info(f"  复合分数：{phase1_score:.4f}")
-
-            # Phase 1 样本外验证
-            result_oos_phase1 = backtest_grid_strategy(
-                df_oos,
-                grid_spacing=phase1_params['grid_spacing'],
-                grid_amount=phase1_params['grid_amount'],
-                initial_position=phase1_params['initial_position'],
-                max_grids=phase1_params['max_grids'],
-                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                initial_cash=allocated_cash
-            )
-
-            oos_score_phase1 = calculate_composite_score(
-                result=result_oos_phase1,
-                grid_spacing=phase1_params['grid_spacing'],
-                max_grids=phase1_params['max_grids'],
-                n_days=len(df_oos)
-            )
-
-            logger.info(f"Phase 1 OOS 验证 - 复合分数：{oos_score_phase1:.4f}, "
-                        f"Calmar：{result_oos_phase1['calmar_ratio']:.4f}, "
-                        f"回撤：{result_oos_phase1['max_drawdown']*100:.2f}%")
-
-            # ========== Phase 2: WF微调 ==========
-            logger.info("\n>>> Phase 2: WF微调")
-
-            # 根据市场状态调整微调范围
-            if regime_state == 'soft_circuit_break':
-                fine_tune_range = 0.05  # 更窄的搜索范围
-                max_grids_phase2 = min(phase1_params['max_grids'], 5)
-            elif regime_state == 'warning':
-                fine_tune_range = 0.08
-                max_grids_phase2 = min(phase1_params['max_grids'], 7)
-            else:  # normal
-                fine_tune_range = 0.10
-                max_grids_phase2 = phase1_params['max_grids']
-
-            phase2_spacing_min = max(0.001, phase1_params['grid_spacing'] * (1 - fine_tune_range))
-            phase2_spacing_max = phase1_params['grid_spacing'] * (1 + fine_tune_range)
-            phase2_ip_min = max(0.20, phase1_params['initial_position'] * (1 - fine_tune_range))
-            phase2_ip_max = min(0.80, phase1_params['initial_position'] * (1 + fine_tune_range))
-
-            logger.info(f"Phase 2 搜索空间（以Phase1为中心±{fine_tune_range*100:.0f}%%）:")
-            logger.info(f"  grid_spacing: {phase2_spacing_min:.4f} ~ {phase2_spacing_max:.4f}")
-            logger.info(f"  initial_position: {phase2_ip_min:.4f} ~ {phase2_ip_max:.4f}")
-
-            def objective_phase2(trial):
-                grid_spacing = trial.suggest_float('grid_spacing',
-                    phase2_spacing_min, phase2_spacing_max, step=0.0005)
-                ip = trial.suggest_float('initial_position',
-                    phase2_ip_min, phase2_ip_max, step=0.005)
-
-                result = backtest_grid_strategy(
-                    df_oos,  # Phase 2 使用 OOS 数据
-                    grid_spacing=grid_spacing,
-                    grid_amount=phase1_params['grid_amount'],
-                    initial_position=ip,
-                    max_grids=max_grids_phase2,
-                    commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                    stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                    slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                    initial_cash=allocated_cash
-                )
-
-                return calculate_composite_score(
-                    result=result,
-                    grid_spacing=grid_spacing,
-                    max_grids=max_grids_phase2,
-                    n_days=len(df_oos)
-                )
-
-            study_phase2 = optuna.create_study(
-                direction='maximize',
-                study_name=f'{code}_phase2',
-                load_if_exists=False,
-                sampler=optuna.samplers.TPESampler(n_startup_trials=5),
-                pruner=optuna.pruners.MedianPruner()
-            )
-
-            study_phase2.optimize(objective_phase2, n_trials=30, show_progress_bar=False)
-
-            final_params = {
-                'grid_spacing': study_phase2.best_params['grid_spacing'],
-                'grid_amount': phase1_params['grid_amount'],
-                'initial_position': study_phase2.best_params['initial_position'],
-                'max_grids': max_grids_phase2
-            }
-            final_score = study_phase2.best_value
-
-            logger.info(f"Phase 2 微调后最佳参数:")
-            logger.info(f"  网格间距：{final_params['grid_spacing']:.4f}% (Phase1: {phase1_params['grid_spacing']:.4f}%)")
-            logger.info(f"  每格金额：{final_params['grid_amount']}元")
-            logger.info(f"  初始仓位：{final_params['initial_position']*100:.1f}% (Phase1: {phase1_params['initial_position']*100:.1f}%)")
-            logger.info(f"  最大网格：{final_params['max_grids']}层")
-            logger.info(f"  最终分数：{final_score:.4f}")
-
-            # 使用 Phase 2 参数在 OOS 上做最终验证
-            result_final = backtest_grid_strategy(
-                df_oos,
-                grid_spacing=final_params['grid_spacing'],
-                grid_amount=final_params['grid_amount'],
-                initial_position=final_params['initial_position'],
-                max_grids=final_params['max_grids'],
-                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                initial_cash=allocated_cash
-            )
-
-            logger.info(f"最终 OOS 验证 - Calmar：{result_final['calmar_ratio']:.4f}, "
-                        f"回撤：{result_final['max_drawdown']*100:.2f}%, "
-                        f"交易次数：{result_final['n_trades']}")
-
-            all_results.append({
-                'code': code,
-                'phase1_params': phase1_params,
-                'phase1_score': phase1_score,
-                'phase1_oos_score': oos_score_phase1,
-                'final_params': final_params,
-                'final_score': final_score,
-                'final_calmar': result_final['calmar_ratio'],
-                'final_drawdown': result_final['max_drawdown'],
-                'final_trades': result_final['n_trades'],
-                'final_return': result_final['total_return']
-            })
+            all_results.append(result)
 
         optimization_elapsed = time.time() - optimization_start_time
         logger.info(f"\n串行优化完成，耗时: {optimization_elapsed:.1f} 秒")
+
+        # 全量历史回测：用最终参数在完整数据上回测，生成完整净值曲线
+        logger.info("生成全量历史净值曲线...")
+        for r in all_results:
+            code = r.get('code', '')
+            if r.get('error') or code not in full_data_map:
+                continue
+            full_df = full_data_map[code]
+            final_params = r.get('final_params', {})
+            if not final_params:
+                continue
+            result_full = backtest_grid_strategy(
+                full_df,
+                buy_spacing_pct=final_params['buy_spacing_pct'],
+                sell_spacing_pct=final_params['sell_spacing_pct'],
+                grid_amount=final_params['grid_amount'],
+                amount_multiplier=final_params['amount_multiplier'],
+                initial_position=final_params['initial_position'],
+                max_grids=final_params['max_grids'],
+                spacing_decay=final_params['spacing_decay'],
+                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
+                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
+                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+                initial_cash=allocated_cash
+            )
+            r['full_portfolio_values'] = result_full.get('portfolio_values', [])
+            r['full_initial_value'] = allocated_cash
+            r['full_trades_detail'] = result_full.get('trades', [])
+            r['full_benchmark_values'] = result_full.get('benchmark_values', [])
+            r['full_benchmark_return'] = result_full.get('benchmark_return', 0)
+            r['full_data_start'] = str(full_df['date'].iloc[0])[:10]
+            r['full_data_end'] = str(full_df['date'].iloc[-1])[:10]
+            logger.info(f"  {code}: 全量回测 {len(full_df)}天, 净值点数={len(result_full.get('portfolio_values', []))}")
+
+    # 打印数据源健康报告（验证限流效果）
+    try:
+        from data_layer.fetcher import get_source_manager
+        get_source_manager().print_health_report()
+    except Exception:
+        pass
 
     # 过滤掉有错误的股票
     valid_results = [r for r in all_results if not r.get('error')]
@@ -1894,31 +1335,13 @@ def run_two_phase_optimization(config: dict) -> Dict:
 
     logger.info(f"\n优化报告已保存到：{report_file}")
 
-    # 生成 Markdown 参数解释报告
-    try:
-        report_date = datetime.now().strftime('%Y%m%d')
-        markdown_file = os.path.join(output_dir, f"优化参数报告_{report_date}.md")
-        _generate_optimization_markdown_report(
-            all_results=valid_results,
-            config=config,
-            output_path=markdown_file,
-            elapsed_time=optimization_elapsed,
-            ins_start=ins_start,
-            ins_end=ins_end,
-            oos_start=oos_start,
-            oos_end=oos_end,
-            search_space=search_space
-        )
-    except Exception as e:
-        logger.warning(f"生成 Markdown 报告失败: {e}")
-
     # 选择实盘交易股票
     trading_stocks_count = max(1, min(len(valid_results), max_stocks_for_trading))
     df_results = pd.DataFrame(valid_results)
     df_results = df_results.sort_values('final_return', ascending=False)
     trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
 
-    logger.info(f"\n实盘交易股票（按收益排序）:")
+    logger.info("\n实盘交易股票（按收益排序）:")
     for i, code in enumerate(trading_stocks):
         row = df_results[df_results['code'] == code].iloc[0]
         logger.info(f"  {i+1}. {code} - 最终收益: {row['final_return']*100:.2f}%, "
@@ -1937,241 +1360,10 @@ def run_two_phase_optimization(config: dict) -> Dict:
     }
     save_state(state)
 
-    logger.info(f"实盘股票已保存到 config_state.json")
+    logger.info("实盘股票已保存到 config_state.json")
 
     return all_results
 
-
-def run_optimization(config: dict) -> Dict:
-    """
-    优化模式：使用 Optuna 进行贝叶斯优化，寻找最佳网格参数
-
-    优化目标:
-    - 最大化复合分数（Calmar − 回撤惩罚 − 频率惩罚 − 成本惩罚 − 密度惩罚）
-    - 回撤硬约束：max_drawdown ≤ 12%
-    - 网格资金池约束：grid_amount × max_grids ≤ alloc × (1 − initial_position) × 95%
-
-    参数:
-        config: 配置字典
-
-    返回:
-        最佳参数字典
-    """
-    logger.info("=" * 60)
-    logger.info("开始执行参数优化 (贝叶斯优化 + 多目标惩罚)...")
-    logger.info("=" * 60)
-
-    stocks = config.get('stocks', [])
-    grid_cfg = config.get('grid', {})
-    backtest_cfg = config.get('backtest', {})
-    paths_cfg = config.get('paths', {})
-    capital_cfg = config.get('capital', {})
-
-    if not stocks:
-        logger.error("配置文件中未指定股票列表")
-        return {}
-
-    # 资金分配逻辑（与 optimize_parameters_wf 一致）
-    total_cash = capital_cfg.get('total', 100000)
-    max_position_pct = capital_cfg.get('max_position_per_stock', 0.30)
-    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.40)
-    initial_position = capital_cfg.get('initial_position', 0.45)
-
-    investable_cash = total_cash * (1 - cash_reserve_ratio)
-    max_stocks_by_money = max(1, int(investable_cash / (total_cash * max_position_pct)))
-    max_stocks = min(max_stocks_by_money, len(stocks))
-    allocated_cash = investable_cash / max_stocks if max_stocks > 0 else investable_cash
-
-    grid_pool = allocated_cash * (1 - initial_position)
-
-    logger.info(f"资金配置: 总资金={total_cash}元, 每股分配={allocated_cash:.0f}元, "
-                f"网格池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
-
-    # 搜索空间（启动时动态裁剪，避免无效采样）
-    search_space = build_adaptive_search_space(allocated_cash, initial_position)
-    logger.info(f"搜索空间（已裁剪）: grid_amount={search_space['grid_amount_choices']}, "
-                f"max_grids={search_space['max_grids_range']}, grid_pool={search_space['grid_pool']:.0f}元")
-
-    # 准备数据
-    all_results = []
-
-    for code in stocks:
-        logger.info(f"\n处理股票：{code}")
-
-        # 获取历史数据（仅对选出的 top_n 股票执行增量更新）
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
-                           selected_stocks=stocks)
-
-        if df.empty or len(df) < backtest_cfg.get('days', 250):
-            logger.warning(f"{code} 数据不足，跳过")
-            continue
-
-        # 清洗数据
-        df = clean_data(df)
-
-        # 截取回测周期
-        n_days = backtest_cfg.get('days', 250)
-        df_backtest = df.tail(n_days)
-
-        # 样本外验证：分割数据
-        oos_ratio = backtest_cfg.get('oos_ratio', 0.3)
-        split_idx = int(len(df_backtest) * (1 - oos_ratio))
-
-        df_ins = df_backtest.iloc[:split_idx]  # 样本内
-        df_oos = df_backtest.iloc[split_idx:]  # 样本外
-
-        logger.info(f"样本内数据：{len(df_ins)}天，样本外数据：{len(df_oos)}天")
-
-        # === 定义 Optuna 目标函数（多目标惩罚） ===
-        def objective(trial):
-            """Optuna 多目标优化目标函数"""
-            grid_spacing = trial.suggest_float('grid_spacing',
-                search_space['grid_spacing_range'][0],
-                search_space['grid_spacing_range'][1], step=0.001)
-            grid_amount = trial.suggest_categorical('grid_amount',
-                search_space['grid_amount_choices'])
-            ip = trial.suggest_float('initial_position',
-                search_space['initial_position_range'][0],
-                search_space['initial_position_range'][1], step=0.01)
-            max_g = trial.suggest_int('max_grids',
-                search_space['max_grids_range'][0],
-                search_space['max_grids_range'][1])
-
-            # 样本内回测
-            result = backtest_grid_strategy(
-                df_ins,
-                grid_spacing=grid_spacing,
-                grid_amount=grid_amount,
-                initial_position=ip,
-                max_grids=max_g,
-                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                initial_cash=allocated_cash
-            )
-
-            return calculate_composite_score(
-                result=result,
-                grid_spacing=grid_spacing,
-                max_grids=max_g,
-                n_days=len(df_ins)
-            )
-
-        # === 执行优化 ===
-        n_trials = backtest_cfg.get('n_trials', 150)
-        n_startup = backtest_cfg.get('n_startup_trials', 20)
-        logger.info(f"开始 Optuna 优化，试验次数：{n_trials}")
-
-        sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
-        pruner = optuna.pruners.MedianPruner()
-
-        study = optuna.create_study(
-            direction='maximize',
-            study_name=f'{code}_grid_optimization',
-            load_if_exists=False,
-            sampler=sampler,
-            pruner=pruner
-        )
-
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-        # 最佳参数
-        best_params = study.best_params
-        best_score = study.best_value
-
-        logger.info(f"\n{code} 最佳参数:")
-        logger.info(f"  网格间距：{best_params['grid_spacing']:.3f}%")
-        logger.info(f"  每格金额：{best_params['grid_amount']}元")
-        logger.info(f"  初始仓位：{best_params['initial_position']*100:.0f}%")
-        logger.info(f"  最大网格：{best_params['max_grids']}层")
-        logger.info(f"  复合分数：{best_score:.4f}")
-
-        # 样本外验证
-        result_oos = backtest_grid_strategy(
-            df_oos,
-            grid_spacing=best_params['grid_spacing'],
-            grid_amount=best_params['grid_amount'],
-            initial_position=best_params['initial_position'],
-            max_grids=best_params['max_grids'],
-            commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-            stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-            slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-            initial_cash=allocated_cash
-        )
-
-        oos_score = calculate_composite_score(
-            result=result_oos,
-            grid_spacing=best_params['grid_spacing'],
-            max_grids=best_params['max_grids'],
-            n_days=len(df_oos)
-        )
-
-        logger.info(f"样本外验证 - 复合分数：{oos_score:.4f}, "
-                    f"Calmar：{result_oos['calmar_ratio']:.4f}, "
-                    f"回撤：{result_oos['max_drawdown']*100:.2f}%, "
-                    f"交易次数：{result_oos['n_trades']}")
-
-        all_results.append({
-            'code': code,
-            'best_params': best_params,
-            'in_sample_score': best_score,
-            'out_of_sample_score': oos_score,
-            'out_of_sample_calmar': result_oos['calmar_ratio'],
-            'out_of_sample_drawdown': result_oos['max_drawdown'],
-            'out_of_sample_trades': result_oos['n_trades'],
-            'out_of_sample_return': result_oos['total_return']
-        })
-
-    # 保存优化结果
-    output_dir = paths_cfg['output_dir']
-    report_file = os.path.join(output_dir, 'report.json')
-
-    with open(report_file, 'w', encoding='utf-8') as f:
-        json.dump({
-            'optimization_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'capital_allocation': {
-                'total': total_cash,
-                'allocated_per_stock': allocated_cash,
-                'grid_pool_per_stock': grid_pool,
-                'num_stocks': max_stocks_for_trading
-            },
-            'results': all_results
-        }, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"\n优化报告已保存到：{report_file}")
-
-    # === 选择实盘交易股票：根据收益排序，选择理论收益最大的 n 只 ===
-    # 根据资金量确定实盘股票数量
-    trading_stocks_count = max(1, max_stocks)  # 默认全部参与，可根据资金调整
-    df_results = pd.DataFrame(all_results)
-    df_results = df_results.sort_values('out_of_sample_return', ascending=False)
-    trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
-
-    logger.info(f"\n实盘交易股票（按收益排序）:")
-    for i, code in enumerate(trading_stocks):
-        row = df_results[df_results['code'] == code].iloc[0]
-        logger.info(f"  {i+1}. {code} - 样本外收益: {row['out_of_sample_return']*100:.2f}%")
-
-    # 保存实盘股票到 config_state.json
-    from utils import load_state, save_state
-    state = load_state()
-    state['trading_stocks'] = trading_stocks
-    state['optimization_history'] = {
-        r['code']: {
-            'best_params': r['best_params'],
-            'out_of_sample_return': r['out_of_sample_return'],
-            'out_of_sample_calmar': r['out_of_sample_calmar'],
-            'out_of_sample_drawdown': r['out_of_sample_drawdown']
-        }
-        for r in all_results
-    }
-    save_state(state)
-    logger.info(f"实盘股票已保存到 config_state.json")
-
-    return all_results
-
-
-# ==================== 信号生成（增强版：动态参数调整 + 风控） ====================
 
 def calculate_realized_volatility(prices: pd.Series, period: int = 30) -> float:
     """
@@ -2225,39 +1417,6 @@ def load_optimization_history(config: dict) -> Dict:
     
     optimization_history = state.get('optimization_history', {})
     
-    # 如果状态文件中没有，尝试从优化报告文件加载
-    if not optimization_history:
-        paths_cfg = config.get('paths', {})
-        output_dir = paths_cfg.get('output_dir', './output')
-        
-        # 查找最新的优化报告
-        import glob
-        report_files = glob.glob(os.path.join(output_dir, 'wf_optimization_report_*.json'))
-        
-        if report_files:
-            latest_report = max(report_files)
-            logger.info(f"从优化报告加载历史数据：{latest_report}")
-            
-            try:
-                with open(latest_report, 'r', encoding='utf-8') as f:
-                    report_data = json.load(f)
-                
-                # 提取各股票的优化结果
-                for result in report_data.get('results', []):
-                    code = result.get('code')
-                    if code:
-                        optimization_history[code] = {
-                            'optimization_date': report_data.get('optimization_date', ''),
-                            'best_params': result.get('best_params', {}),
-                            'ins_calmar': result.get('in_sample', {}).get('calmar_ratio', 0),
-                            'oos_calmar': result.get('out_of_sample', {}).get('calmar_ratio', 0)
-                        }
-                
-                logger.info(f"加载了 {len(optimization_history)} 只股票的历史优化数据")
-                
-            except Exception as e:
-                logger.warning(f"读取优化报告失败：{str(e)}")
-    
     return optimization_history
 
 
@@ -2284,7 +1443,7 @@ def adjust_grid_spacing(current_vol: float, reference_vol: float,
     vol_adjustment_enabled = risk_control_cfg.get('vol_adjustment_enabled', True)
     
     if not vol_adjustment_enabled or reference_vol <= 0:
-        logger.info(f"使用原始优化参数（波动率调整：禁用或参考值为 0）")
+        logger.info("使用原始优化参数（波动率调整：禁用或参考值为 0）")
         return base_spacing, "optimized"
     
     # 计算波动率比率
@@ -2340,7 +1499,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
     
     stocks = config.get('stocks', [])
     grid_cfg = config.get('grid', {})
-    risk_cfg = config.get('risk', {})
+#     risk_cfg = config.get('risk', {})
     paths_cfg = config.get('paths', {})
     
     # === 步骤 1: 加载历史优化数据（用于波动率对比） ===
@@ -2348,7 +1507,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
     opt_history = load_optimization_history(config)
     
     # === 步骤 2: 初始化风控管理器 ===
-    from risk_management.circuit_breaker import RiskControlManager, create_risk_control_manager
+#     from risk_management.circuit_breaker import RiskControlManager, create_risk_control_manager
     
     risk_manager = create_risk_control_manager(config)
     
@@ -2383,7 +1542,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
         cash=state.get('cash', 500000)  # 默认现金 50 万
     )
     
-    logger.info(f"\n账户状态:")
+    logger.info("\n账户状态:")
     logger.info(f"  总市值：{account_status.total_value:,.2f}")
     logger.info(f"  历史峰值：{account_status.peak_value:,.2f}")
     logger.info(f"  当前回撤：{account_status.drawdown*100:.2f}%")
@@ -2398,10 +1557,16 @@ def generate_signals(config: dict) -> pd.DataFrame:
 
     # === 步骤 4.5: 市场状态检查 ===
     from risk_management.market_regime import RegimeFilter
+    from utils.utils import load_state, save_state
     benchmark_code = config.get('regime_filter', {}).get('benchmark_index', '000300.SH')
     benchmark_df = get_stock_data(benchmark_code, data_dir=paths_cfg.get('data_dir', './data'))
 
+    # 加载持久化的 RegimeFilter 状态
+    regime_saved = state.get('regime_filter_state', {})
+
     if not benchmark_df.empty:
+        if 'date' in benchmark_df.columns and not isinstance(benchmark_df.index, pd.DatetimeIndex):
+            benchmark_df = benchmark_df.set_index('date')
         benchmark_data = {
             'close': benchmark_df['close'],
             'high': benchmark_df.get('high', benchmark_df['close']),
@@ -2409,9 +1574,15 @@ def generate_signals(config: dict) -> pd.DataFrame:
             'volume': benchmark_df.get('volume', pd.Series())
         }
         regime_filter = RegimeFilter(config)
+        regime_filter.from_dict(regime_saved)
         regime_result = regime_filter.check(benchmark_data)
         regime_can_buy = regime_result['can_buy']
         logger.info(f"市场状态: {regime_result['log_msg']}")
+
+        # 保存更新后的 RegimeFilter 状态
+        state['regime_filter_state'] = regime_filter.to_dict()
+        from utils.utils import save_state
+        save_state(state)
     else:
         regime_can_buy = True
         logger.warning("无法获取基准指数数据，市场状态检查跳过")
@@ -2429,15 +1600,35 @@ def generate_signals(config: dict) -> pd.DataFrame:
         signal_stocks = stocks
         logger.info(f"未配置实盘股票，使用候选股票池：{signal_stocks}")
 
-    # === 步骤 5: 生成交易信号 ===
+    # === 步骤 5: 并行获取交易股票数据 ===
+    logger.info(f"\n并行获取 {len(signal_stocks)} 只股票数据...")
+    stock_data = {}
+    fetch_tasks = [
+        (code, paths_cfg['data_dir'], False, config)
+        for code in signal_stocks
+    ]
+    with ThreadPoolExecutor(max_workers=min(len(signal_stocks), 5)) as executor:
+        futures = {executor.submit(_fetch_single_stock_data, task): task[0] for task in fetch_tasks}
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                _, df, status = future.result()
+                if status == "success" and not df.empty:
+                    stock_data[code] = df
+                else:
+                    logger.warning(f"{code} 数据获取失败: {status}")
+            except Exception as e:
+                logger.warning(f"{code} 数据获取异常: {e}")
+
+    # === 步骤 6: 生成交易信号 ===
     signals = []
-    version = get_version()  # 获取策略版本号
+    version = config.get('version', '2.0.0')
 
     for code in signal_stocks:
         logger.info(f"\n{'-'*60}")
         logger.info(f"处理股票：{code}")
         logger.info(f"{'-'*60}")
-        
+
         # 检查是否允许买入该股（熔断 + 市场状态双重检查）
         allow_buy = risk_manager.should_allow_buy(code) and regime_can_buy
 
@@ -2445,10 +1636,8 @@ def generate_signals(config: dict) -> pd.DataFrame:
             reason = '熔断' if not risk_manager.should_allow_buy(code) else '市场状态限制'
             logger.warning(f"⚠️  {code} 不允许买入: {reason}")
 
-        # 获取最新数据（仅对实盘交易股票执行增量更新获取实时数据）
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
-                            selected_stocks=signal_stocks)
-        
+        df = stock_data.get(code, pd.DataFrame())
+
         if df.empty:
             logger.warning(f"{code} 无数据，跳过")
             continue
@@ -2479,27 +1668,25 @@ def generate_signals(config: dict) -> pd.DataFrame:
         reference_vol = 0.0
         base_spacing = grid_cfg.get('base_spacing', 2.0)
         
+        best_params = {}
         if code in opt_history:
             hist_data = opt_history[code]
-            
-            # 注意：历史优化报告中可能没有直接存储波动率
-            # 这里需要从 In-Sample 数据重新计算，或使用优化时的最佳参数反推
-            # 简化处理：使用优化报告中的 in_sample_calmar 作为参考指标
             logger.info(f"找到历史优化记录：{hist_data.get('optimization_date', 'N/A')}")
-            
-            # 如果有保存的波动率数据，直接使用
+
             reference_vol = hist_data.get('ins_volatility', 0.0)
-            
-            # 如果没有，使用当前波动率的一定比例作为近似（临时方案）
             if reference_vol <= 0:
-                logger.info(f"历史记录中无波动率数据，使用当前波动率的 80% 作为参考")
+                logger.info("历史记录中无波动率数据，使用当前波动率的 80% 作为参考")
                 reference_vol = current_vol * 0.8
-            
-            # 获取优化得到的最佳网格间距
+
+            # 获取优化参数（兼容 load_optimization_history 的 best_params 键名）
             best_params = hist_data.get('best_params', {})
-            if 'grid_spacing' in best_params:
-                base_spacing = best_params['grid_spacing']
-                logger.info(f"使用优化最佳参数：grid_spacing={base_spacing}%")
+            if 'buy_spacing_pct' in best_params:
+                base_spacing = best_params['buy_spacing_pct']
+                logger.info(f"使用优化最佳参数：buy_spacing={base_spacing*100:.2f}%, "
+                          f"sell_spacing={best_params.get('sell_spacing_pct', base_spacing)*100:.2f}%")
+            elif 'grid_spacing' in best_params:
+                base_spacing = best_params['grid_spacing'] / 100.0  # 旧格式是百分比数字
+                logger.info(f"使用旧版优化参数：grid_spacing={base_spacing*100:.2f}%")
         else:
             logger.info(f"未找到 {code} 的历史优化记录，使用配置文件默认参数")
         
@@ -2532,77 +1719,58 @@ def generate_signals(config: dict) -> pd.DataFrame:
         current_vol = calculate_realized_volatility(df['close'].iloc[:-1], period=30)  # 排除 T 日
         logger.info(f"当前波动率（近 30 日，T-1 数据）：{current_vol*100:.2f}%")
         
-        # ATR 动态调整
-        atr_ratio = safe_divide(current_atr, current_price, 0.02)
-        atr_adjusted_spacing = adjusted_spacing * (atr_ratio / 0.02) * grid_cfg.get('atr_coef', 1.5)
-        atr_adjusted_spacing = max(1.0, min(atr_adjusted_spacing, 5.0))
-        
-        logger.info(f"ATR 调整后间距：{atr_adjusted_spacing:.2f}%")
-        
-        # === 涨跌停检查 ===
-        limit_up, limit_down = check_limit_status(
-            current_price, prev_close, 
-            risk_cfg.get('limit_threshold', 9.8)
+        # === 使用 DynamicGridEngine 生成7参数网格信号 ===
+
+        # 账户状态
+        cash = state.get('cash', 500000)
+        current_position = sum(
+            p.get('quantity', 0) for p in state.get('positions', {}).get(code, [])
         )
-        
-        if limit_down:
-            logger.warning(f"{code} 跌停，暂停生成买入信号")
-        if limit_up:
-            logger.warning(f"{code} 涨停，暂停生成卖出信号")
-        
-        # === 生成网格价格 ===
-        grid_amount = grid_cfg.get('grid_amount', 10000)
-        max_grids = grid_cfg.get('max_grids', 10)
-        
-        # 买入信号（价格低于中心价）
-        if allow_buy and not limit_down:
-            for i in range(1, max_grids + 1):
-                buy_price = current_price * (1 - atr_adjusted_spacing / 100 * i)
-                buy_qty = validate_buy_quantity(int(grid_amount / buy_price))
-                
-                if buy_qty > 0:
-                    signals.append({
-                        'code': code,
-                        'direction': 'buy',
-                        'price': round(buy_price, 2),
-                        'quantity': buy_qty,
-                        'amount': round(buy_qty * buy_price, 2),
-                        'reason': f'网格第{i}层买入，间距{atr_adjusted_spacing:.1f}%',
-                        'valid_date': get_next_trading_day(datetime.now()).strftime('%Y-%m-%d'),
-                        'priority': i,
-                        'strategy_version': version,
-                        'param_source': param_source
-                    })
-        elif not allow_buy:
-            logger.warning(f"{code} 因风控限制，跳过所有买入信号")
-        elif limit_down:
-            logger.warning(f"{code} 因跌停限制，跳过所有买入信号")
-        
-        # 卖出信号（价格高于中心价）
-        # 注意：实际应用中需要检查可用持仓 (T+1 规则)
-        available_position = state.get(f'{code}_position', 10000)  # 示例可用持仓
-        
-        for i in range(1, max_grids + 1):
-            sell_price = current_price * (1 + atr_adjusted_spacing / 100 * i)
-            sell_qty = validate_buy_quantity(int(grid_amount / sell_price))
-            
-            if sell_qty > 0 and not limit_up:
-                # T+1 检查
-                if check_t1_rule(sell_qty, available_position):
-                    signals.append({
-                        'code': code,
-                        'direction': 'sell',
-                        'price': round(sell_price, 2),
-                        'quantity': sell_qty,
-                        'amount': round(sell_qty * sell_price, 2),
-                        'reason': f'网格第{i}层卖出，间距{atr_adjusted_spacing:.1f}%',
-                        'valid_date': get_next_trading_day(datetime.now()).strftime('%Y-%m-%d'),
-                        'priority': i,
-                        'strategy_version': version,
-                        'param_source': param_source
-                    })
-                else:
-                    logger.debug(f"{code} 卖出信号因 T+1 规则被过滤")
+        available_position = state.get(f'{code}_available', current_position)
+
+        # 从优化结果提取7参数（回退到配置默认值）
+        opt_buy_sp = best_params.get('buy_spacing_pct', grid_cfg.get('base_spacing', 0.02))
+        opt_sell_sp = best_params.get('sell_spacing_pct', opt_buy_sp)
+        opt_mult = best_params.get('amount_multiplier', 1.0)
+        opt_decay = best_params.get('spacing_decay', 1.0)
+        opt_max_grids = best_params.get('max_grids', grid_cfg.get('max_grids', 10))
+        opt_grid_amount = best_params.get('grid_amount', grid_cfg.get('grid_amount', 10000))
+
+        engine = DynamicGridEngine(config)
+        grid_signals = engine.generate_signals(
+            code=code,
+            ref_price=current_price,
+            atr_20=current_atr,
+            volatility_60d=current_vol,
+            available_position=available_position,
+            current_position=current_position,
+            cash=cash,
+            grid_amount=opt_grid_amount,
+            amount_multiplier=opt_mult,
+            prev_close=prev_close,
+            can_buy=allow_buy,
+            can_open_new=True,
+            buy_spacing_pct=opt_buy_sp,
+            sell_spacing_pct=opt_sell_sp,
+            spacing_decay=opt_decay,
+            max_grids=opt_max_grids,
+        )
+
+        # 转换 GridSignal 对象为下游期望的 dict 格式
+        for gs in grid_signals:
+            signals.append({
+                'code': gs.code,
+                'direction': gs.direction,
+                'price': gs.price,
+                'quantity': gs.quantity,
+                'amount': round(gs.quantity * gs.price, 2),
+                'reason': gs.reason,
+                'valid_date': get_next_trading_day(datetime.now()).strftime('%Y-%m-%d'),
+                'priority': gs.grid_level,
+                'strategy_version': version,
+                'param_source': param_source,
+                'signal_type': gs.signal_type,
+            })
     
     # === 步骤 6: 转换为 DataFrame 并排序 ===
     if not signals:
@@ -2643,7 +1811,7 @@ def generate_signals(config: dict) -> pd.DataFrame:
         df_code = df_signals[df_signals['code'] == code]
         buy_count = len(df_code[df_code['direction'] == 'buy'])
         sell_count = len(df_code[df_code['direction'] == 'sell'])
-        filtered_count = len(df_code[df_code.get('filtered', False) == True]) if 'filtered' in df_code.columns else 0
+        filtered_count = len(df_code[df_code['filtered']]) if 'filtered' in df_code.columns and df_code['filtered'].any() else 0
         
         logger.info(f"{code}: {buy_count}个买入信号，{sell_count}个卖出信号，{filtered_count}个被风控过滤")
     
@@ -2688,16 +1856,16 @@ class WalkForwardWindow:
         # 使用 pandas 的 DateOffset 确保正确处理非交易日
         # 然后对齐到真实交易日
 
-        # T - 3 个月（样本内结束/样本外开始）
-        oos_start_raw = self.current_date - pd.DateOffset(months=3)
+        # T - 6 个月（样本内结束/样本外开始）
+        oos_start_raw = self.current_date - pd.DateOffset(months=6)
         self.oos_start = align_to_trading_day(oos_start_raw, direction='backward')
 
-        # T - 1 年（样本内开始）
-        ins_start_raw = self.current_date - pd.DateOffset(years=1)
+        # T - 3 年（样本内开始）
+        ins_start_raw = self.current_date - pd.DateOffset(years=3)
         self.ins_start = align_to_trading_day(ins_start_raw, direction='backward')
 
-        # T - 1.5 年（选股池构建开始）
-        universe_start_raw = self.current_date - pd.DateOffset(years=1, months=6)
+        # T - 4 年（选股池构建开始）
+        universe_start_raw = self.current_date - pd.DateOffset(years=4)
         self.universe_start = align_to_trading_day(universe_start_raw, direction='backward')
 
         # 格式化日期字符串（用于日志和数据过滤）
@@ -2710,9 +1878,9 @@ class WalkForwardWindow:
         logger.info("Walk-Forward 时间窗口配置")
         logger.info("=" * 70)
         logger.info(f"当前日期 (T): {self.current_date_str}")
-        logger.info(f"选股池构建期：{self.universe_start_str} 至 {self.oos_start_str} (T-1.5Y ~ T-3M)")
-        logger.info(f"样本内优化期：{self.ins_start_str} 至 {self.oos_start_str} (T-1Y ~ T-3M)")
-        logger.info(f"样本外验证期：{self.oos_start_str} 至 {self.current_date_str} (T-3M ~ T)")
+        logger.info(f"选股池构建期：{self.universe_start_str} 至 {self.oos_start_str} (T-4Y ~ T-6M)")
+        logger.info(f"样本内优化期：{self.ins_start_str} 至 {self.oos_start_str} (T-3Y ~ T-6M)")
+        logger.info(f"样本外验证期：{self.oos_start_str} 至 {self.current_date_str} (T-6M ~ T)")
         logger.info("=" * 70)
     
     def get_universe_period(self) -> Tuple[str, str]:
@@ -2885,313 +2053,65 @@ def check_stock_listing_duration(code: str, df: pd.DataFrame,
     return True, f"上市时间充足 ({years_since_listing:.2f}年)"
 
 
-def build_universe_with_wf(config: dict, wf_window: WalkForwardWindow) -> pd.DataFrame:
-    """
-    基于 Walk-Forward 窗口构建选股池
-    
-    数据范围：T - 1.5 年 至 T - 3 个月（不含）
-    
-    选股标准:
-    1. Hurst 指数 < 0.5 (均值回归特性)
-    2. 流动性充足 (日均成交额 > 阈值)
-    3. 价格适中 (避免高价股和低价股)
-    4. 波动率适中 (避免过度波动)
-    
-    参数:
-        config: 配置字典
-        wf_window: Walk-Forward 窗口管理器
-    
-    返回:
-        符合条件的股票列表 DataFrame
-    
-    关键约束:
-        - 禁止使用 T - 3 个月之后的任何数据
-        - 防止未来信息泄露
-        - 自动排除上市时间不足 1.5 年的股票
-    """
-    logger.info("=" * 70)
-    logger.info("Walk-Forward 选股池构建")
-    logger.info("=" * 70)
-    
-    # 获取选股池构建期日期范围
-    universe_start, universe_end = wf_window.get_universe_period()
-    universe_start_dt = datetime.strptime(universe_start, '%Y-%m-%d')
-    universe_end_dt = datetime.strptime(universe_end, '%Y-%m-%d')
-    
-    # 计算所需的最小数据跨度
-    required_data_span = (universe_end_dt - universe_start_dt).days
-    required_years = required_data_span / 365.25
-    
-    logger.info(f"选股数据期间：{universe_start} 至 {universe_end}")
-    logger.info(f"所需最小数据跨度：{required_data_span}天 ({required_years:.2f}年)")
-    logger.info(f"注意：禁止使用 {universe_end} 之后的数据（防止前视偏差）")
-    logger.info(f"注意：自动排除上市时间不足 {required_years:.2f}年的股票")
-    logger.info("=" * 70)
-    
-    selection_cfg = config.get('selection', {})
-    risk_cfg = config.get('risk', {})
-    paths_cfg = config.get('paths', {})
-    
-    # 获取全市场股票列表
-    from data_layer.fetcher import get_all_a_stocks, prepare_selection_data
-    
-    df_all_stocks = get_all_a_stocks()
-    
-    if df_all_stocks.empty:
-        logger.error("无法获取全市场股票列表")
-        return pd.DataFrame()
-    
-    # 初步过滤（仅保留代码格式正确的）
-    initial_count = len(df_all_stocks)
-    df_all_stocks = df_all_stocks[df_all_stocks['code'].str.contains(r'\.(SH|SZ)$', regex=True, na=False)]
-    logger.info(f"初步过滤后剩余 {len(df_all_stocks)} 只股票 (共过滤 {initial_count - len(df_all_stocks)} 只)")
-    
-    # 限制处理数量
-    max_stocks_to_process = selection_cfg.get('max_stocks_to_process', 200)
-    stock_list = df_all_stocks['code'].head(max_stocks_to_process).tolist()
-    logger.info(f"将处理最近的 {len(stock_list)} 只股票")
-    
-    # === 获取选股数据并计算指标 ===
-    results = []
-    success_count = 0
-    fail_count = 0
-    filtered_by_listing = 0  # 因上市时间不足被过滤的数量
-    
-    for i, code in enumerate(stock_list):
-        try:
-            logger.info(f"[{i+1}/{len(stock_list)}] 处理股票：{code}")
-            
-            # 获取历史数据
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'])
-            
-            # 防御性检查 1: 无数据
-            if df.empty:
-                logger.warning(f"{code} 无数据，跳过")
-                fail_count += 1
-                continue
-            
-            # 防御性检查 2: 上市时间不足
-            is_valid_listing, listing_reason = check_stock_listing_duration(
-                code, df, required_years=required_years
-            )
-            
-            if not is_valid_listing:
-                logger.info(f"{code} 过滤：{listing_reason}")
-                filtered_by_listing += 1
-                continue
-            
-            logger.debug(f"{code} {listing_reason}")
-            
-            # === 关键：按 Walk-Forward 窗口切割数据 ===
-            # 仅使用选股池构建期的数据 [T-1.5Y, T-3M)
-            df_universe = wf_window.slice_dataframe_by_period(df, period='universe')
-            
-            # 防御性检查 3: 数据量不足
-            if df_universe.empty:
-                logger.warning(f"{code} 选股期数据为空，跳过")
-                fail_count += 1
-                continue
-            
-            min_required_records = selection_cfg.get('min_required_records', 60)
-            if len(df_universe) < min_required_records:
-                logger.warning(
-                    f"{code} 选股期数据不足 (<{min_required_records}条，实际{len(df_universe)}条)，跳过"
-                )
-                fail_count += 1
-                continue
-            
-            # 清洗数据
-            df_universe = clean_data(df_universe)
-            
-            # 再次检查清洗后的数据量
-            if df_universe.empty:
-                logger.warning(f"{code} 数据清洗后为空，跳过")
-                fail_count += 1
-                continue
-            
-            # 计算指标（仅基于选股期数据）
-            latest = df_universe.iloc[-1]
-            
-            # ATR
-            df_universe['atr'] = calculate_atr(df_universe, selection_cfg.get('atr_period', 20))
-            latest_atr = df_universe['atr'].iloc[-1]
-            
-            # 波动率
-            df_universe['volatility'] = calculate_volatility(df_universe, 20)
-            latest_vol = df_universe['volatility'].iloc[-1]
-            
-            # Hurst 指数（使用选股期最后 250 天，如果数据不足则使用全部）
-            if len(df_universe) >= 250:
-                price_series = df_universe['close'].tail(250)
-            else:
-                price_series = df_universe['close']
-                logger.debug(f"{code} 数据不足 250 条，使用全部 {len(price_series)} 条计算 Hurst 指数")
-            
-            hurst = calculate_hurst_exponent(price_series)
-            
-            # 日均成交额（选股期最后 20 天）
-            if len(df_universe) >= 20:
-                avg_turnover = df_universe['amount'].tail(20).mean() / 10000  # 万元
-            else:
-                avg_turnover = df_universe['amount'].mean() / 10000
-                logger.debug(f"{code} 数据不足 20 条，使用全部数据计算日均成交额")
-            
-            # 收集结果
-            results.append({
-                'code': code,
-                'price': latest['close'],
-                'atr': latest_atr if not np.isnan(latest_atr) else 0,
-                'volatility': latest_vol if not np.isnan(latest_vol) else 0,
-                'hurst': hurst,
-                'avg_turnover': avg_turnover,
-                'valid': True
-            })
-            
-            success_count += 1
-            
-        except Exception as e:
-            logger.error(f"处理 {code} 时发生异常：{str(e)}", exc_info=True)
-            fail_count += 1
-    
-    # 转换为 DataFrame
-    df_selection = pd.DataFrame(results)
-    
-    if df_selection.empty:
-        logger.error("没有获取到任何股票数据")
-        return pd.DataFrame()
-    
-    # === 输出统计信息 ===
-    logger.info("\n" + "=" * 70)
-    logger.info("选股池构建统计:")
-    logger.info("=" * 70)
-    logger.info(f"总计：{len(stock_list)} 只股票")
-    logger.info(f"  成功入选：{success_count} 只")
-    logger.info(f"  处理失败：{fail_count} 只")
-    logger.info(f"  上市时间不足过滤：{filtered_by_listing} 只")
-    logger.info(f"  成功率：{success_count/max(len(stock_list),1)*100:.1f}%")
-    logger.info("=" * 70)
-    
-    # === 应用选股条件过滤 ===
-    
-    # 1. Hurst 指数过滤
-    hurst_threshold = selection_cfg.get('hurst_threshold', 0.5)
-    df_selection = df_selection[df_selection['hurst'] < hurst_threshold]
-    logger.info(f"Hurst < {hurst_threshold}: 剩余 {len(df_selection)} 只股票")
-    
-    # 2. 流动性过滤
-    min_turnover = risk_cfg.get('min_turnover', 5000)
-    df_selection = df_selection[df_selection['avg_turnover'] >= min_turnover]
-    logger.info(f"日均成交额 >= {min_turnover}万：剩余 {len(df_selection)} 只股票")
-    
-    # 3. 价格过滤
-    min_price = selection_cfg.get('min_price', 5.0)
-    max_price = selection_cfg.get('max_price', 500.0)
-    df_selection = df_selection[
-        (df_selection['price'] >= min_price) & 
-        (df_selection['price'] <= max_price)
-    ]
-    logger.info(f"价格在 [{min_price}, {max_price}] 区间：剩余 {len(df_selection)} 只股票")
-    
-    # 4. 波动率过滤
-    vol_threshold = selection_cfg.get('volatility_threshold', 0.8)
-    df_selection = df_selection[df_selection['volatility'] < vol_threshold]
-    logger.info(f"波动率 < {vol_threshold}: 剩余 {len(df_selection)} 只股票")
-    
-    # 排序（按 Hurst 指数）
-    df_selection = df_selection.sort_values('hurst', ascending=True)
-    df_selection['rank'] = range(1, len(df_selection) + 1)
-    
-    # 添加推荐理由
-    df_selection['reason'] = df_selection.apply(
-        lambda row: f"Hurst={row['hurst']:.3f}, ATR={row['atr']:.2f}, 成交额={row['avg_turnover']:.0f}万",
-        axis=1
-    )
-    
-    logger.info("\n" + "=" * 70)
-    logger.info("选股池构建完成:")
-    logger.info(f"总计：{len(stock_list)} 只，成功：{success_count}只，失败：{fail_count}只")
-    logger.info(f"最终入选：{len(df_selection)} 只")
-    logger.info("=" * 70)
-    
-    # 保存选股结果
-    output_dir = paths_cfg['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
-    result_file = os.path.join(output_dir, f"wf_stock_selection_{wf_window.current_date_str.replace('-', '')}.csv")
-    df_selection.to_csv(result_file, index=False, encoding='utf-8-sig')
-    logger.info(f"选股结果已保存到：{result_file}")
-    
-    # 打印前 10 只股票
-    logger.info("\n选股池预览 (Top 10):")
-    for _, row in df_selection.head(10).iterrows():
-        logger.info(f"  {row['rank']}. {row['code']} | {row['reason']}")
-    
-    return df_selection
-
-
 # ==================== 搜索空间动态裁剪 ====================
 
-def build_adaptive_search_space(allocated_cash: float, init_pos: float) -> dict:
+def build_adaptive_search_space(allocated_cash: float, init_pos: float,
+                                 config: dict = None) -> dict:
     """
-    启动时动态裁剪搜索空间，避免 Optuna 采样无效组合
+    启动时动态裁剪搜索空间（7参数版），避免 Optuna 采样无效组合。
 
-    核心约束: grid_amount × max_grids ≤ grid_pool × 0.95
+    核心约束: Σ(grid_amount × multiplier^k for k in 0..max_grids-1) ≤ grid_pool × 0.95
 
     参数:
         allocated_cash: 单股分配资金（元）
-        init_pos: 初始仓位比例（决定网格资金池大小）
+        init_pos: 初始仓位比例（中性值，实际由 Optuna 采样）
+        config: 配置字典（可选，读取 backtest 节中的参数范围）
 
     返回:
         裁剪后的搜索空间字典
     """
-    # 实际网格资金池 = alloc × (1 - initial_position)
+    bt_cfg = (config or {}).get('backtest', {})
     grid_pool = allocated_cash * (1 - init_pos)
-    # 95% 安全系数
     max_invest = grid_pool * 0.95
 
-    # 基础每格金额下限
-    amount_min = max(2000, allocated_cash * 0.03)
+    # grid_amount 连续范围（Optuna 用 suggest_int 采样）
+    amount_min = max(500, int(allocated_cash * 0.01))
+    amount_max = min(100000, int(max_invest / 3))  # 最少保留3层空间
 
-    # 离散候选值（按资金级别）
+    # max_grids 范围（按资金级别，上限15）
     if allocated_cash < 100000:
-        raw_amounts = [2000, 3000, 4000, 5000]
-        max_grids_raw = 6
+        max_grids_raw = 8
     elif allocated_cash < 500000:
-        raw_amounts = [5000, 8000, 10000, 15000]
-        max_grids_raw = 9
+        max_grids_raw = 12
     else:
-        raw_amounts = [10000, 20000, 30000, 50000]
-        max_grids_raw = 9
+        max_grids_raw = 15
 
-    # 动态裁剪：基于保守估计的 max_grids（取最小4层）过滤 grid_amount
-    # 确保所有 valid_amounts 在 max_grids=4 时都满足约束
-    conservative_grids = 4
-    valid_amounts = [a for a in raw_amounts if a * conservative_grids <= max_invest]
+    # 保守估计：用 multiplier=2.0 估算资金需求来限制 max_grids
+    # 在 multiplier=2.0 时最多层数
+    test_multiplier = 2.0
+    test_grids = 3
+    while test_grids <= max_grids_raw:
+        test_inv = float(np.sum(amount_min * (test_multiplier ** np.arange(test_grids))))
+        if test_inv > max_invest:
+            break
+        test_grids += 1
+    feasible_max_grids = max(3, test_grids - 1)
 
-    if not valid_amounts:
-        # 降级：找不到满足4层的grid_amount，计算 amount_min 支持的最大层数
-        valid_amounts = [amount_min]
-        feasible_grids = int(max_invest / amount_min)
-        max_grids = min(max_grids_raw, feasible_grids)
-        # 确保 lower <= upper
-        if max_grids < 4:
-            max_grids_range = [max(1, max_grids), max_grids] if max_grids >= 1 else [1, 1]
-        else:
-            max_grids_range = [4, max_grids]
-    else:
-        # 基于最大有效金额计算 max_grids 上限（确保所有 valid_amounts 都满足约束）
-        max_valid_amount = max(valid_amounts)
-        feasible_grids = int(max_invest / max_valid_amount)
-        max_grids = min(max_grids_raw, feasible_grids)
-        # 修正：确保 max_grids 与所有 valid_amounts 兼容
-        if max_valid_amount * 4 > max_invest:
-            max_grids = min(max_grids, feasible_grids)
-        max_grids_range = [4, max_grids] if max_grids >= 4 else [max(1, max_grids), max_grids]
+    max_grids_range = [3, min(max_grids_raw, feasible_max_grids + 2)]
+
+    # 从 config 读取参数范围，config 未设置时回退到默认值
+    # max_grids_range 由资金自适应推导，config 中的上限作为约束
+    max_grids_config = bt_cfg.get('max_grids_range', [3, 15])
+    max_grids_range[1] = min(max_grids_range[1], max_grids_config[1])
 
     return {
-        'grid_amount_choices': valid_amounts,
+        'grid_amount_range': [amount_min, amount_max],
         'max_grids_range': max_grids_range,
-        'grid_spacing_range': [0.015, 0.035],
-        'initial_position_range': [0.40, 0.50],
+        'buy_spacing_range': bt_cfg.get('buy_spacing_range', [0.01, 0.06]),
+        'sell_spacing_range': bt_cfg.get('sell_spacing_range', [0.01, 0.06]),
+        'multiplier_range': bt_cfg.get('amount_multiplier_range', [0.3, 3.0]),
+        'initial_position_range': bt_cfg.get('initial_position_range', [0.15, 0.75]),
+        'decay_range': bt_cfg.get('spacing_decay_range', [0.5, 2.0]),
         'grid_pool': grid_pool,
         'max_invest': max_invest,
     }
@@ -3201,513 +2121,218 @@ def build_adaptive_search_space(allocated_cash: float, init_pos: float) -> dict:
 
 def calculate_composite_score(
     result: dict,
-    grid_spacing: float,
+    buy_spacing_pct: float,
+    sell_spacing_pct: float,
     max_grids: int,
+    amount_multiplier: float,
     n_days: int,
     max_drawdown_limit: float = 0.12,
     trade_freq_threshold: int = 4,
     cost_ratio_limit: float = 0.03
 ) -> float:
     """
-    多目标优化惩罚函数（量纲对齐版）
-
-    设计原则：
-    1. 小资金(<10万)对交易频率极敏感——高频网格吞噬手续费本金
-    2. 追求高Calmar但不能容忍高回撤——12%是小资金存活红线
-    3. 密集网格(小间距+多层)在波动率跳变时易崩溃——需惩罚
+    多目标优化惩罚函数（7参数版）
 
     参数:
         result: backtest_grid_strategy 返回的字典
-        grid_spacing: 网格间距(小数，如 0.02 表示 2%)
+        buy_spacing_pct: 买入网格间距(小数)
+        sell_spacing_pct: 卖出网格间距(小数)
         max_grids: 最大网格层数
+        amount_multiplier: 加仓倍数
         n_days: 回测天数
         max_drawdown_limit: 最大回撤上限(默认12%)
         trade_freq_threshold: 月均交易次数上限阈值(默认4笔/月/股)
         cost_ratio_limit: 摩擦成本/初始本金上限(默认3%)
-
-    返回:
-        复合分数(越高越好)，返回 -999 表示最大回撤超限，-5.0 表示流动性越界
     """
-    # 1. 提取关键指标
     calmar = result.get('calmar_ratio', 0)
     max_dd = result.get('max_drawdown', 1)
     n_trades = result.get('n_trades', 0)
     annual_return = result.get('annual_return', 0)
     total_slippage = result.get('total_slippage_cost', 0)
-    initial_cash = result.get('initial_cash', 1000000.0)
+    initial_cash = result.get('initial_cash', DEFAULT_INITIAL_CASH)
 
-    # 2. 硬约束：流动性越界 → 软惩罚（有限值避免污染 TPE 分布）
     if result.get('reason') == 'GRID_POOL_EXCEEDED':
         return -5.0
 
-    # 3. 硬约束：最大回撤超过上限 → 无效
     if max_dd > max_drawdown_limit:
         return -999
 
-    # 4. 回撤软惩罚：[0, 0.5] 区间无惩罚，[0.5, 1.0] 线性增长至 0.25
-    #    量级：max 0.25，与 Calmar 量纲匹配
+    # 回撤软惩罚
     dd_ratio = max_dd / max_drawdown_limit
-    if dd_ratio > 0.5:
-        dd_penalty = (dd_ratio - 0.5) * 0.5
-    else:
-        dd_penalty = 0.0
+    dd_penalty = (dd_ratio - 0.5) * 0.5 if dd_ratio > 0.5 else 0.0
 
-    # 5. 频率惩罚：月均交易次数超过阈值（4笔/月/股）开始惩罚
-    #    量级：max ~0.4，避免淹没 Calmar 信号
+    # 频率惩罚
     months = max(1, n_days / 21)
     trades_per_month = n_trades / months
     trade_penalty = max(0.0, (trades_per_month - trade_freq_threshold) * 0.15)
 
-    # 6. 成本惩罚：使用 initial_cash 作分母，防除零奇点
-    #    摩擦率 = (滑点 + 估算手续费) / 初始本金
-    #    超过 3% 阈值开始惩罚，上限 0.3（避免淹没 Calmar 信号）
+    # 成本惩罚
     estimated_fees = abs(result.get('total_return', 0)) * initial_cash * 0.0007
     friction_ratio = (total_slippage + estimated_fees) / initial_cash
     cost_penalty = max(0.0, min((friction_ratio - cost_ratio_limit) * 5.0, 0.3))
 
-    # 7. 网格密度惩罚：对数平滑，量级控制在 [0, 0.4]
-    #    density_metric = max_grids / (spacing * 100)
-    #    例: 5层/2.0%间距 = 2.5；6层/1.5%间距 = 4.0
-    #    >1.5 时开始惩罚，6层/1.5% 惩罚约 0.28
-    density_metric = max_grids / max(grid_spacing * 100, 0.1)
+    # 网格密度惩罚：使用平均间距
+    avg_spacing = (buy_spacing_pct + sell_spacing_pct) / 2
+    density_metric = max_grids / max(avg_spacing * 100, 0.1)
     if density_metric > 1.5:
         density_penalty = 0.3 * np.log10(density_metric / 1.5)
     else:
         density_penalty = 0.0
 
-    # 8. 复合分数 = Calmar - 各项惩罚
-    composite = calmar - dd_penalty - trade_penalty - cost_penalty - density_penalty
+    # 金字塔激进惩罚：multiplier 偏离 1.0 过多时微罚
+    mult_deviation = abs(amount_multiplier - 1.0)
+    pyramid_penalty = 0.1 * mult_deviation if mult_deviation > 0.5 else 0.0
 
-    # 9. 年化收益为负 → 硬下移，保持梯度单调性
+    composite = calmar - dd_penalty - trade_penalty - cost_penalty - density_penalty - pyramid_penalty
+
     if annual_return < 0:
         composite -= 1.5
 
     return composite
 
 
-# ==================== Walk-Forward 参数优化 ====================
+# ==================== 独立命令入口 ====================
 
-def optimize_parameters_wf(config: dict, wf_window: WalkForwardWindow,
-                           stock_pool: List[str]) -> Dict:
+
+def run_select(config: dict, force_select: bool = False) -> pd.DataFrame:
     """
-    基于 Walk-Forward 窗口的参数优化
-    
-    数据范围：
-    - In-Sample: T - 1 年 至 T - 3 个月（用于优化）
-    - Out-of-Sample: T - 3 个月 至 T（用于验证）
-    
-    优化算法：Optuna 贝叶斯超参数搜索
-    
-    搜索空间:
-    - grid_spacing: 1.0% ~ 5.0%, 步长 0.1%
-    - grid_amount: [5000, 10000, 20000, 50000]
-    - initial_position: 30% ~ 70%, 步长 5%
-    - max_grids: 5 ~ 15
-    
-    目标函数：最大化 Calmar Ratio (年化收益 / 最大回撤)
-    
+    选股命令入口（严格本地模式）
+
     参数:
         config: 配置字典
-        wf_window: Walk-Forward 窗口管理器
-        stock_pool: 候选股票池列表
-    
-    返回:
-        优化结果字典（包含最佳参数和绩效指标）
-    
-    关键约束:
-        - OOS 数据绝对不允许参与任何形式的训练或参数选择
-    """
-    logger.info("=" * 70)
-    logger.info("Walk-Forward 参数优化")
-    logger.info("=" * 70)
-    
-    # 获取日期范围
-    ins_start, ins_end = wf_window.get_ins_sample_period()
-    oos_start, oos_end = wf_window.get_oos_sample_period()
-    
-    logger.info(f"In-Sample 期间：{ins_start} 至 {ins_end} (T-1Y ~ T-3M)")
-    logger.info(f"Out-of-Sample 期间：{oos_start} 至 {oos_end} (T-3M ~ T)")
-    logger.info("=" * 70)
+        force_select: 是否强制重新选股
 
-    grid_cfg = config.get('grid', {})
+    返回:
+        选股结果 DataFrame
+    """
+    logger.info("=" * 60)
+    logger.info("选股模式：严格本地数据")
+    logger.info("=" * 60)
+    return run_multi_factor_selection(config, auto_update_config=True, force_select=force_select)
+
+
+def run_backtest(config: dict) -> Dict:
+    """
+    回测命令入口：对选出的股票使用优化后的参数进行历史回测
+
+    参数:
+        config: 配置字典
+
+    返回:
+        回测结果字典
+    """
+    from data_layer.market_db import save_backtest_result, get_stock_data as get_db_data
+    from utils.utils import load_state
+
+    stocks = config.get('stocks', [])
+    if not stocks:
+        logger.error("配置文件中未指定股票列表，请先运行选股")
+        return {}
+
     backtest_cfg = config.get('backtest', {})
     paths_cfg = config.get('paths', {})
     capital_cfg = config.get('capital', {})
+    initial_cash = capital_cfg.get('total', int(DEFAULT_INITIAL_CASH))
 
-    # 从配置读取资金参数
-    total_cash = capital_cfg.get('total', 100000)  # 默认10万
-    max_position_pct = capital_cfg.get('max_position_per_stock', 0.30)
-    cash_reserve_ratio = capital_cfg.get('cash_reserve_ratio', 0.40)
-    initial_position = capital_cfg.get('initial_position', 0.45)
+    # 读取优化后的参数
+    state = load_state()
+    opt_history = state.get('optimization_history', {})
 
-    # 计算每只股票分配的资金
-    investable_cash = total_cash * (1 - cash_reserve_ratio)
-    max_stocks_by_money = max(1, int(investable_cash / (total_cash * max_position_pct)))
-    max_stocks = min(max_stocks_by_money, len(stock_pool))
-    allocated_cash = investable_cash / max_stocks if max_stocks > 0 else investable_cash
+    # 默认网格参数（7参数格式）
+    grid_cfg = config.get('grid', {})
+    default_params = {
+        'buy_spacing_pct': grid_cfg.get('base_spacing', 0.02),
+        'sell_spacing_pct': grid_cfg.get('base_spacing', 0.02),
+        'grid_amount': grid_cfg.get('grid_amount', 3000),
+        'amount_multiplier': 1.0,
+        'initial_position': grid_cfg.get('initial_position', 0.45),
+        'max_grids': grid_cfg.get('max_grids', 5),
+        'spacing_decay': 1.0,
+    }
 
-    # 网格资金池
-    grid_pool = allocated_cash * (1 - initial_position)
+    results = []
+    logger.info("=" * 60)
+    logger.info("回测模式：历史数据回测")
+    logger.info("=" * 60)
+    logger.info(f"回测股票: {len(stocks)} 只, 初始资金: {initial_cash}")
 
-    logger.info(f"资金配置: 总资金={total_cash}元, 单股上限={max_position_pct*100}%, "
-                f"现金保留={cash_reserve_ratio*100}%")
-    logger.info(f"投入股票数: {max_stocks}, 每只分配: {allocated_cash:.0f}元, "
-                f"网格资金池={grid_pool:.0f}元 ({(1-initial_position)*100:.0f}%)")
+    for code in stocks:
+        logger.info(f"\n{'-'*60}")
+        logger.info(f"回测: {code}")
+        logger.info(f"{'-'*60}")
 
-    # 计算搜索空间（启动时动态裁剪，避免无效采样）
-    search_space = build_adaptive_search_space(allocated_cash, initial_position)
-    logger.info(f"搜索空间（已裁剪）: grid_amount={search_space['grid_amount_choices']}, "
-                f"max_grids={search_space['max_grids_range']}, "
-                f"grid_pool={search_space['grid_pool']:.0f}元")
-
-    if not stock_pool:
-        logger.error("股票池为空，无法优化")
-        return {}
-    
-    all_results = []
-    
-    # 限制优化股票数量
-    max_optimize_stocks = backtest_cfg.get('max_optimize_stocks', 5)
-    stocks_to_optimize = stock_pool[:max_optimize_stocks]
-    
-    logger.info(f"将对以下 {len(stocks_to_optimize)} 只股票进行参数优化:")
-    for code in stocks_to_optimize:
-        logger.info(f"  - {code}")
-    logger.info("")
-    
-    for code in stocks_to_optimize:
-        logger.info(f"\n{'='*70}")
-        logger.info(f"处理股票：{code}")
-        logger.info(f"{'='*70}")
-
-        # 获取历史数据（仅对选股池中的股票执行增量更新）
-        df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
-                            selected_stocks=stocks_to_optimize)
-        
-        if df.empty:
-            logger.warning(f"{code} 无数据，跳过")
+        # 读取历史数据（严格本地，直接从 SQLite 读取）
+        df = get_db_data(code, data_dir=paths_cfg.get('data_dir', './data'))
+        if df is None or df.empty or len(df) < 60:
+            logger.warning(f"{code} 数据不足，跳过")
             continue
-        
-        # 清洗数据
+
         df = clean_data(df)
-        
-        # === 关键：按 Walk-Forward 窗口切割数据 ===
-        # In-Sample 数据：用于参数优化 [T-1Y, T-3M)
-        df_ins = wf_window.slice_dataframe_by_period(df, period='ins')
-        
-        # Out-of-Sample 数据：用于独立验证 [T-3M, T]
-        df_oos = wf_window.slice_dataframe_by_period(df, period='oos')
-        
-        # 记录数据切片信息（注释要求）
-        logger.info(f"数据切片完成:")
-        logger.info(f"  In-Sample: {len(df_ins)}天 ({ins_start} 至 {ins_end})")
-        logger.info(f"  Out-of-Sample: {len(df_oos)}天 ({oos_start} 至 {oos_end})")
-        
-        if df_ins.empty or len(df_ins) < 60:
-            logger.warning(f"{code} In-Sample 数据不足，跳过")
-            continue
-        
-        if df_oos.empty or len(df_oos) < 20:
-            logger.warning(f"{code} Out-of-Sample 数据不足，跳过")
-            continue
-        
-        # === 定义 Optuna 目标函数 ===
-        def objective(trial):
-            """
-            Optuna 多目标优化目标函数
 
-            搜索空间（根据资金自动计算）:
-            - grid_spacing: {search_space['grid_spacing_range']}
-            - grid_amount: {search_space['grid_amount_choices']}
-            - initial_position: {search_space['initial_position_range']}
-            - max_grids: {search_space['max_grids_range']}
+        # 使用优化后的参数或默认参数（兼容新旧格式）
+        params = opt_history.get(code, {}).get('final_params')
+        if not params:
+            params = default_params
+        logger.info(f"参数: buy_sp={params.get('buy_spacing_pct', 0)*100:.2f}%, "
+                    f"sell_sp={params.get('sell_spacing_pct', 0)*100:.2f}%, "
+                    f"amount={params.get('grid_amount')}, mult={params.get('amount_multiplier', 1.0):.2f}, "
+                    f"ip={params.get('initial_position', 0)*100:.0f}%, grids={params.get('max_grids')}, "
+                    f"decay={params.get('spacing_decay', 1.0):.2f}")
 
-            目标：最大化复合分数 = Calmar - 回撤惩罚 - 交易频率惩罚 - 成本率惩罚 - 网格密度惩罚
-            """
-            # 参数搜索空间（根据资金规模自动计算）
-            grid_spacing = trial.suggest_float('grid_spacing',
-                search_space['grid_spacing_range'][0],
-                search_space['grid_spacing_range'][1], step=0.001)
-            grid_amount = trial.suggest_categorical('grid_amount',
-                search_space['grid_amount_choices'])
-            initial_position = trial.suggest_float('initial_position',
-                search_space['initial_position_range'][0],
-                search_space['initial_position_range'][1], step=0.01)
-            max_grids = trial.suggest_int('max_grids',
-                search_space['max_grids_range'][0],
-                search_space['max_grids_range'][1])
-
-            # In-Sample 回测（仅使用样本内数据）
-            result = backtest_grid_strategy(
-                df_ins,  # 关键：仅使用 In-Sample 数据
-                grid_spacing=grid_spacing,
-                grid_amount=grid_amount,
-                initial_position=initial_position,
-                max_grids=max_grids,
-                commission_rate=backtest_cfg.get('commission_rate', 0.00015),
-                stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-                slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
-                initial_cash=allocated_cash  # 使用分配的资金
-            )
-
-            # 多目标惩罚复合分数
-            return calculate_composite_score(
-                result=result,
-                grid_spacing=grid_spacing,
-                max_grids=max_grids,
-                n_days=len(df_ins),
-                max_drawdown_limit=0.12,
-                trade_freq_limit=0.05,
-                cost_ratio_limit=0.40
-            )
-        
-        # === 执行优化 ===
-        n_trials = backtest_cfg.get('n_trials', 150)
-        n_startup = backtest_cfg.get('n_startup_trials', 20)
-        logger.info(f"开始 Optuna 优化，试验次数：{n_trials}")
-
-        sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup)
-        pruner = optuna.pruners.MedianPruner()
-
-        study = optuna.create_study(
-            direction='maximize',
-            study_name=f'{code}_wf_optimization_{wf_window.current_date_str}',
-            load_if_exists=False,
-            sampler=sampler,
-            pruner=pruner
-        )
-        
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-        
-        # 最佳参数
-        best_params = study.best_params
-        best_calmar_ins = study.best_value
-        
-        logger.info(f"\n{code} In-Sample 最佳参数:")
-        logger.info(f"  网格间距：{best_params['grid_spacing']}%")
-        logger.info(f"  每格金额：{best_params['grid_amount']}元")
-        logger.info(f"  初始仓位：{best_params['initial_position']}%")
-        logger.info(f"  最大网格：{best_params['max_grids']}层")
-        logger.info(f"  In-Sample Calmar Ratio: {best_calmar_ins:.4f}")
-        
-        # === 样本外验证（关键：OOS 数据不参与优化） ===
-        logger.info(f"\n开始 Out-of-Sample 验证...")
-        
-        result_oos = backtest_grid_strategy(
-            df_oos,  # 关键：仅使用 OOS 数据
-            grid_spacing=best_params['grid_spacing'],
-            grid_amount=best_params['grid_amount'],
-            initial_position=best_params['initial_position'],
-            max_grids=best_params['max_grids'],
+        # 执行回测（7参数）
+        result = backtest_grid_strategy(
+            df,
+            buy_spacing_pct=params.get('buy_spacing_pct', 0.02),
+            sell_spacing_pct=params.get('sell_spacing_pct', params.get('buy_spacing_pct', 0.02)),
+            grid_amount=params.get('grid_amount', 3000),
+            amount_multiplier=params.get('amount_multiplier', 1.0),
+            initial_position=params.get('initial_position', 0.45),
+            max_grids=params.get('max_grids', 5),
+            spacing_decay=params.get('spacing_decay', 1.0),
             commission_rate=backtest_cfg.get('commission_rate', 0.00015),
             stamp_tax=backtest_cfg.get('stamp_tax', 0.0005),
-            slippage_rate=backtest_cfg.get('slippage_rate', 0.001)  # 新增：滑点参数
+            slippage_rate=backtest_cfg.get('slippage_rate', 0.001),
+            initial_cash=initial_cash
         )
-        
-        logger.info(f"\n{code} Out-of-Sample 绩效指标:")
-        logger.info(f"  总收益率：{result_oos['total_return']*100:.2f}%")
-        logger.info(f"  年化收益：{result_oos['annual_return']*100:.2f}%")
-        logger.info(f"  最大回撤：{result_oos['max_drawdown']*100:.2f}%")
-        logger.info(f"  夏普比率：{result_oos['sharpe_ratio']:.4f}")
-        logger.info(f"  Calmar Ratio: {result_oos['calmar_ratio']:.4f}")
-        logger.info(f"  交易次数：{result_oos['n_trades']}")
-        
-        # 保存结果
-        all_results.append({
-            'code': code,
-            'window_date': wf_window.current_date_str,
-            'best_params': best_params,
-            'in_sample': {
-                'calmar_ratio': best_calmar_ins,
-                'trials': n_trials
-            },
-            'out_of_sample': {
-                'total_return': result_oos['total_return'],
-                'annual_return': result_oos['annual_return'],
-                'max_drawdown': result_oos['max_drawdown'],
-                'sharpe_ratio': result_oos['sharpe_ratio'],
-                'calmar_ratio': result_oos['calmar_ratio'],
-                'n_trades': result_oos['n_trades']
-            }
-        })
-    
-    # === 保存优化报告 ===
-    output_dir = paths_cfg['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
-    
-    report_file = os.path.join(
-        output_dir, 
-        f'wf_optimization_report_{wf_window.current_date_str.replace("-", "")}.json'
-    )
-    
-    report_data = {
-        'optimization_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'window_config': {
-            'current_date': wf_window.current_date_str,
-            'universe_period': wf_window.get_universe_period(),
-            'ins_sample_period': wf_window.get_ins_sample_period(),
-            'oos_sample_period': wf_window.get_oos_sample_period()
-        },
-        'results': all_results
-    }
-    
-    with open(report_file, 'w', encoding='utf-8') as f:
-        json.dump(report_data, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"\n优化报告已保存到：{report_file}")
+        # 附加参数信息用于保存
+        result['code'] = code
+        result['params'] = params
 
-    # === 选择实盘交易股票：根据收益排序，选择理论收益最大的 n 只 ===
-    trading_stocks_count = max(1, len(stock_pool))
-    df_results = pd.DataFrame(all_results)
-    df_results = df_results.sort_values('out_of_sample_return', ascending=False)
-    wf_trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
+        # 保存到 SQLite
+        save_backtest_result(code, result, data_dir=paths_cfg.get('data_dir', './data'))
 
-    logger.info(f"\n实盘交易股票（按收益排序）:")
-    for i, code in enumerate(wf_trading_stocks):
-        row = df_results[df_results['code'] == code].iloc[0]
-        logger.info(f"  {i+1}. {code} - 样本外收益: {row['out_of_sample_return']*100:.2f}%")
+        logger.info(f"结果: 收益率={result['total_return']*100:.2f}%, "
+                    f"最大回撤={result['max_drawdown']*100:.2f}%, "
+                    f"Calmar={result['calmar_ratio']:.4f}, "
+                    f"交易次数={result['n_trades']}")
+        results.append(result)
 
-    # 保存实盘股票到 config_state.json
-    from utils import load_state, save_state
-    state = load_state()
-    state['trading_stocks'] = wf_trading_stocks
-    state['optimization_history'] = {
-        r['code']: {
-            'best_params': r.get('best_params', {}),
-            'out_of_sample_return': r.get('out_of_sample_return', 0),
-            'out_of_sample_calmar': r.get('out_of_sample_calmar', 0),
-            'out_of_sample_drawdown': r.get('out_of_sample_drawdown', 0)
-        }
-        for r in all_results
-    }
-    save_state(state)
-    logger.info(f"实盘股票已保存到 config_state.json")
+    logger.info("=" * 60)
+    logger.info("回测完成")
+    logger.info("=" * 60)
 
-    return all_results
+    return {'stocks': stocks, 'results': results}
 
 
 # ==================== Walk-Forward 完整流程 ====================
 
-def run_walk_forward_analysis(config: dict, current_date: datetime = None, 
-                               rolling_period: str = None) -> Dict:
-    """
-    执行完整的 Walk-Forward 分析流程
-    
-    流程:
-    1. 创建 Walk-Forward 窗口（当前日期 T）
-    2. 构建选股池（使用 T-1.5Y 至 T-3M 数据）
-    3. 参数优化（使用 T-1Y 至 T-3M 数据）
-    4. 样本外验证（使用 T-3M 至 T 数据）
-    5. 滚动窗口（如果指定 rolling_period）
-    
-    参数:
-        config: 配置字典
-        current_date: 当前日期（默认今天）
-        rolling_period: 滚动周期（如 '1m' 表示每月滚动）
-    
-    返回:
-        包含所有滚动窗口结果的字典
-    """
-    logger.info("=" * 70)
-    logger.info("Walk-Forward 完整分析流程")
-    logger.info("=" * 70)
-    
-    paths_cfg = config.get('paths', {})
-    output_dir = paths_cfg['output_dir']
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 存储所有滚动窗口的结果
-    all_rolling_results = []
-    
-    # 初始化当前窗口
-    wf_window = WalkForwardWindow(current_date)
-    
-    # 滚动次数（如果启用滚动）
-    max_rolls = 12 if rolling_period else 1  # 默认最多滚动 12 次
-    
-    roll_count = 0
-    
-    while wf_window is not None:
-        roll_count += 1
-        logger.info(f"\n{'#'*70}")
-        logger.info(f"# Walk-Forward 窗口 #{roll_count}")
-        logger.info(f"# 当前日期：{wf_window.current_date_str}")
-        logger.info(f"{'#'*70}\n")
-        
-        # === 步骤 1: 构建选股池 ===
-        df_universe = build_universe_with_wf(config, wf_window)
-        
-        if df_universe.empty:
-            logger.warning("选股池为空，停止分析")
-            break
-        
-        # 获取选股池列表
-        stock_pool = df_universe['code'].tolist()
-        
-        # === 步骤 2: 参数优化 ===
-        optimization_results = optimize_parameters_wf(config, wf_window, stock_pool)
-        
-        if not optimization_results:
-            logger.warning("优化结果为空，停止分析")
-            break
-        
-        # === 步骤 3: 保存当前窗口结果 ===
-        window_result = {
-            'window_date': wf_window.current_date_str,
-            'universe_count': len(stock_pool),
-            'optimization_results': optimization_results
-        }
-        all_rolling_results.append(window_result)
-        
-        # === 步骤 4: 滚动窗口 ===
-        if rolling_period and roll_count < max_rolls:
-            logger.info(f"\n准备滚动窗口：{rolling_period}")
-            wf_window = wf_window.roll_forward(rolling_period)
-            
-            # 检查是否超过当前实际日期
-            if wf_window.current_date > datetime.now():
-                logger.info("滚动窗口已超过当前日期，停止滚动")
-                wf_window = None
-        else:
-            wf_window = None
-    
-    # === 保存汇总报告 ===
-    summary_file = os.path.join(
-        output_dir,
-        f'wf_summary_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-    )
-    
-    summary_data = {
-        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'rolling_period': rolling_period,
-        'total_windows': len(all_rolling_results),
-        'windows': all_rolling_results
-    }
-    
-    with open(summary_file, 'w', encoding='utf-8') as f:
-        json.dump(summary_data, f, ensure_ascii=False, indent=2)
-    
-    logger.info(f"\n{'='*70}")
-    logger.info("Walk-Forward 分析完成")
-    logger.info(f"共执行 {len(all_rolling_results)} 个窗口")
-    logger.info(f"汇总报告已保存到：{summary_file}")
-    logger.info(f"{'='*70}")
-    
-    return summary_data
-
-
-# ==================== 主调度函数 ====================
-
-def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
+def execute_strategy(mode: str = None, config_path: str = "config.yaml",
+                     force_select: bool = False):
     """
     策略执行入口
 
     参数:
-        mode: 运行模式 ('select', 'optimize', 'signal')
+        mode: 运行模式 ('select', 'optimize', 'backtest')
         config_path: 配置文件路径
+        force_select: 是否强制重新选股（选股模式有效）
     """
     # 加载配置
     config = load_config(config_path)
+
+    # 初始化数据获取模块配置（限流参数等）
+    from data_layer.fetcher import init_fetcher_config
+    init_fetcher_config(config)
 
     # 如果未指定模式，使用配置文件中的模式
     if mode is None:
@@ -3717,14 +2342,14 @@ def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
 
     try:
         if mode == 'select':
-            result = run_selection(config)
+            result = run_select(config, force_select=force_select)
             return result
         elif mode == 'optimize':
             # 两阶段优化：贝叶斯优化 + WF微调
             result = run_two_phase_optimization(config)
             return result
-        elif mode == 'signal':
-            result = generate_signals(config)
+        elif mode == 'backtest':
+            result = run_backtest(config)
             return result
         else:
             logger.error(f"未知模式：{mode}")
@@ -3733,95 +2358,6 @@ def execute_strategy(mode: str = None, config_path: str = "config.yaml"):
     except Exception as e:
         logger.exception(f"策略执行失败：{str(e)}")
         raise
-
-
-class SignalStabilizer:
-    """
-    信号稳定性过滤器（无状态设计，调用方维护实例）。
-
-    职责：
-    - 维护 signal_history (maxlen=3)：每只股票最近3日得分
-    - 维护 cooldown_tracker：剔除观察期追踪
-    - 输出 trade_signals：T日生成 → T+1日9:30执行
-
-    使用方式：
-        stabilizer = SignalStabilizer()
-        # T日:
-        threshold = screener._get_threshold(scores)
-        result = stabilizer.update(daily_signals_df, current_date, threshold)
-        # T+1日9:30执行 result[result["action"]=="buy"]
-    """
-
-    def __init__(self, config: Optional[dict] = None):
-        """
-        初始化信号稳定性过滤器。
-
-        Parameters:
-            config: 配置字典（可选）
-        """
-        self.signal_stability_days = 3  # 连续3日达标
-        self.cooldown_margin = 0.05     # 阈值下方5%以内触发冷却
-        self.cooldown_days = 2           # 冷却期2日
-        self.signal_history = {}          # {code: deque(maxlen=3) of scores}
-        self.cooldown_tracker = {}       # {code: remaining_cooldown_days}
-
-    def update(self, daily_signals: pd.DataFrame, current_date: str,
-               daily_threshold: float) -> pd.DataFrame:
-        """
-        输入当日截面打分，输出可交易信号。
-
-        Parameters:
-            daily_signals: screener.screen() 输出的 DataFrame，含 code, total_score
-            current_date: 当前日期字符串 "YYYY-MM-DD"
-            daily_threshold: 当日动态阈值（来自 screener._get_threshold）
-
-        Returns:
-            pd.DataFrame: 含可交易信号的 DataFrame (columns: code, score, action, reason)
-        """
-        from collections import deque
-
-        trade_signals = []
-        for _, row in daily_signals.iterrows():
-            code, score = row["code"], row["total_score"]
-
-            # 1. 更新历史
-            hist = self.signal_history.setdefault(code, deque(maxlen=3))
-            hist.append(score)
-
-            # 2. 冷却期递减
-            if code in self.cooldown_tracker:
-                self.cooldown_tracker[code] -= 1
-                if self.cooldown_tracker[code] <= 0:
-                    del self.cooldown_tracker[code]
-                trade_signals.append({"code": code, "score": score, "action": "cooldown", "reason": "waiting"})
-                continue
-
-            # 3. 稳定性检查：连续3日均 >= daily_threshold
-            if len(hist) < 3:
-                trade_signals.append({"code": code, "score": score, "action": "watch", "reason": f"history={len(hist)}/3"})
-                continue
-
-            if min(hist) >= daily_threshold:
-                trade_signals.append({"code": code, "score": score, "action": "buy", "reason": "stable_3d"})
-                self.cooldown_tracker[code] = self.cooldown_days  # 触发后进入冷却
-            else:
-                trade_signals.append({"code": code, "score": score, "action": "skip", "reason": "below_threshold"})
-
-        return pd.DataFrame(trade_signals)
-
-    def prune_suspended(self, active_codes: List[str]):
-        """
-        停牌标的自动从历史缓存剔除。
-
-        Parameters:
-            active_codes: 当前在交易的有效代码列表
-        """
-        for code in list(self.signal_history.keys()):
-            if code not in active_codes:
-                del self.signal_history[code]
-        for code in list(self.cooldown_tracker.keys()):
-            if code not in active_codes:
-                del self.cooldown_tracker[code]
 
 
 if __name__ == "__main__":

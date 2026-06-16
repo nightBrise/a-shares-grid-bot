@@ -1,18 +1,17 @@
-# Git 忽略文件 - A 股网格交易系统
+# Git 忽略文件 - A 股网格交易系统 v2.0.0
 
 # 数据目录 (自动下载的行情数据，本地保存无需上传)
 data/
 *.csv
 *.parquet
 
-# 用户配置文件 (包含个人设置和敏感信息)
-config.yaml
-config_state.json
+# 用户配置文件 (包含个人设置，不上传)
+configuration/config.yaml
+configuration/config_state.json
 
 # 输出文件 (信号、日志、报告)
 output/
 *.log
-*.json
 
 # 环境变量和敏感信息
 .env
@@ -57,4 +56,12 @@ Thumbs.db
 
 # Optuna 研究存储
 optuna_study_*.db
-output/
+
+# Gradio 临时文件
+.gradio/
+
+# pytest 缓存
+.pytest_cache/
+
+# ruff 缓存
+.ruff_cache/
