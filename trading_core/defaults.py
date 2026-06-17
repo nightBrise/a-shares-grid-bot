@@ -15,7 +15,7 @@ def get_defaults() -> dict:
         "capital": {
             "total": 1000000,
             "cash_reserve_ratio": 0.4,
-            "max_position_per_stock": 0.3,
+            "max_position_per_stock": 0.10,
         },
 
         # === 风控 ===
@@ -187,5 +187,19 @@ def get_defaults() -> dict:
             "resume": True,
             "update_threshold_days": 30,
             "skip_min_record_count": 100,
+        },
+
+        # === 交易模式 ===
+        "trading": {
+            "mode": "paper",
+            "fee_rate": 0.00015,
+            "stamp_tax_rate": 0.0005,
+            "min_fee": 5.0,
+        },
+
+        # === 模拟盘 ===
+        "paper_trading": {
+            "enabled": False,
+            "initial_cash": 1000000,
         },
     }

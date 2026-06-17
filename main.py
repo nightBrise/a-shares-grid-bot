@@ -105,6 +105,24 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--paper',
+        action='store_true',
+        help='运行模拟盘交易（收盘后统一模拟）'
+    )
+
+    parser.add_argument(
+        '--paper-reset',
+        action='store_true',
+        help='重置模拟盘持仓和资金'
+    )
+
+    parser.add_argument(
+        '--paper-status',
+        action='store_true',
+        help='查看模拟盘状态'
+    )
+
+    parser.add_argument(
         '--version', '-v',
         action='version',
         version=f'%(prog)s {__version__}'
@@ -146,6 +164,8 @@ def main():
         mode = 'optimize'
     elif args.backtest:
         mode = 'backtest'
+    elif args.paper or args.paper_reset or args.paper_status:
+        mode = 'paper'
     else:
         mode = config.get('mode', 'select')
 
@@ -177,6 +197,33 @@ def main():
     logger.info(f"状态文件：{args.state}")
 
     logger.info("=" * 70)
+
+    # 处理模拟盘命令
+    if args.paper or args.paper_reset or args.paper_status:
+        from trading_core.paper_trading import run_paper_trading, get_paper_status
+        from data_layer.market_db import init_paper_tables
+        
+        data_dir = config.get('paths', {}).get('data_dir', './data')
+        init_paper_tables(data_dir)
+        
+        if args.paper_status:
+            # 查看模拟盘状态
+            status = get_paper_status(config)
+            print("\n模拟盘状态：")
+            print(f"  现金：{status['cash']:,.2f}")
+            print(f"  总市值：{status['total_value']:,.2f}")
+            print(f"  持仓市值：{status['market_value']:,.2f}")
+            print(f"  持仓数量：{status['position_count']}")
+            if status['positions']:
+                print("\n  持仓明细：")
+                for pos in status['positions']:
+                    print(f"    {pos['code']}: {pos['quantity']}股 (可卖{pos['available']}) "
+                          f"成本{pos['avg_cost']:.2f} 市值{pos['market_value']:,.2f}")
+            sys.exit(0)
+        
+        # 运行模拟盘
+        success = run_paper_trading(config, reset=args.paper_reset)
+        sys.exit(0 if success else 1)
 
     # 处理数据库下载/更新命令
     if args.download_db:

@@ -71,48 +71,32 @@ def test_perfect_handover():
     print("\n" + "="*70)
     print("场景 1: 完美衔接测试")
     print("="*70)
-    print("本地 CSV 最后一条：2023-01-01")
-    print("新拉取数据开始：2023-01-02")
-    print("预期：无缝衔接，无重复，无遗漏\n")
     
-    # 现有数据：2022-12-20 至 2023-01-01 (10 个工作日)
-    df_existing = generate_mock_data('2022-12-20', 10, base_price=100.0)
+    # 生成现有数据和新数据，确保无重叠
+    df_existing = generate_mock_data('2023-01-02', 5, base_price=100.0)
+    last_date = df_existing['date'].iloc[-1]
+    
+    # 新数据从现有数据最后一天的下一天开始
+    from datetime import datetime, timedelta
+    next_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    df_new = generate_mock_data(next_date, 5, base_price=105.0, seed=43)
+    
     print(f"现有数据：{df_existing['date'].iloc[0]} 至 {df_existing['date'].iloc[-1]} ({len(df_existing)}条)")
-    
-    # 新数据：2023-01-02 至 2023-01-13 (10 个工作日)
-    df_new = generate_mock_data('2023-01-02', 10, base_price=105.0, seed=43)
     print(f"新数据：{df_new['date'].iloc[0]} 至 {df_new['date'].iloc[-1]} ({len(df_new)}条)")
     
     # 执行合并
     df_combined = append_new_data(df_existing, df_new, "TEST.SH")
     
-    # 验证
     print("\n合并结果:")
     print(f"  总条数：{len(df_combined)}")
-    print(f"  日期范围：{df_combined['date'].iloc[0]} 至 {df_combined['date'].iloc[-1]}")
     
     # 检查重复
     duplicates = df_combined.duplicated(subset=['date']).sum()
     print(f"  重复记录：{duplicates}")
     
-    # 检查间隔
-    dates = pd.to_datetime(df_combined['date'])
-    gaps = dates.diff().dt.days
-    large_gaps = gaps[gaps > 3]
-    
-    if len(large_gaps) == 0:
-        print("  日期间隔：✓ 连续无间隔")
-    else:
-        print(f"  日期间隔：⚠️ 发现 {len(large_gaps)} 个间隔>3 天")
-    
-    # 显示连接处
-    mid_idx = len(df_existing) - 1
-    print("\n连接处详情:")
-    print(df_combined.loc[mid_idx-2:mid_idx+2, ['date', 'close']].to_string(index=False))
-    
     # 断言
     assert duplicates == 0, "发现重复！"
-    assert len(df_combined) == len(df_existing) + len(df_new), "条数不匹配！"
+    assert len(df_combined) == len(df_existing) + len(df_new), f"条数不匹配！期望{len(df_existing) + len(df_new)}，实际{len(df_combined)}"
     
     print("\n✓ 测试通过：完美衔接，无重复无遗漏")
     return True
@@ -171,16 +155,17 @@ def test_gap():
     print("\n" + "="*70)
     print("场景 3: 数据间隔测试")
     print("="*70)
-    print("本地 CSV 最后一条：2023-01-01")
-    print("新拉取数据开始：2023-01-10 (间隔 8 天)")
-    print("预期：正确合并，检测到间隔\n")
     
-    # 现有数据：2022-12-20 至 2023-01-01
-    df_existing = generate_mock_data('2022-12-20', 10, base_price=100.0)
+    # 生成现有数据和新数据，确保有间隔
+    df_existing = generate_mock_data('2023-01-02', 5, base_price=100.0)
+    last_date = df_existing['date'].iloc[-1]
+    
+    # 新数据从现有数据最后一天的后5天开始（制造间隔）
+    from datetime import datetime, timedelta
+    gap_start = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=5)).strftime('%Y-%m-%d')
+    df_new = generate_mock_data(gap_start, 5, base_price=105.0, seed=43)
+    
     print(f"现有数据：{df_existing['date'].iloc[0]} 至 {df_existing['date'].iloc[-1]} ({len(df_existing)}条)")
-    
-    # 新数据：2023-01-10 至 2023-01-21
-    df_new = generate_mock_data('2023-01-10', 10, base_price=105.0, seed=43)
     print(f"新数据：{df_new['date'].iloc[0]} 至 {df_new['date'].iloc[-1]} ({len(df_new)}条)")
     
     # 合并
@@ -197,10 +182,11 @@ def test_gap():
     if len(large_gaps) > 0:
         print(f"  ⚠️  检测到 {len(large_gaps)} 个间隔>3 天:")
         for idx in large_gaps.index:
-            prev_date = dates.iloc[idx-1].strftime('%Y-%m-%d')
-            curr_date = dates.iloc[idx].strftime('%Y-%m-%d')
-            gap_days = large_gaps.iloc[idx]
-            print(f"     - {prev_date} → {curr_date}: 间隔 {gap_days} 天")
+            if idx > 0:
+                prev_date = dates.iloc[idx-1].strftime('%Y-%m-%d')
+                curr_date = dates.iloc[idx].strftime('%Y-%m-%d')
+                gap_days = large_gaps.loc[idx]
+                print(f"     - {prev_date} → {curr_date}: 间隔 {gap_days} 天")
         print("  → 需调用 check_data_integrity() 检测并补全缺失日期")
     else:
         print("  ✓ 日期连续")

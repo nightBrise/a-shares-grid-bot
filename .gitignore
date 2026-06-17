@@ -12,6 +12,7 @@ configuration/config_state.json
 # 输出文件 (信号、日志、报告)
 output/
 *.log
+logs/
 
 # 环境变量和敏感信息
 .env
@@ -46,6 +47,9 @@ wheels/
 *.swp
 *.swo
 *~
+
+# Claude 代码审查
+.claude/reviews/
 
 # Jupyter Notebook
 .ipynb_checkpoints

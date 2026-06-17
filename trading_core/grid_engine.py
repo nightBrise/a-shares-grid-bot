@@ -330,9 +330,9 @@ class DynamicGridEngine:
 
         for i in range(1, params.n_grids + 1):
             # 买入价格: 低于参考价
-            buy_price = ref_price * (1 - effective_spacing / 100 * i)
+            buy_price = ref_price * (1 - effective_spacing * i)
             # 卖出价格: 高于参考价
-            sell_price = ref_price * (1 + effective_spacing / 100 * i)
+            sell_price = ref_price * (1 + effective_spacing * i)
 
             if direction in ["both", "buy"]:
                 buy_prices.append(round(buy_price, 2))
@@ -426,6 +426,7 @@ class DynamicGridEngine:
         prev_close: Optional[float] = None,
         can_buy: bool = True,
         can_open_new: bool = True,
+        **kwargs,
     ) -> List[GridSignal]:
         """
         为股票生成完整的网格信号集。

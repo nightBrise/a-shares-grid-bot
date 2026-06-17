@@ -66,21 +66,24 @@ def generate_mock_data(start_date: str, days: int, base_price: float = 100.0) ->
 def test_scenario_1_perfect_handover():
     """
     场景 1: 完美衔接
-    本地 CSV 最后一条：2023-01-01
-    新拉取数据开始：2023-01-02
+    本地 CSV 最后一条：2023-01-06
+    新拉取数据开始：2023-01-09（下一个工作日）
     预期：无缝衔接，无重复，无遗漏
     """
     print("\n" + "="*70)
     print("场景 1: 完美衔接测试")
     print("="*70)
     
-    # 生成现有数据（2023-01-01 及之前）
-    df_existing = generate_mock_data('2022-12-20', 10, base_price=100.0)
-    print(f"\n现有数据日期范围：{df_existing['date'].iloc[0]} 至 {df_existing['date'].iloc[-1]}")
+    # 生成现有数据（5个工作日）
+    df_existing = generate_mock_data('2023-01-02', 5, base_price=100.0)
+    last_date = df_existing['date'].iloc[-1]
+    print(f"\n现有数据日期范围：{df_existing['date'].iloc[0]} 至 {last_date}")
     print(f"现有数据条数：{len(df_existing)}")
     
-    # 生成新数据（从 2023-01-02 开始）
-    df_new = generate_mock_data('2023-01-02', 10, base_price=105.0)
+    # 生成新数据（从下一个工作日开始）
+    from datetime import datetime, timedelta
+    next_date = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+    df_new = generate_mock_data(next_date, 5, base_price=105.0)
     print(f"新数据日期范围：{df_new['date'].iloc[0]} 至 {df_new['date'].iloc[-1]}")
     print(f"新数据条数：{len(df_new)}")
     
@@ -104,14 +107,20 @@ def test_scenario_1_perfect_handover():
     if len(gaps) > 0:
         print(f"  ⚠️  发现 {len(gaps)} 个日期间隔 > 3 天")
         for gap_date, gap in gaps.items():
-            print(f"     - {gap.days} 天间隔 at index {gap_date}")
+            if gap_date > 0:
+                prev_date = dates.iloc[gap_date-1].strftime('%Y-%m-%d')
+                curr_date = dates.iloc[gap_date].strftime('%Y-%m-%d')
+                print(f"     - {prev_date} → {curr_date}: {gap.days} 天间隔")
     else:
         print("  ✓ 日期连续，无间隔")
     
     # 显示连接处数据
     mid_idx = len(df_existing) - 1
     print("\n连接处数据预览 (前后各 3 条):")
-    print(df_combined.loc[mid_idx-2:mid_idx+3, ['date', 'close']].to_string(index=False))
+    if mid_idx >= 2 and mid_idx + 3 < len(df_combined):
+        print(df_combined.loc[mid_idx-2:mid_idx+3, ['date', 'close']].to_string(index=False))
+    else:
+        print(df_combined[['date', 'close']].to_string(index=False))
     
     assert duplicate_count == 0, "发现重复数据！"
     assert len(df_combined) == len(df_existing) + len(df_new), "数据条数不匹配！"
@@ -180,21 +189,24 @@ def test_scenario_2_overlap():
 def test_scenario_3_gap():
     """
     场景 3: 有间隔
-    本地 CSV 最后一条：2023-01-01
-    新数据从 2023-01-10 开始（中间缺失 8 天）
+    本地 CSV 最后一条：2023-01-06
+    新数据从 2023-01-11 开始（中间缺失 3 个工作日）
     预期：检测到间隔，提示补全
     """
     print("\n" + "="*70)
     print("场景 3: 数据间隔测试")
     print("="*70)
     
-    # 生成现有数据（到 2023-01-01）
-    df_existing = generate_mock_data('2022-12-20', 10, base_price=100.0)
-    print(f"\n现有数据日期范围：{df_existing['date'].iloc[0]} 至 {df_existing['date'].iloc[-1]}")
+    # 生成现有数据（5个工作日）
+    df_existing = generate_mock_data('2023-01-02', 5, base_price=100.0)
+    last_date = df_existing['date'].iloc[-1]
+    print(f"\n现有数据日期范围：{df_existing['date'].iloc[0]} 至 {last_date}")
     print(f"现有数据条数：{len(df_existing)}")
     
-    # 生成新数据（从 2023-01-10 开始，有间隔）
-    df_new = generate_mock_data('2023-01-10', 10, base_price=105.0)
+    # 生成新数据（从5天后开始，制造间隔）
+    from datetime import datetime, timedelta
+    gap_start = (datetime.strptime(last_date, '%Y-%m-%d') + timedelta(days=5)).strftime('%Y-%m-%d')
+    df_new = generate_mock_data(gap_start, 5, base_price=105.0)
     print(f"新数据日期范围：{df_new['date'].iloc[0]} 至 {df_new['date'].iloc[-1]}")
     print(f"新数据条数：{len(df_new)}")
     

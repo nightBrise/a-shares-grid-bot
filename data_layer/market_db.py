@@ -492,6 +492,51 @@ def get_all_codes_from_kline(data_dir: str = "./data") -> List[str]:
     return [row[0] for row in rows]
 
 
+def get_filtered_codes_from_metadata(
+    min_record_count: int = 200,
+    exclude_st: bool = True,
+    data_dir: str = "./data"
+) -> List[str]:
+    """
+    从 stock_metadata 预过滤股票代码（方案B优化）
+
+    在读取全量数据前，先按元数据过滤，减少无效数据读取。
+
+    过滤条件：
+    1. record_count >= min_record_count（数据量足够计算指标）
+    2. is_st = 0（排除ST股票）
+
+    参数:
+        min_record_count: 最小记录数（默认200，指标计算需要）
+        exclude_st: 是否排除ST股票（默认True）
+        data_dir: 数据目录
+
+    返回:
+        过滤后的股票代码列表
+    """
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return []
+
+    conditions = ["record_count >= ?"]
+    params = [min_record_count]
+
+    if exclude_st:
+        conditions.append("(is_st = 0 OR is_st IS NULL)")
+
+    where_clause = " AND ".join(conditions)
+    query = f"SELECT code FROM stock_metadata WHERE {where_clause}"
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+    codes = [row[0] for row in rows]
+    logger.info(f"元数据预过滤: {len(codes)} 只股票通过 (record_count >= {min_record_count}, 排除ST)")
+    return codes
+
+
 def load_st_flags(data_dir: str = "./data") -> Dict[str, bool]:
     """
     从 stock_metadata 表加载 ST 标记
@@ -1006,41 +1051,334 @@ def save_update_checkpoint(
         )
 
 
-def get_update_checkpoint(
-    code: Optional[str] = None,
-    data_dir: str = "./data"
-) -> Dict[str, dict]:
+def get_latest_data_date(code: str, data_dir: str = "./data") -> Optional[str]:
     """
-    获取增量更新检查点
+    获取股票最新数据日期
 
     参数:
-        code: 股票代码（None 返回全部）
+        code: 股票代码
         data_dir: 数据目录
 
     返回:
-        {code: {last_success, last_date, last_error, consecutive_failures}} 字典
+        最新日期字符串 (YYYY-MM-DD) 或 None
     """
     db_path = _get_db_path(data_dir)
     if not os.path.exists(db_path):
-        return {}
+        return None
 
-    query = "SELECT * FROM update_checkpoint"
-    params = ()
-    if code:
-        query += " WHERE code = ?"
-        params = (code,)
+    query = "SELECT MAX(date) FROM daily_kline WHERE code = ?"
 
     with sqlite3.connect(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        cursor.execute(query, (code,))
+        row = cursor.fetchone()
+
+    return row[0] if row and row[0] else None
+
+
+# ==================== 模拟盘数据表 ====================
+
+def init_paper_tables(data_dir: str = "./data") -> None:
+    """
+    初始化模拟盘相关表
+    """
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+
+        # 虚拟持仓表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                code TEXT PRIMARY KEY,
+                total_quantity INTEGER DEFAULT 0,
+                available_quantity INTEGER DEFAULT 0,
+                frozen_quantity INTEGER DEFAULT 0,
+                avg_cost_price REAL DEFAULT 0,
+                market_value REAL DEFAULT 0,
+                last_update TEXT
+            )
+        """)
+
+        # 虚拟交易记录表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT,
+                direction TEXT,
+                price REAL,
+                quantity INTEGER,
+                amount REAL,
+                fee REAL,
+                stamp_tax REAL,
+                trade_date TEXT,
+                trade_time TEXT,
+                pnl REAL,
+                status TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_date
+            ON paper_trades(trade_date)
+        """)
+
+        # 虚拟账户表（单条记录，id=1）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS paper_account (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                cash REAL DEFAULT 0,
+                total_value REAL DEFAULT 0,
+                peak_value REAL DEFAULT 0,
+                max_drawdown REAL DEFAULT 0,
+                daily_pnl REAL DEFAULT 0,
+                total_trades INTEGER DEFAULT 0,
+                last_update TEXT
+            )
+        """)
+
+        # 每日结算快照
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS paper_daily_snapshots (
+                date TEXT PRIMARY KEY,
+                cash REAL,
+                total_value REAL,
+                market_value REAL,
+                max_drawdown REAL,
+                daily_pnl REAL,
+                trade_count INTEGER,
+                positions TEXT
+            )
+        """)
+
+        conn.commit()
+
+    logger.info("模拟盘表初始化完成")
+
+
+def save_paper_position(
+    code: str,
+    total_quantity: int,
+    available_quantity: int,
+    frozen_quantity: int,
+    avg_cost_price: float,
+    market_value: float,
+    data_dir: str = "./data"
+) -> None:
+    """保存虚拟持仓"""
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO paper_positions
+               (code, total_quantity, available_quantity, frozen_quantity,
+                avg_cost_price, market_value, last_update)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (code, total_quantity, available_quantity, frozen_quantity,
+             avg_cost_price, market_value, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+
+
+def get_paper_position(code: str, data_dir: str = "./data") -> Optional[Dict]:
+    """获取单只股票虚拟持仓"""
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return None
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM paper_positions WHERE code = ?",
+            (code,)
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
 
     return {
-        row[0]: {
-            "last_success": row[1],
-            "last_date": row[2],
-            "last_error": row[3],
-            "consecutive_failures": row[4] or 0,
+        'code': row[0],
+        'total_quantity': row[1],
+        'available_quantity': row[2],
+        'frozen_quantity': row[3],
+        'avg_cost_price': row[4],
+        'market_value': row[5],
+        'last_update': row[6]
+    }
+
+
+def get_all_paper_positions(data_dir: str = "./data") -> List[Dict]:
+    """获取所有虚拟持仓"""
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return []
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM paper_positions")
+        rows = cursor.fetchall()
+
+    return [
+        {
+            'code': row[0],
+            'total_quantity': row[1],
+            'available_quantity': row[2],
+            'frozen_quantity': row[3],
+            'avg_cost_price': row[4],
+            'market_value': row[5],
+            'last_update': row[6]
         }
         for row in rows
+    ]
+
+
+def delete_paper_position(code: str, data_dir: str = "./data") -> None:
+    """删除虚拟持仓"""
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM paper_positions WHERE code = ?", (code,))
+        conn.commit()
+
+
+def save_paper_trade(
+    code: str,
+    direction: str,
+    price: float,
+    quantity: int,
+    amount: float,
+    fee: float,
+    stamp_tax: float,
+    trade_date: str,
+    trade_time: str,
+    status: str,
+    pnl: float = 0,
+    data_dir: str = "./data"
+) -> str:
+    """保存虚拟交易记录，返回交易ID"""
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO paper_trades
+               (code, direction, price, quantity, amount, fee, stamp_tax,
+                trade_date, trade_time, pnl, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (code, direction, price, quantity, amount, fee, stamp_tax,
+             trade_date, trade_time, pnl, status)
+        )
+        conn.commit()
+        return str(cursor.lastrowid)
+
+
+def save_paper_account(
+    cash: float,
+    total_value: float,
+    peak_value: float,
+    max_drawdown: float,
+    data_dir: str = "./data"
+) -> None:
+    """保存虚拟账户状态"""
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO paper_account
+               (id, cash, total_value, peak_value, max_drawdown, last_update)
+               VALUES (1, ?, ?, ?, ?, ?)""",
+            (cash, total_value, peak_value, max_drawdown,
+             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        )
+        conn.commit()
+
+
+def get_paper_account(data_dir: str = "./data") -> Optional[Dict]:
+    """获取虚拟账户状态"""
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return None
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM paper_account WHERE id = 1")
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    return {
+        'id': row[0],
+        'cash': row[1],
+        'total_value': row[2],
+        'peak_value': row[3],
+        'max_drawdown': row[4],
+        'daily_pnl': row[5],
+        'total_trades': row[6],
+        'last_update': row[7]
     }
+
+
+def save_paper_daily_snapshot(
+    date: str,
+    cash: float,
+    total_value: float,
+    market_value: float,
+    max_drawdown: float,
+    daily_pnl: float,
+    trade_count: int,
+    positions: List[Dict],
+    data_dir: str = "./data"
+) -> None:
+    """保存每日结算快照"""
+    db_path = _get_db_path(data_dir)
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO paper_daily_snapshots
+               (date, cash, total_value, market_value, max_drawdown,
+                daily_pnl, trade_count, positions)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date, cash, total_value, market_value, max_drawdown,
+             daily_pnl, trade_count, json.dumps(positions))
+        )
+        conn.commit()
+
+
+def get_paper_daily_snapshots(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    data_dir: str = "./data"
+) -> Optional[pd.DataFrame]:
+    """获取每日结算快照"""
+    db_path = _get_db_path(data_dir)
+    if not os.path.exists(db_path):
+        return None
+
+    query = "SELECT * FROM paper_daily_snapshots"
+    params = []
+    conditions = []
+
+    if start_date:
+        conditions.append("date >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("date <= ?")
+        params.append(end_date)
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY date"
+
+    with sqlite3.connect(db_path) as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+
+    if df.empty:
+        return None
+    return df
+

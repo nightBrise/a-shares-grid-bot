@@ -222,23 +222,27 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True,
     # ============================================================
     # 严格本地模式：只读取 SQLite 数据，不足时报错
     # ============================================================
-    from data_layer.market_db import get_all_codes_from_kline, load_st_flags, get_multi_stock_data
+    from data_layer.market_db import get_filtered_codes_from_metadata, get_multi_stock_data
 
-    local_codes = get_all_codes_from_kline(data_dir)
+    # 方案B：使用元数据预过滤，减少无效数据读取
+    local_codes = get_filtered_codes_from_metadata(
+        min_record_count=200,
+        exclude_st=True,
+        data_dir=data_dir
+    )
 
     if len(local_codes) < 500:
         raise RuntimeError(
-            f"本地 SQLite 仅有 {len(local_codes)} 只股票，"
+            f"元数据预过滤后仅 {len(local_codes)} 只股票，"
             f"请先运行: python main.py --download-db"
         )
 
-    logger.info(f"本地 SQLite 有 {len(local_codes)} 只股票数据，使用本地优先模式")
-    st_flags = load_st_flags(data_dir)
+    logger.info(f"元数据预过滤后: {len(local_codes)} 只股票")
 
     # 计算需要的历史数据起始日期（Path Memory 需要至少 120 天，留足余量取 2 年）
     start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
 
-    # 批量读取所有历史数据
+    # 方案B：批量读取过滤后的股票数据
     df_all = get_multi_stock_data(local_codes, start_date=start_date, data_dir=data_dir)
 
     if df_all is None or df_all.empty:
@@ -246,18 +250,22 @@ def run_multi_factor_selection(config: dict, auto_update_config: bool = True,
 
     logger.info(f"SQLite 批量读取: {df_all['code'].nunique()} 只股票, {len(df_all)} 条记录")
 
+    # 方案C：使用 pandas groupby 批量计算指标
+    logger.info("开始批量计算指标...")
     total = len(local_codes)
-    for i, code in enumerate(local_codes):
-        df_code = df_all[df_all['code'] == code].copy()
-        if not df_code.empty:
-            df_code = df_code.drop(columns=['code'], errors='ignore')
-            is_st = st_flags.get(code, False)
-            process_result(code, df_code, "success", is_st)
+    processed = 0
+
+    for code, group in df_all.groupby('code'):
+        df_code = group.drop(columns=['code'], errors='ignore').copy()
+
+        if not df_code.empty and len(df_code) >= 60:
+            process_result(code, df_code, "success", is_st=False)
+            processed += 1
 
         # 进度日志
-        if (i + 1) % max(1, total // 10) == 0:
-            pct = 100 * (i + 1) // total
-            logger.info(f"进度: {i + 1}/{total} ({pct}%)")
+        if processed % max(1, total // 10) == 0:
+            pct = 100 * processed // total
+            logger.info(f"进度: {processed}/{total} ({pct}%)")
 
     logger.info(f"指标计算完成: 成功 {success_count}, 失败 {fail_count}")
 
@@ -439,6 +447,8 @@ def backtest_grid_strategy(df: pd.DataFrame,
         }
 
     prices = df['close'].values
+    highs = df['high'].values if 'high' in df.columns else df['close'].values
+    lows = df['low'].values if 'low' in df.columns else df['close'].values
 
     # 预计算 ATR 序列（用于动态间距）
     atr_series = None
@@ -488,6 +498,8 @@ def backtest_grid_strategy(df: pd.DataFrame,
     # 逐日回测
     for i, price in enumerate(prices[1:], start=1):
         prev_price = prices[i - 1]
+        today_low = lows[i]
+        today_high = highs[i]
 
         # === 涨跌停检查 ===
         change_pct = abs(price - prev_price) / prev_price if prev_price > 0 else 0
@@ -520,7 +532,7 @@ def backtest_grid_strategy(df: pd.DataFrame,
         # === 强制平仓检查 ===
         lower_rail = center_price - 2 * current_atr
         force_close_trigger = lower_rail * (1 - dynamic_buy_spacing * 3)
-        if price <= force_close_trigger and available_position > 100:
+        if today_low <= force_close_trigger and available_position > 100:
             fc_qty = max(100, int(available_position * 0.5 / 100) * 100)
             fc_qty = min(fc_qty, available_position)
             actual_sell_price = price * (1 - slippage_rate)
@@ -541,11 +553,11 @@ def backtest_grid_strategy(df: pd.DataFrame,
             center_price, dynamic_buy_spacing, dynamic_sell_spacing,
             spacing_decay, max_grids)
 
-        # === 买入（跌停不买，金字塔加仓）===
+        # === 买入（跌停不买，金字塔加仓，用 Low 触发）===
         if not is_limit_down:
             for buy_layer, buy_price in enumerate(buy_prices):
                 buy_amount = grid_amount * (amount_multiplier ** buy_layer)
-                if price <= buy_price and cash > buy_amount * 1.1:
+                if today_low <= buy_price and cash > buy_amount * 1.1:
                     buy_qty = validate_buy_quantity(int(buy_amount / buy_price))
                     if buy_qty > 0 and cash >= buy_qty * buy_price * 1.01:
                         actual_buy_price = buy_price * (1 + slippage_rate)
@@ -565,10 +577,10 @@ def backtest_grid_strategy(df: pd.DataFrame,
                                 'slippage': slippage_cost, 'layer': buy_layer + 1
                             })
 
-        # === 卖出（涨停不卖，T+1约束，倒金字塔）===
+        # === 卖出（涨停不卖，T+1约束，倒金字塔，用 High 触发）===
         if not is_limit_up:
             for sell_layer, sell_price in enumerate(sell_prices):
-                if price >= sell_price and available_position > 0:
+                if today_high >= sell_price and available_position > 0:
                     inv_multiplier = 1.0 / max(amount_multiplier, 0.1)
                     sell_amount = grid_amount * (inv_multiplier ** sell_layer)
                     sell_qty = min(available_position, validate_buy_quantity(
@@ -589,7 +601,7 @@ def backtest_grid_strategy(df: pd.DataFrame,
                             'slippage': slippage_cost, 'layer': sell_layer + 1
                         })
 
-        # 计算组合市值
+        # 计算组合市值（用收盘价）
         portfolio_value = cash + position * price
         portfolio_values.append(portfolio_value)
     
@@ -1335,22 +1347,34 @@ def run_two_phase_optimization(config: dict) -> Dict:
 
     logger.info(f"\n优化报告已保存到：{report_file}")
 
-    # 选择实盘交易股票
-    trading_stocks_count = max(1, min(len(valid_results), max_stocks_for_trading))
+    # 保存所有优化通过的股票（用于后续筛选进入模拟盘）
     df_results = pd.DataFrame(valid_results)
     df_results = df_results.sort_values('final_return', ascending=False)
+    
+    # 所有优化通过的股票（按收益排序）
+    all_optimized_stocks = df_results['code'].tolist()
+    
+    # 选择实盘交易股票（受资金限制）
+    trading_stocks_count = max(1, min(len(valid_results), max_stocks_for_trading))
     trading_stocks = df_results.head(trading_stocks_count)['code'].tolist()
 
-    logger.info("\n实盘交易股票（按收益排序）:")
+    logger.info("\n所有优化通过的股票（按收益排序）:")
+    for i, row in df_results.iterrows():
+        logger.info(f"  {i+1}. {row['code']} - 最终收益: {row['final_return']*100:.2f}%, "
+                    f"Calmar: {row['final_calmar']:.4f}")
+
+    logger.info(f"\n资金限制下可进入模拟盘: {trading_stocks_count} 只")
+    logger.info("实盘交易股票（按收益排序）:")
     for i, code in enumerate(trading_stocks):
         row = df_results[df_results['code'] == code].iloc[0]
         logger.info(f"  {i+1}. {code} - 最终收益: {row['final_return']*100:.2f}%, "
                     f"Calmar: {row['final_calmar']:.4f}")
 
-    # 保存实盘股票到 config_state.json
+    # 保存所有优化通过的股票到 config_state.json
     from utils import load_state, save_state
     state = load_state()
-    state['trading_stocks'] = trading_stocks
+    state['optimized_stocks'] = all_optimized_stocks  # 所有优化通过的股票
+    state['trading_stocks'] = trading_stocks  # 资金限制下可进入模拟盘的股票
     state['optimization_history'] = {
         r['code']: {
             'final_params': r['final_params'],
@@ -1516,25 +1540,43 @@ def generate_signals(config: dict) -> pd.DataFrame:
     # 简化处理：假设持仓信息存储在 state 中
     from utils import load_state
     state = load_state()
-    positions_data = state.get('positions', [])  # 格式：[{code, cost_price, quantity}, ...]
+    positions_data = state.get('positions', [])  # 格式：{code: [{code, cost_price, quantity}, ...]} 或 [{code, cost_price, quantity}, ...]
     
     # 获取最新价格（简化处理，实际应从行情数据获取）
     positions_with_price = []
-    for pos in positions_data:
-        code = pos['code']
-        try:
-            df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
-                                selected_stocks=stocks)
-            if not df.empty:
-                current_price = df.iloc[-1]['close']
-                positions_with_price.append({
-                    'code': code,
-                    'cost_price': pos['cost_price'],
-                    'current_price': current_price,
-                    'quantity': pos['quantity']
-                })
-        except Exception as e:
-            logger.warning(f"获取 {code} 最新价格失败：{str(e)}")
+    if isinstance(positions_data, dict):
+        for code, pos_list in positions_data.items():
+            for pos in pos_list:
+                code = pos.get('code', code)
+                try:
+                    df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                                        selected_stocks=stocks)
+                    if not df.empty:
+                        current_price = df.iloc[-1]['close']
+                        positions_with_price.append({
+                            'code': code,
+                            'cost_price': pos.get('cost_price', 0),
+                            'current_price': current_price,
+                            'quantity': pos.get('quantity', 0)
+                        })
+                except Exception as e:
+                    logger.warning(f"获取 {code} 最新价格失败：{str(e)}")
+    else:
+        for pos in positions_data:
+            code = pos['code']
+            try:
+                df = get_stock_data(code, data_dir=paths_cfg['data_dir'],
+                                    selected_stocks=stocks)
+                if not df.empty:
+                    current_price = df.iloc[-1]['close']
+                    positions_with_price.append({
+                        'code': code,
+                        'cost_price': pos['cost_price'],
+                        'current_price': current_price,
+                        'quantity': pos['quantity']
+                    })
+            except Exception as e:
+                logger.warning(f"获取 {code} 最新价格失败：{str(e)}")
     
     # 构建账户状态
     account_status = risk_manager.get_account_status(

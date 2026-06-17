@@ -211,13 +211,19 @@ def get_trade_calendar(force_refresh: bool = False) -> pd.DatetimeIndex:
         # === 交叉校验: Baostock ===
         try:
             import baostock as bs
-            bs.login()
-            # 获取未来30天和过去30天
-            start_d = (now - timedelta(days=30)).strftime('%Y-%m-%d')
-            end_d = (now + timedelta(days=30)).strftime('%Y-%m-%d')
-            rs = bs.query_trade_dates(start_date=start_d, end_date=end_d)
-            df_bs = rs.get_data()
-            bs.logout()
+            import socket
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(10)
+            try:
+                bs.login()
+                # 获取未来30天和过去30天
+                start_d = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+                end_d = (now + timedelta(days=30)).strftime('%Y-%m-%d')
+                rs = bs.query_trade_dates(start_date=start_d, end_date=end_d)
+                df_bs = rs.get_data()
+                bs.logout()
+            finally:
+                socket.setdefaulttimeout(old_timeout)
 
             if not df_bs.empty:
                 bs_dates = set(pd.to_datetime(df_bs[df_bs['is_trading_day'] == '1']['calendar_date']))
@@ -337,7 +343,11 @@ def get_next_trading_day(date, n: int = 1):
         date = pd.Timestamp(date)
 
     calendar = get_trade_calendar()
-    idx = calendar.searchsorted(date, side='left')
+    try:
+        idx = calendar.searchsorted(date, side='left')
+    except ValueError:
+        date = pd.Timestamp(date.year, date.month, date.day)
+        idx = calendar.searchsorted(date, side='left')
     target_idx = min(len(calendar) - 1, idx + n - 1)
     return calendar[target_idx]
 
